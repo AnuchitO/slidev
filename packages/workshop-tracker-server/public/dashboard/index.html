@@ -5,10 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Workshop Tracker — Dashboard</title>
 <!--
-  NOTE(security): this route has no auth (plan 027, same documented gap as
-  026's presenter route) — anyone who knows/guesses this URL can open it.
-  Plan 029 (M4) adds a join code that gates presenter/dashboard access. Do
-  not point this at a real workshop room before 029 lands.
+  Auth (plan 029 / PRD §12): the HTTP GET for this page itself is gated by
+  `server.ts`'s `requireDashboardCode` middleware on a `?code=` query param
+  (a 401 is returned before this HTML is ever served if it's missing/wrong —
+  see that function's own comment for why a query param over HTTP Basic).
+  The *same* code is read back out of `location.search` below and sent as
+  `presenterCode` on the `dashboard:join` socket event, which is gated
+  server-side by the identical presenter-credential check `presenter:*`
+  events use — opening the dashboard is exactly as privileged as moving
+  everyone's slide. One credential, one place it lives (the URL the operator
+  hands out), never embedded in this file itself.
 -->
 <style>
   :root {
@@ -83,7 +89,7 @@
 </head>
 <body>
   <h1>Workshop Tracker — Instructor Dashboard</h1>
-  <p class="sub">Minimal M2 dashboard: participant roster + status for the current step. No auth yet — see the note in this file's source.</p>
+  <p class="sub">Participant roster + status for the current step. Requires the presenter code (see this file's source).</p>
   <p class="conn" id="conn">connecting…</p>
 
   <div class="counts">
@@ -108,15 +114,24 @@
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
+    const presenterCode = new URLSearchParams(location.search).get('code') || undefined
+
     const socket = io()
     const connEl = document.getElementById('conn')
     const rowsEl = document.getElementById('rows')
     const emptyEl = document.getElementById('empty')
 
     socket.on('connect', () => {
-      connEl.textContent = 'live'
-      connEl.classList.add('live')
-      socket.emit('dashboard:join')
+      socket.emit('dashboard:join', { presenterCode }, (result) => {
+        if (result && result.ok === false) {
+          connEl.textContent = 'presenter code rejected — append ?code=<presenterCode> to this page\'s URL and reload'
+          connEl.classList.remove('live')
+          socket.disconnect()
+          return
+        }
+        connEl.textContent = 'live'
+        connEl.classList.add('live')
+      })
     })
     socket.on('disconnect', () => {
       connEl.textContent = 'disconnected — retrying…'

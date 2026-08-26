@@ -86,23 +86,30 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
     // creep.
     socket.emit('slide:sync', { index: session.currentSlideIndex })
 
-    socket.on('presenter:setSlide', ({ index, stepId }: { index: number, stepId?: string }) => {
+    socket.on('presenter:setSlide', ({ index }: { index: number }) => {
       // NOTE(security): M1/M2 have no auth — any connected socket can emit
       // this and move everyone's slide. That's an accepted,
       // explicitly-tracked gap; plan 029 (M4) adds a join code that gates
       // who's allowed to be "the presenter". Do not treat this as
       // done/secure before 029 lands.
       session.currentSlideIndex = index
-      // `stepId` isn't in PRD §10's `presenter:setSlide` payload verbatim —
-      // it's a deliberate addition (mirroring M1's `slide:sync` precedent)
-      // so the dashboard can show a "current step" status column (plan 027
-      // Step 3) without the server parsing deck markdown itself. The addon
-      // computes it client-side via `resolveStepId` (frontmatter `stepId`,
-      // falling back to the slide index — PRD §8) and reports it here;
-      // falls back to the slide index itself if the addon omits it (e.g. an
-      // older addon build).
-      session.currentStepId = stepId ?? String(index)
       io.emit('slide:changed', { index })
+      broadcastStateUpdate(io)
+    })
+
+    // Not in PRD §10's literal event list — a deliberate addition (mirroring
+    // M1's `slide:sync` precedent) so the dashboard can show a "current
+    // step" status column (plan 027 Step 3) without the server parsing deck
+    // markdown itself. Kept as its *own* event rather than folded into
+    // `presenter:setSlide` above: the addon computes `stepId` via a real
+    // mounted component reading `useNav().currentFrontmatter`
+    // (`StepReporter.vue`), which updates on its own reactive schedule,
+    // independent of when the router's `afterEach` (which drives
+    // `presenter:setSlide`) fires — see that component's own comment for
+    // why they can't share one event.
+    socket.on('presenter:setStep', ({ stepId }: { stepId: string }) => {
+      // NOTE(security): same gap as `presenter:setSlide` above.
+      session.currentStepId = stepId
       broadcastStateUpdate(io)
     })
 

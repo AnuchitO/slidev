@@ -1,11 +1,13 @@
 # slidev-addon-workshop-tracker
 
 A Slidev addon that syncs the presenter's current slide to every connected
-participant in real time, over the companion
-[`workshop-tracker-server`](../workshop-tracker-server). This is **M1 of the
-workshop-tracking initiative** — slide sync only, no participant identity,
-step tracking, error reporting, presence, or auth yet. See
-[`plans/026-workshop-tracker-m1-slide-sync.md`](../../plans/026-workshop-tracker-m1-slide-sync.md)
+participant in real time, and (as of M2) lets participants identify
+themselves and acknowledge hands-on steps, over the companion
+[`workshop-tracker-server`](../workshop-tracker-server). Currently
+implements **M1 (slide sync) and M2 (participant identity + step
+tracking)** — error reporting, presence, and auth are still ahead. See
+[`plans/026-workshop-tracker-m1-slide-sync.md`](../../plans/026-workshop-tracker-m1-slide-sync.md),
+[`plans/027-workshop-tracker-m2-step-tracking.md`](../../plans/027-workshop-tracker-m2-step-tracking.md),
 and [`plans/prd-workshop-tracking.md`](../../plans/prd-workshop-tracking.md).
 
 ## Usage
@@ -72,6 +74,71 @@ the `router` instance passed into `defineAppSetup` is used, matching
 (the router is already a live, installed `vue-router` `Router` — `app.use(router)`
 runs before any addon's `setup/main.ts` executes).
 
+## M2: components and Global Layers
+
+- **`<StepCommand command="...">`** (`components/StepCommand.vue`) — a
+  global component, auto-registered from this addon's `components/`
+  directory the same way theme components are (`packages/slidev/node/vite/components.ts`'s
+  `dirs` includes `roots.map(i => join(i, 'components'))`, and `roots`
+  includes addon roots) — confirmed by using it bare in
+  `demo/workshop-tracker/slides.md` with no explicit import. `command` is
+  optional; the Done button is always available (PRD §8). Reads the active
+  step's key via `resolveStepId` (`src/stepId.ts`): the slide's `stepId`
+  frontmatter, falling back to the slide index. Button visual state
+  (`src/stepCommandStatus.ts`, unit tested) only confirms Copy/Done once the
+  server acks — not an optimistic "clicked = done".
+- **`<JoinScreen>`** (`components/JoinScreen.vue`) — a full-screen name-entry
+  overlay, gated on "have we received a `participant:join` ack yet", not on
+  slide rendering. Persists `{ participantId, name }` to `sessionStorage` so
+  a same-tab reload rejoins as the same participant.
+- **`<StepReporter>`** (`components/StepReporter.vue`) — renders nothing;
+  reports the presenter's current `stepId` to the server (`presenter:setStep`).
+  See "Real gap found during M2" below for why this exists as its own
+  component rather than living in `setup/main.ts` alongside
+  `presenter:setSlide`.
+
+Both `<JoinScreen>` and `<StepReporter>` are mounted via
+[`global-top.vue`](./global-top.vue) — Slidev's documented **Global Layers**
+extension point (<https://sli.dev/features/global-layers>,
+`packages/slidev/node/virtual/global-layers.ts`): a `global-top.{ts,js,vue}`
+file at an addon/theme root is auto-rendered once, persisting across every
+slide, with full injection context (`useNav()` works). This is the
+mechanism for "a component that's always mounted" — deliberately _not_ the
+plan's originally-sketched "`app.component()` + a small root-level
+teleport/overlay pattern in `setup/main.ts`", because `setup/main.ts` runs
+pre-`app.mount()` outside any component's setup context (see below).
+
+## Real gap found during M2: `setup/main.ts` can't reliably read slide frontmatter
+
+Plan 027 Step 1 asked to empirically confirm frontmatter passthrough
+"inside an actual component's setup()" before relying on it further — doing
+that surfaced a genuine bug in the milestone's own original design, not
+just a hypothetical risk. `useNav().currentFrontmatter` (used inside real
+components — `StepCommand.vue`, `StepReporter.vue`) reads
+`stepId` correctly. But the plan's original sketch had `setup/main.ts`'s
+`router.afterEach` read `to.meta.slide.frontmatter` directly off the
+resolved route object to report `stepId` alongside `presenter:setSlide` —
+and that was empirically `undefined` at the moment `afterEach` fires, even
+though the _same_ slide's frontmatter was correctly populated a moment
+later via `useNav()`.
+
+Root cause: `currentSlideRoute` (and therefore `currentFrontmatter`) is
+computed from the **reactive `slides` array**
+(`packages/client/composables/useNav.ts`:
+`currentSlideRoute = computed(() => slides.value[currentSlideNo.value - 1])`),
+not from the vue-router route object itself — `to.meta.slide` in
+`router.afterEach` is a different, less-reliably-populated-at-that-moment
+object. `setup/main.ts` can safely read `to.path` (a plain string,
+immediately correct — that's what `presenter:setSlide`'s `index` still uses)
+but not `to.meta.slide.frontmatter`.
+
+Fix: `stepId` reporting was pulled out into its own component
+(`StepReporter.vue`, a real mounted component using `useNav()`) and its own
+server event (`presenter:setStep`, separate from `presenter:setSlide`) — see
+`workshop-tracker-server`'s README for the server-side half. Don't
+reintroduce frontmatter reads in `setup/main.ts`; use a mounted component
+(via Global Layers or a slide-scoped component) instead.
+
 ## Known issue: local relative-path addon resolution (core Slidev, not this addon)
 
 Slidev's `resolveAddons()` (`packages/slidev/node/integrations/addons.ts`)
@@ -113,10 +180,12 @@ in play — but out of scope for M1.
 ## Known security gap (by design, until plan 029)
 
 **Any connected client can act as "the presenter."** There is no
-authentication in M1 — a participant's browser navigating to a
-`/presenter/:no` route will emit `presenter:setSlide` just like the real
-instructor's would, moving everyone else's slide. This is an accepted,
-explicitly-tracked gap; plan
-[029](../../plans/029-workshop-tracker-m4-presence-auth.md) (M4) adds a join
-code that gates who's allowed to be "the presenter." Do not treat this addon
-as workshop-ready before 029 lands.
+authentication — a participant's browser navigating to a `/presenter/:no`
+route will emit `presenter:setSlide`/`presenter:setStep` just like the real
+instructor's would, moving/relabeling everyone else's slide and step. The
+`/dashboard` route (served by `workshop-tracker-server`) is equally open to
+anyone who knows/guesses the URL. This is an accepted, explicitly-tracked
+gap; plan [029](../../plans/029-workshop-tracker-m4-presence-auth.md) (M4)
+adds a join code that gates who's allowed to be "the presenter" and who can
+open the dashboard. Do not treat this addon as workshop-ready before 029
+lands.

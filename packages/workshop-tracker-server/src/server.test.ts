@@ -250,7 +250,15 @@ describe('createWorkshopTrackerServer', () => {
   })
 
   describe('presenter reports the active step (M2)', () => {
-    it('presenter:setSlide with a stepId is reflected in state:update as currentStepId', async () => {
+    // `presenter:setStep` is its own event, separate from
+    // `presenter:setSlide` — the addon computes `stepId` from a real
+    // mounted component's `useNav().currentFrontmatter` (see
+    // `StepReporter.vue`), not from the router's resolved route object
+    // `presenter:setSlide` derives its `index` from, so the two can't share
+    // one event without one of them reading unreliable data (that's exactly
+    // what plan 027 Step 1 asked to confirm empirically, and the original
+    // combined-event approach failed that check during manual verification).
+    it('presenter:setStep sets currentStepId and broadcasts state:update to the dashboard', async () => {
       const dashboard = await connectClient()
       const initialSnapshot = waitFor(dashboard, 'state:update')
       dashboard.emit('dashboard:join')
@@ -258,24 +266,28 @@ describe('createWorkshopTrackerServer', () => {
 
       const presenter = await connectClient()
       const update = waitFor<{ currentStepId: string }>(dashboard, 'state:update')
-      presenter.emit('presenter:setSlide', { index: 2, stepId: 'install-deps' })
+      presenter.emit('presenter:setStep', { stepId: 'install-deps' })
       const payload = await update
 
       expect(payload.currentStepId).toBe('install-deps')
     })
 
-    it('falls back to the slide index as the stepId when presenter:setSlide omits it', async () => {
+    it('presenter:setSlide alone does not change currentStepId', async () => {
       const dashboard = await connectClient()
       const initialSnapshot = waitFor(dashboard, 'state:update')
       dashboard.emit('dashboard:join')
       await initialSnapshot
 
       const presenter = await connectClient()
-      const update = waitFor<{ currentStepId: string }>(dashboard, 'state:update')
-      presenter.emit('presenter:setSlide', { index: 4 })
+      presenter.emit('presenter:setStep', { stepId: 'install-deps' })
+      await waitForMatchingStateUpdate<{ currentStepId: string }>(dashboard, p => p.currentStepId === 'install-deps')
+
+      const update = waitFor<{ currentSlideIndex: number, currentStepId: string }>(dashboard, 'state:update')
+      presenter.emit('presenter:setSlide', { index: 7 })
       const payload = await update
 
-      expect(payload.currentStepId).toBe('4')
+      expect(payload.currentSlideIndex).toBe(7)
+      expect(payload.currentStepId).toBe('install-deps')
     })
   })
 })

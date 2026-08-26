@@ -26,6 +26,7 @@ context, not for any UI.
 import { useNav } from '@slidev/client'
 import { watch } from 'vue'
 import { getWorkshopSocket } from '../src/client'
+import { getPresenterCodeFromUrl } from '../src/presenterCode'
 import { resolveStepId } from '../src/stepId'
 
 const { currentFrontmatter, currentSlideNo, isPresenter } = useNav()
@@ -33,13 +34,13 @@ const { currentFrontmatter, currentSlideNo, isPresenter } = useNav()
 watch(
   [isPresenter, currentSlideNo, currentFrontmatter],
   ([presenting, slideNo, frontmatter]) => {
-    // NOTE(security): same gap as `presenter:setSlide` (026) — no auth yet,
-    // so any client can claim `isPresenter` and report a step. Plan 029
-    // closes this for both.
+    // Plan 029: the server rejects this event without a valid presenter
+    // credential (same gate as `presenter:setSlide`, `../setup/main.ts`) —
+    // `isPresenter` alone no longer gets a client anywhere server-side.
     if (!presenting)
       return
     const stepId = resolveStepId(frontmatter, slideNo)
-    getWorkshopSocket().emit('presenter:setStep', { stepId })
+    getWorkshopSocket().emit('presenter:setStep', { stepId, presenterCode: getPresenterCodeFromUrl() })
   },
   { immediate: true },
 )

@@ -29,6 +29,15 @@ const STORAGE_KEY = 'workshop-tracker:participant'
 interface StoredParticipant {
   participantId: string
   name: string
+  /**
+   * Persisted alongside identity (plan 029) so a same-tab reload can
+   * auto-rejoin without re-prompting for the code — this is the low(er)-
+   * privilege participant room code (PRD §12), not the presenter
+   * credential, so sessionStorage is an acceptable place for it (unlike the
+   * presenter code — see `../src/presenterCode.ts`'s comment on why *that*
+   * one is never persisted/embedded anywhere).
+   */
+  roomCode: string
 }
 
 const { isPresenter } = useNav()
@@ -36,6 +45,8 @@ const { isPresenter } = useNav()
 const joined = ref(false)
 const submitting = ref(false)
 const name = ref('')
+const roomCode = ref('')
+const joinError = ref('')
 
 function readStoredParticipant(): StoredParticipant | undefined {
   try {
@@ -43,7 +54,7 @@ function readStoredParticipant(): StoredParticipant | undefined {
     if (!raw)
       return undefined
     const parsed = JSON.parse(raw)
-    if (typeof parsed?.participantId === 'string' && typeof parsed?.name === 'string')
+    if (typeof parsed?.participantId === 'string' && typeof parsed?.name === 'string' && typeof parsed?.roomCode === 'string')
       return parsed
     return undefined
   }
@@ -64,14 +75,22 @@ function writeStoredParticipant(participant: StoredParticipant) {
   }
 }
 
-function join(joinName: string, participantId?: string) {
+function join(joinName: string, joinRoomCode: string, participantId?: string) {
   submitting.value = true
+  joinError.value = ''
   getWorkshopSocket().emit(
     'participant:join',
-    { name: joinName, participantId },
-    (ack: { participantId: string, currentSlideIndex: number }) => {
-      writeStoredParticipant({ participantId: ack.participantId, name: joinName })
+    { name: joinName, participantId, roomCode: joinRoomCode },
+    (ack: { participantId: string, currentSlideIndex: number } | { error: string }) => {
       submitting.value = false
+      // Plan 029: the server rejects a wrong/missing room code via this ack
+      // rather than a forced disconnect — surface it so the participant can
+      // correct the code and retry without reloading the page.
+      if ('error' in ack) {
+        joinError.value = 'That room code was not accepted — check it and try again.'
+        return
+      }
+      writeStoredParticipant({ participantId: ack.participantId, name: joinName, roomCode: joinRoomCode })
       joined.value = true
     },
   )
@@ -80,14 +99,15 @@ function join(joinName: string, participantId?: string) {
 onMounted(() => {
   const stored = readStoredParticipant()
   if (stored)
-    join(stored.name, stored.participantId)
+    join(stored.name, stored.roomCode, stored.participantId)
 })
 
 function onSubmit() {
-  const trimmed = name.value.trim()
-  if (!trimmed || submitting.value)
+  const trimmedName = name.value.trim()
+  const trimmedRoomCode = roomCode.value.trim()
+  if (!trimmedName || !trimmedRoomCode || submitting.value)
     return
-  join(trimmed)
+  join(trimmedName, trimmedRoomCode)
 }
 </script>
 
@@ -109,7 +129,18 @@ function onSubmit() {
         :disabled="submitting"
         class="workshop-tracker-join-input"
       >
-      <button type="submit" class="workshop-tracker-join-button" :disabled="submitting || !name.trim()">
+      <input
+        v-model="roomCode"
+        type="text"
+        placeholder="Room code"
+        autocomplete="off"
+        :disabled="submitting"
+        class="workshop-tracker-join-input"
+      >
+      <p v-if="joinError" class="workshop-tracker-join-error">
+        {{ joinError }}
+      </p>
+      <button type="submit" class="workshop-tracker-join-button" :disabled="submitting || !name.trim() || !roomCode.trim()">
         {{ submitting ? 'Joining…' : 'Join' }}
       </button>
     </form>
@@ -146,6 +177,11 @@ function onSubmit() {
   margin: 0;
   font-size: 0.85em;
   opacity: 0.75;
+}
+.workshop-tracker-join-error {
+  margin: 0;
+  font-size: 0.85em;
+  color: #e35d5d;
 }
 .workshop-tracker-join-input {
   padding: 0.5em 0.75em;

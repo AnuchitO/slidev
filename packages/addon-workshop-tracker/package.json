@@ -17,6 +17,7 @@
   "devDependencies": {
     "@slidev/client": "workspace:*",
     "@slidev/types": "workspace:*",
+    "jsdom": "^30.0.1",
     "vitest": "catalog:dev",
     "vue": "catalog:frontend",
     "vue-router": "catalog:frontend"

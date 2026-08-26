@@ -60,19 +60,51 @@ export const stepStatus = new Map<string, StepState>()
 export const participants = new Map<string, Participant>()
 
 /**
+ * How a `participant:join` call was actually resolved (plan 030 / PRD §12
+ * resilience). Distinguishes a normal first-time join from a genuine resume
+ * from one that *attempted* to resume but couldn't — the server logs each
+ * differently (`server.ts`) so an operator can tell "someone joined" apart
+ * from "someone's resume silently failed" during a real session, and the
+ * addon's `JoinScreen.vue` uses it to decide whether to skip the join
+ * prompt entirely (successful resume) or show it again (failed resume,
+ * e.g. after a server restart wiped the in-memory registry — PRD §4/§14's
+ * accepted in-memory-reset case).
+ */
+export type JoinOutcome = 'fresh' | 'resumed' | 'resume-fallback'
+
+export interface JoinResult {
+  participant: Participant
+  outcome: JoinOutcome
+}
+
+/**
  * Finds an existing participant by a client-supplied id (from
  * `sessionStorage`, see the addon's `JoinScreen.vue`) and refreshes it, or
  * creates a new one with a fresh server-assigned id. Never trusts a
  * client-supplied id as the id of a *new* record — only reuses it to look up
  * an *existing* one — so a stale/guessed id can't be used to plant a record
  * under an attacker-chosen key.
+ *
+ * Resume is bound to two things an attacker can't cheaply obtain together:
+ * the participant room code (checked by the caller, `server.ts`, before this
+ * function ever runs) and this specific `existingId` — a 122-bit
+ * `crypto.randomUUID()` minted at original join time (see `server.ts`'s
+ * `participant:join` handler) that's never broadcast to other participant
+ * sockets (only to the presenter-code-gated dashboard room). That combination
+ * is, in effect, an unguessable bearer resume token scoped to one browser
+ * tab's `sessionStorage` — not a plain "trust whatever id shows up" design
+ * (plan 030's STOP condition on resume hijacking).
  */
-export function joinParticipant(name: string, existingId: string | undefined, generateId: () => string, socketId: string): Participant {
+export function joinParticipant(name: string, existingId: string | undefined, generateId: () => string, socketId: string): JoinResult {
   const now = Date.now()
   const existing = existingId ? participants.get(existingId) : undefined
 
   if (existing) {
-    existing.name = name
+    // Plan 030 Step 1: name is part of what's being resumed — the resumed
+    // identity wins even if a (possibly different) name was supplied on this
+    // join call, so a rejoin can't quietly rename a participant out from
+    // under their own history. `name` here is only ever used for a genuinely
+    // *new* participant, below.
     existing.connected = true
     existing.lastSeen = now
     // A (re)join always means the tab is frontmost/interactive again — reset
@@ -80,7 +112,7 @@ export function joinParticipant(name: string, existingId: string | undefined, ge
     // from before the reconnect, and re-point socketId at the new socket.
     existing.visibility = 'visible'
     existing.socketId = socketId
-    return existing
+    return { participant: existing, outcome: 'resumed' }
   }
 
   const participant: Participant = {
@@ -93,7 +125,7 @@ export function joinParticipant(name: string, existingId: string | undefined, ge
     socketId,
   }
   participants.set(participant.id, participant)
-  return participant
+  return { participant, outcome: existingId ? 'resume-fallback' : 'fresh' }
 }
 
 export function setStepStatus(participantId: string, stepId: string, state: StepState): void {

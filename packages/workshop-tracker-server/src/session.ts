@@ -26,12 +26,33 @@ export const session: WorkshopSession = {
 
 export type StepState = 'idle' | 'copied' | 'done'
 
+/**
+ * `'visible'`/`'hidden'` are reported directly by the participant's browser
+ * on `visibilitychange` (PRD §10's `participant:visibility`); `'closed'` is
+ * never sent by a client (a closing tab can't reliably emit one more event)
+ * — it's inferred server-side, either immediately on a clean Socket.io
+ * `disconnect`, or by `presence.ts`'s `sweepStaleParticipants` for a hung
+ * connection that never fires one (plan 029 Step 3).
+ */
+export type ParticipantVisibility = 'visible' | 'hidden' | 'closed'
+
 export interface Participant {
   id: string
   name: string
   joinedAt: number
   lastSeen: number
   connected: boolean
+  visibility: ParticipantVisibility
+  /**
+   * The Socket.io socket id this participant is currently attached to.
+   * Needed by `presence.ts`'s staleness sweep to ask "is the socket this
+   * participant last spoke through still actually connected" without that
+   * module reaching into `io.sockets.sockets` itself (kept injectable/pure
+   * for testing — see `presence.test.ts`). Updated on every
+   * `participant:join` (including a rejoin on a new socket after a
+   * reconnect).
+   */
+  socketId: string
 }
 
 // Keyed as `${participantId}:${stepId}`.
@@ -46,7 +67,7 @@ export const participants = new Map<string, Participant>()
  * an *existing* one — so a stale/guessed id can't be used to plant a record
  * under an attacker-chosen key.
  */
-export function joinParticipant(name: string, existingId: string | undefined, generateId: () => string): Participant {
+export function joinParticipant(name: string, existingId: string | undefined, generateId: () => string, socketId: string): Participant {
   const now = Date.now()
   const existing = existingId ? participants.get(existingId) : undefined
 
@@ -54,6 +75,11 @@ export function joinParticipant(name: string, existingId: string | undefined, ge
     existing.name = name
     existing.connected = true
     existing.lastSeen = now
+    // A (re)join always means the tab is frontmost/interactive again — reset
+    // visibility to 'visible' rather than leaving a stale 'hidden'/'closed'
+    // from before the reconnect, and re-point socketId at the new socket.
+    existing.visibility = 'visible'
+    existing.socketId = socketId
     return existing
   }
 
@@ -63,6 +89,8 @@ export function joinParticipant(name: string, existingId: string | undefined, ge
     joinedAt: now,
     lastSeen: now,
     connected: true,
+    visibility: 'visible',
+    socketId,
   }
   participants.set(participant.id, participant)
   return participant

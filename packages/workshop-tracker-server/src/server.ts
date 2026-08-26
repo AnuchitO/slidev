@@ -119,7 +119,7 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
         { name, participantId }: { name: string, participantId?: string },
         ack?: (payload: { participantId: string, currentSlideIndex: number }) => void,
       ) => {
-        const participant = joinParticipant(name, participantId, randomUUID)
+        const participant = joinParticipant(name, participantId, randomUUID, socket.id)
         socket.data.participantId = participant.id
         ack?.({ participantId: participant.id, currentSlideIndex: session.currentSlideIndex })
         broadcastStateUpdate(io)

@@ -89,11 +89,14 @@ export interface JoinResult {
 
 /**
  * Finds an existing participant by a client-supplied id (from
- * `sessionStorage`, see the addon's `JoinScreen.vue`) and refreshes it, or
- * creates a new one with a fresh server-assigned id. Never trusts a
- * client-supplied id as the id of a *new* record — only reuses it to look up
- * an *existing* one — so a stale/guessed id can't be used to plant a record
- * under an attacker-chosen key.
+ * `localStorage`, see the addon's `JoinScreen.vue` / `participantIdentity.ts`
+ * — originally `sessionStorage` under plan 030, switched to `localStorage`
+ * as a follow-on fix so a closed-and-reopened tab, not just a same-tab
+ * refresh, can still resume) and refreshes it, or creates a new one with a
+ * fresh server-assigned id. Never trusts a client-supplied id as the id of a
+ * brand-new record — only reuses it to look up an *existing* one — so a
+ * stale/guessed id can't be used to plant a record under an attacker-chosen
+ * key.
  *
  * Resume is bound to two things an attacker can't cheaply obtain together:
  * the participant room code (checked by the caller, `server.ts`, before this
@@ -101,9 +104,14 @@ export interface JoinResult {
  * `crypto.randomUUID()` minted at original join time (see `server.ts`'s
  * `participant:join` handler) that's never broadcast to other participant
  * sockets (only to the presenter-code-gated dashboard room). That combination
- * is, in effect, an unguessable bearer resume token scoped to one browser
- * tab's `sessionStorage` — not a plain "trust whatever id shows up" design
- * (plan 030's STOP condition on resume hijacking).
+ * is, in effect, an unguessable bearer resume token scoped to one browser's
+ * `localStorage` — not a plain "trust whatever id shows up" design (plan
+ * 030's STOP condition on resume hijacking). Being scoped to *one browser*
+ * rather than one tab is a deliberate widening (see `participantIdentity.ts`'s
+ * doc comment for the bug it fixes) — the addon's own `JoinScreen.vue` "Not
+ * you? Join as someone else" link is the client-side mitigation for the one
+ * new consequence that introduces (a shared/kiosk browser resuming the
+ * previous person's identity), not a server-side concern.
  */
 export function joinParticipant(name: string, existingId: string | undefined, generateId: () => string, socketId: string): JoinResult {
   const now = Date.now()

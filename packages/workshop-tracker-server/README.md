@@ -100,7 +100,7 @@ duration; don't reuse a workshop's room code as a password anywhere else.
 - `participant:join { name, roomCode, participantId? }` → `ack({ participantId, currentSlideIndex } | { error: 'invalid_room_code' })`
   — requires a valid `roomCode` (see "Auth" above). Creates a new
   participant, or (if `participantId` matches an existing record — see the
-  addon's `JoinScreen.vue`, which persists it to `sessionStorage`) reuses it
+  addon's `JoinScreen.vue`, which persists it to `localStorage`) reuses it
   instead of creating a duplicate. A client-supplied `participantId` is only
   ever used to _look up_ an existing record, never trusted as the id of a
   new one.

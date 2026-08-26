@@ -12,7 +12,7 @@ import {
 } from './session'
 
 // Plan 030 (M5): server-side participant revival by id — a client-supplied
-// `participantId` (from the addon's `sessionStorage`, see `JoinScreen.vue`)
+// `participantId` (from the addon's `localStorage`, see `JoinScreen.vue`)
 // either resumes a known participant or falls back to minting a fresh one.
 // Fake timers throughout (no real sleeps) so `joinedAt`-vs-`lastSeen`
 // assertions are exact and instant.

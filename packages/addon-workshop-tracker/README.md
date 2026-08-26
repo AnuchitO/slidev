@@ -58,8 +58,9 @@ connects to `http://localhost:3710`; override with
 (e.g. `http://localhost:3030/presenter/1?presenterCode=...`) — see "Auth"
 below for why it has to be supplied this way rather than any config file.
 **Room code**: participants type it into the join screen alongside their
-name (no URL param needed, though `JoinScreen.vue`'s stored
-`sessionStorage` value means it's only typed once per browser tab).
+name (no URL param needed, though `JoinScreen.vue`'s stored `localStorage`
+value means it's only typed once per browser — resuming across a closed
+tab, and even a restarted browser, not just a same-tab reload).
 
 ## How it works
 
@@ -107,8 +108,8 @@ runs before any addon's `setup/main.ts` executes).
 - **`<JoinScreen>`** (`components/JoinScreen.vue`) — a full-screen name-entry
   overlay, gated on "have we received a `participant:join` ack yet", not on
   slide rendering. Persists `{ participantId, name, roomCode }` to
-  `sessionStorage` so a same-tab reload rejoins as the same participant
-  without re-prompting for the room code.
+  `localStorage` so a reload — same tab, or a closed-and-reopened tab —
+  rejoins as the same participant without re-prompting for the room code.
 - **`<StepReporter>`** (`components/StepReporter.vue`) — renders nothing;
   reports the presenter's current `stepId` to the server (`presenter:setStep`,
   including the presenter credential — see "Auth" below). See "Real gap
@@ -262,7 +263,8 @@ action/dashboard connection outright (fail closed).
 ## M5: reconnect/resume (plan 030 / PRD §12)
 
 `<JoinScreen>` now consumes the `participantId` it already persisted to
-`sessionStorage` (027's down payment): on mount, if one is stored, it emits
+`localStorage` (027's down payment; switched from `sessionStorage` in a
+follow-on fix — see below): on mount, if one is stored, it emits
 `participant:join` with it immediately and shows a lightweight "Resuming
 your session…" message instead of the name/room-code form — a refreshing
 participant never sees a join prompt, matching PRD §12's "without
@@ -279,8 +281,38 @@ considered) and the specific `participantId` itself, a 122-bit
 `crypto.randomUUID()` minted at original join time that is _never_ broadcast
 to other participant sockets (only to the presenter-code-gated dashboard
 room). That combination functions as an unguessable bearer resume token
-scoped to one browser tab's `sessionStorage`, satisfying plan 030's STOP
+scoped to one browser's `localStorage`, satisfying plan 030's STOP
 condition on resume hijacking without needing a separate token scheme.
+
+### Follow-on fix: `sessionStorage` → `localStorage` (closed-tab resume)
+
+A real workshop-tracker bug report: a participant who closed and reopened
+their tab (same browser, same device — not a same-tab refresh) was treated
+as brand new, losing their step-status history and showing as a duplicate
+row on the dashboard. Root cause: `sessionStorage` is scoped to a single
+browser tab and is cleared the instant that tab closes, so a reopened tab
+had nothing to read on mount.
+
+Fix: `participantIdentity.ts` now persists to `localStorage` instead —
+same-origin, not tab-scoped, so it survives a closed tab (and even a
+restarted browser) until explicitly cleared. The resume-hijacking threat
+model above is otherwise unaffected; only the storage backend and its
+retention duration changed.
+
+**New consequence, and its mitigation**: unlike `sessionStorage`,
+`localStorage` doesn't clear itself when a tab closes, so the _same physical
+browser_ used later by a different person (a shared/kiosk laptop at the
+workshop) would otherwise silently inherit the previous participant's
+identity, with no way to say "that's not me." `<JoinScreen>` now shows a
+small, low-key "Not you? Join as someone else" button after a successful
+resume (bottom-left, subdued — distinct from `<ErrorReportWidget>`'s
+bottom-right button) that calls `clearStoredParticipant()` and re-shows the
+join form blank. Whether to offer it is decided by the pure function
+`shouldOfferJoinAsSomeoneElse` (`src/participantIdentity.ts`, unit tested,
+same pattern as `resolveJoinAckOutcome`) — true only for a genuine resume of
+an already-known identity, never for a name/room-code just typed for the
+first time. The default resume path (same person, same tab or a reopened
+one) is unchanged and stays exactly as fast as before this fix.
 
 **When resume fails** (the server no longer recognizes the stored id — e.g.
 it restarted mid-workshop, PRD §4/§14's accepted in-memory-reset case), the

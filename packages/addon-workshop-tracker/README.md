@@ -1,13 +1,15 @@
 # slidev-addon-workshop-tracker
 
 A Slidev addon that syncs the presenter's current slide to every connected
-participant in real time, and (as of M2) lets participants identify
-themselves and acknowledge hands-on steps, over the companion
-[`workshop-tracker-server`](../workshop-tracker-server). Currently
-implements **M1 (slide sync) and M2 (participant identity + step
-tracking)** — error reporting, presence, and auth are still ahead. See
+participant in real time, lets participants identify themselves and
+acknowledge hands-on steps, and (as of M4) reports each participant's
+presence and gates presenter/dashboard actions behind a credential, over the
+companion [`workshop-tracker-server`](../workshop-tracker-server). Currently
+implements **M1 (slide sync), M2 (participant identity + step tracking), and
+M4 (presence + auth)** — error reporting (M3) is still ahead. See
 [`plans/026-workshop-tracker-m1-slide-sync.md`](../../plans/026-workshop-tracker-m1-slide-sync.md),
 [`plans/027-workshop-tracker-m2-step-tracking.md`](../../plans/027-workshop-tracker-m2-step-tracking.md),
+[`plans/029-workshop-tracker-m4-presence-auth.md`](../../plans/029-workshop-tracker-m4-presence-auth.md),
 and [`plans/prd-workshop-tracking.md`](../../plans/prd-workshop-tracking.md).
 
 ## Usage
@@ -40,9 +42,19 @@ addons:
 (A deck outside this monorepo, consuming the addon as a real published or
 `file:`-linked dependency, is unaffected — see below.)
 
-Then run the sync server (`pnpm --filter workshop-tracker-server dev`)
-alongside the Slidev dev server. By default the addon connects to
-`http://localhost:3710`; override with `VITE_WORKSHOP_TRACKER_SERVER_URL`.
+Then run the sync server (`pnpm --filter workshop-tracker-server dev`,
+configured with `WORKSHOP_ROOM_CODE`/`WORKSHOP_PRESENTER_CODE` — see that
+package's README) alongside the Slidev dev server. By default the addon
+connects to `http://localhost:3710`; override with
+`VITE_WORKSHOP_TRACKER_SERVER_URL`.
+
+**Presenter code**: load the presenter's own window with
+`?presenterCode=<the WORKSHOP_PRESENTER_CODE value>` appended to the URL
+(e.g. `http://localhost:3030/presenter/1?presenterCode=...`) — see "Auth"
+below for why it has to be supplied this way rather than any config file.
+**Room code**: participants type it into the join screen alongside their
+name (no URL param needed, though `JoinScreen.vue`'s stored
+`sessionStorage` value means it's only typed once per browser tab).
 
 ## How it works
 
@@ -92,14 +104,20 @@ runs before any addon's `setup/main.ts` executes).
   slide rendering. Persists `{ participantId, name }` to `sessionStorage` so
   a same-tab reload rejoins as the same participant.
 - **`<StepReporter>`** (`components/StepReporter.vue`) — renders nothing;
-  reports the presenter's current `stepId` to the server (`presenter:setStep`).
-  See "Real gap found during M2" below for why this exists as its own
-  component rather than living in `setup/main.ts` alongside
-  `presenter:setSlide`.
+  reports the presenter's current `stepId` to the server (`presenter:setStep`,
+  including the presenter credential — see "Auth" below). See "Real gap
+  found during M2" below for why this exists as its own component rather
+  than living in `setup/main.ts` alongside `presenter:setSlide`.
+- **`<PresenceReporter>`** (`components/PresenceReporter.vue`, plan 029
+  Step 2) — renders nothing; reports this participant's
+  `participant:visibility` on `visibilitychange` and a
+  `participant:heartbeat` every 5s (kept in sync with the server's
+  `HEARTBEAT_INTERVAL_MS` — see that component's own comment). Gated on
+  `!isPresenter`, same as `<JoinScreen>`.
 
-Both `<JoinScreen>` and `<StepReporter>` are mounted via
-[`global-top.vue`](./global-top.vue) — Slidev's documented **Global Layers**
-extension point (<https://sli.dev/features/global-layers>,
+`<JoinScreen>`, `<StepReporter>`, and `<PresenceReporter>` are all mounted
+via [`global-top.vue`](./global-top.vue) — Slidev's documented **Global
+Layers** extension point (<https://sli.dev/features/global-layers>,
 `packages/slidev/node/virtual/global-layers.ts`): a `global-top.{ts,js,vue}`
 file at an addon/theme root is auto-rendered once, persisting across every
 slide, with full injection context (`useNav()` works). This is the
@@ -177,15 +195,31 @@ below. Worth a decision in a later plan — e.g. this addon forcing
 `syncDirections` to presenter-only-send once a `workshop-tracker` server is
 in play — but out of scope for M1.
 
-## Known security gap (by design, until plan 029)
+## Auth (plan 029 / PRD §12)
 
-**Any connected client can act as "the presenter."** There is no
-authentication — a participant's browser navigating to a `/presenter/:no`
-route will emit `presenter:setSlide`/`presenter:setStep` just like the real
-instructor's would, moving/relabeling everyone else's slide and step. The
-`/dashboard` route (served by `workshop-tracker-server`) is equally open to
-anyone who knows/guesses the URL. This is an accepted, explicitly-tracked
-gap; plan [029](../../plans/029-workshop-tracker-m4-presence-auth.md) (M4)
-adds a join code that gates who's allowed to be "the presenter" and who can
-open the dashboard. Do not treat this addon as workshop-ready before 029
-lands.
+`presenter:setSlide`/`presenter:setStep` now require a `presenterCode`,
+verified server-side (`workshop-tracker-server`'s `src/auth.ts`); a
+participant's browser navigating to a `/presenter/:no` route without it has
+those events silently rejected, so it can no longer move/relabel everyone
+else's slide and step. `participant:join` now similarly requires a
+`roomCode`.
+
+**Why the presenter code is read from the URL (`src/presenterCode.ts`), not
+a build-time env var**: Slidev builds one JS bundle per deck, served to
+every route (`/N` and `/presenter/N` alike) — there's no separate
+"presenter bundle" to embed a secret into. Anything baked in via
+`import.meta.env` at build time would ship to every participant's browser
+too, which is exactly the failure mode plan 029's STOP condition rules out
+("naively embedded in a public bundle"). Reading `?presenterCode=` from
+`window.location.search` instead means the value only ever exists in the
+one browser tab whose URL the instructor set it on — never in the shipped
+bundle.
+
+The `/dashboard` route (served by `workshop-tracker-server`) is gated the
+same way, at the HTTP layer — see that package's own README for the full
+picture (including the honestly-scoped threat model: this is
+LAN-workshop-appropriate auth, not brute-force/rate-limit-hardened
+SaaS-grade auth). Do not point a real workshop room at this stack without
+setting both `WORKSHOP_ROOM_CODE` and `WORKSHOP_PRESENTER_CODE` on the
+server — an unset code means the server rejects every join/presenter
+action/dashboard connection outright (fail closed).

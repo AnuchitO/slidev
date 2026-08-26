@@ -28,10 +28,35 @@
     --copied: #c9930f;
     --done: #2fa86b;
     --offline: #6b2f3a;
-    --error: #c9524f;
+    --error: #f28b82;
     --presence-visible: #2fa86b;
     --presence-hidden: #c9930f;
     --presence-closed: #6b2f3a;
+
+    /*
+     * Error-reporting design tokens (Google-style / Material redesign,
+     * scoped to the "Error reports" section — see `.error-reports` below).
+     * The same small token set (radius scale, elevation shadows, semantic
+     * color roles, type stack) is applied identically in the participant
+     * widget (`ErrorReportWidget.vue`'s scoped `<style>`), which is how the
+     * two surfaces read as one design system despite being unable to share
+     * an actual stylesheet. Surface color intentionally stays `--panel`
+     * (this page's existing card background) rather than copying the
+     * widget's own surface token — this section still has to nest inside
+     * the *unchanged* rest of the dashboard (table, counts, codes panel),
+     * while the widget floats over arbitrary slide content and needed its
+     * own elevated surface.
+     */
+    --wt-primary: #8ab4f8;
+    --wt-on-primary: #062e6f;
+    --wt-warning: #fdd663;
+    --wt-success: #81c995;
+    --wt-radius-sm: 8px;
+    --wt-radius-md: 16px;
+    --wt-radius-full: 999px;
+    --wt-elevation-1: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px 1px rgba(0, 0, 0, 0.15);
+    --wt-elevation-2: 0 1px 2px rgba(0, 0, 0, 0.3), 0 2px 6px 2px rgba(0, 0, 0, 0.15);
+    --wt-font: 'Google Sans', Roboto, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
   }
   * { box-sizing: border-box; }
   body {
@@ -138,6 +163,28 @@
     padding: 1px 6px;
   }
 
+  /*
+   * "Error reports" section only — see the `--wt-*` token comment in
+   * `:root` above. `.error-reports` opts this section into the shared
+   * Material type stack without touching the rest of the page's typography.
+   */
+  .error-reports {
+    font-family: var(--wt-font);
+  }
+  .error-reports h2 {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .error-reports h2 .wt-icon {
+    color: var(--wt-warning);
+  }
+  .wt-icon {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    display: block;
+  }
   .error-feed {
     display: flex;
     flex-direction: column;
@@ -150,19 +197,21 @@
     background: var(--panel);
     border: 1px solid var(--border);
     border-left: 3px solid var(--error);
-    border-radius: 8px;
+    border-radius: var(--wt-radius-md);
     padding: 12px 14px;
+    box-shadow: var(--wt-elevation-1);
   }
   .error-card.resolved {
-    opacity: 0.55;
+    opacity: 0.6;
     border-left-color: var(--idle);
+    box-shadow: none;
   }
   .error-thumb {
     flex: 0 0 auto;
     width: 72px;
     height: 48px;
     object-fit: cover;
-    border-radius: 4px;
+    border-radius: var(--wt-radius-sm);
     border: 1px solid var(--border);
     cursor: zoom-in;
     background: #000;
@@ -175,11 +224,17 @@
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
-    align-items: baseline;
+    align-items: center;
     font-size: 12px;
     color: var(--muted);
     margin-bottom: 4px;
   }
+  .error-status-icon {
+    display: inline-flex;
+  }
+  .error-status-icon .wt-icon { width: 14px; height: 14px; }
+  .error-status-icon.open { color: var(--error); }
+  .error-status-icon.resolved-icon { color: var(--wt-success); }
   .error-meta .name { color: var(--text); font-weight: 600; }
   .error-text {
     margin: 0;
@@ -191,36 +246,51 @@
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 4px;
+    gap: 6px;
   }
   .resolve-message {
-    width: 160px;
-    padding: 3px 6px;
-    border-radius: 6px;
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    background: rgba(255, 255, 255, 0.05);
+    width: 170px;
+    padding: 5px 8px;
+    border-radius: var(--wt-radius-sm);
+    border: 1px solid var(--border);
+    background: transparent;
     color: inherit;
     font: inherit;
     font-size: 12px;
   }
+  .resolve-message:focus {
+    outline: none;
+    border: 2px solid var(--wt-primary);
+    padding: 4px 7px;
+  }
   .resolve-button {
-    padding: 4px 10px;
-    border-radius: 6px;
-    border: 1px solid rgba(128, 128, 128, 0.4);
-    background: transparent;
-    color: inherit;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    border-radius: var(--wt-radius-full);
+    border: none;
+    background: var(--wt-primary);
+    color: var(--wt-on-primary);
     cursor: pointer;
+    font: inherit;
+    font-weight: 500;
     font-size: 12px;
   }
+  .resolve-button .wt-icon { width: 13px; height: 13px; }
   .resolve-button:disabled {
     cursor: default;
-    opacity: 0.6;
+    opacity: 0.38;
   }
   .resolved-label {
+    display: inline-flex;
+    align-items: flex-start;
+    gap: 5px;
     font-size: 12px;
     color: var(--muted);
     text-align: right;
   }
+  .resolved-label .wt-icon { color: var(--wt-success); margin-top: 1px; }
   .resolved-message {
     display: block;
     font-style: italic;
@@ -240,8 +310,8 @@
   .lightbox img {
     max-width: 90vw;
     max-height: 90vh;
-    border-radius: 6px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+    border-radius: var(--wt-radius-sm);
+    box-shadow: var(--wt-elevation-2), 0 10px 40px rgba(0, 0, 0, 0.6);
   }
 </style>
 </head>
@@ -301,9 +371,11 @@
   -->
   <p class="empty" id="empty" hidden>No participants have joined yet.</p>
 
-  <h2>Error reports</h2>
-  <div class="error-feed" id="error-feed"></div>
-  <p class="empty" id="errors-empty" hidden>No error reports yet.</p>
+  <section class="error-reports">
+    <h2><svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z" /></svg>Error reports</h2>
+    <div class="error-feed" id="error-feed"></div>
+    <p class="empty" id="errors-empty" hidden>No error reports yet.</p>
+  </section>
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
@@ -316,6 +388,14 @@
     const errorFeedEl = document.getElementById('error-feed')
     const errorsEmptyEl = document.getElementById('errors-empty')
     const codesPanelEl = document.getElementById('codes-panel')
+
+    // Inline Material-style icons (see the token/icon comment in `:root`
+    // above) — the same glyphs `ErrorReportWidget.vue` uses, kept as plain
+    // strings here since this page's error cards are built via
+    // `innerHTML`, not a component template.
+    const ICON_WARNING = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>'
+    const ICON_CHECK = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>'
+    const ICON_SEND = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"/></svg>'
 
     // Cached so the elapsed-time ticker (below) can re-render without
     // waiting for the next server-pushed `state:update` — "how long since
@@ -502,7 +582,7 @@
         // feel like a report vanishing into a queue — the participant sees
         // the instructor actually responded.
         const actions = e.resolved
-          ? `<span class="resolved-label">resolved${e.resolutionMessage ? `<span class="resolved-message">“${escapeHtml(e.resolutionMessage)}”</span>` : ''}</span>`
+          ? `<span class="resolved-label">${ICON_CHECK}<span>Resolved${e.resolutionMessage ? `<span class="resolved-message">“${escapeHtml(e.resolutionMessage)}”</span>` : ''}</span></span>`
           : `
             <input
               type="text"
@@ -511,13 +591,18 @@
               placeholder="optional message back to them"
               value="${escapeHtml(draftMessages[e.id] || '')}"
             >
-            <button type="button" class="resolve-button" data-error-id="${escapeHtml(e.id)}">Mark resolved</button>
+            <button type="button" class="resolve-button" data-error-id="${escapeHtml(e.id)}">${ICON_SEND}<span>Mark resolved</span></button>
           `
+
+        const statusIcon = e.resolved
+          ? `<span class="error-status-icon resolved-icon">${ICON_CHECK}</span>`
+          : `<span class="error-status-icon open">${ICON_WARNING}</span>`
 
         card.innerHTML = `
           ${thumb}
           <div class="error-body">
             <div class="error-meta">
+              ${statusIcon}
               <span class="name">${escapeHtml(e.participantName)}</span>
               <span>step: ${escapeHtml(e.stepId)}</span>
               <span>${new Date(e.ts).toLocaleTimeString()}</span>

@@ -27,9 +27,26 @@ Mounted as a Global Layer (`../global-top.vue`), same reasoning as
 `setup/main.ts` can't provide (pre-`app.mount()`, no component context).
 Hidden on the presenter route (`isPresenter`) — error reporting is a
 participant action, per PRD §5's persona split.
+
+Visual design (UX/UI pass, direct participant feedback): restyled to read
+as Material Design — Google-blue primary, Material's red/amber/green
+semantic roles, elevation via layered shadows, inline Material-style SVG
+icons in place of emoji, and the resolution notice as a Material
+*snackbar* (bottom-anchored, compact, single dismiss action) rather than a
+top-right toast card — a snackbar is the idiomatic Material pattern for a
+transient, non-blocking follow-up message, and bottom-left keeps it clear
+of this widget's own bottom-right footprint instead of stacking on it.
+Theme: reacts live to Slidev's own dark/light signal (`useDarkMode()` from
+`@slidev/client`, the same composable the deck's own toggle drives) via a
+`wt-theme-light` modifier class carrying a light token override — a small
+lift since the signal is already exported for exactly this kind of
+consumption. The dashboard side of this redesign (`workshop-tracker-server/
+public/dashboard/index.html`) intentionally stays dark-only: it's a
+separate standalone page the instructor opens directly, not embedded in
+the deck, so there's no equivalent theme signal to react to there.
 -->
 <script setup lang="ts">
-import { useNav } from '@slidev/client'
+import { useDarkMode, useNav } from '@slidev/client'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { getWorkshopSocket, getWorkshopTrackerServerUrl } from '../src/client'
 import { canCaptureScreen } from '../src/errorReportCapability'
@@ -38,6 +55,7 @@ import { currentParticipant } from '../src/participantIdentity'
 import { resolveStepId } from '../src/stepId'
 
 const { isPresenter, currentFrontmatter, currentSlideNo } = useNav()
+const { isDark } = useDarkMode()
 
 const stepId = computed(() => resolveStepId(currentFrontmatter.value, currentSlideNo.value))
 
@@ -157,7 +175,7 @@ async function submit() {
 // optional message, and the server sends it — targeted, not broadcast — to
 // this specific participant's own socket as `participant:errorResolved`
 // (`server.ts`'s `presenter:resolveError` handler). Shown as a dismissible
-// banner *independent* of whether the report panel above is open — a
+// snackbar *independent* of whether the report panel above is open — a
 // participant who already closed the panel (or is mid-`<StepCommand>` on a
 // later slide) should still see that the instructor followed up, not just
 // participants who happen to have it open at that moment.
@@ -193,32 +211,41 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div v-if="!isPresenter && resolutionNotice" class="workshop-tracker-resolution-toast">
-    <span class="workshop-tracker-resolution-icon">✅</span>
-    <div class="workshop-tracker-resolution-body">
-      <p class="workshop-tracker-resolution-title">
-        The instructor marked your report resolved
-      </p>
-      <p v-if="resolutionNotice.message" class="workshop-tracker-resolution-message">
-        “{{ resolutionNotice.message }}”
-      </p>
+  <Transition name="wt-snackbar">
+    <div
+      v-if="!isPresenter && resolutionNotice"
+      class="workshop-tracker-resolution-toast"
+      :class="{ 'wt-theme-light': !isDark }"
+      role="status"
+    >
+      <svg class="wt-icon wt-icon-success" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" /></svg>
+      <div class="workshop-tracker-resolution-body">
+        <p class="workshop-tracker-resolution-title">
+          The instructor marked your report resolved
+        </p>
+        <p v-if="resolutionNotice.message" class="workshop-tracker-resolution-message">
+          “{{ resolutionNotice.message }}”
+        </p>
+      </div>
+      <button type="button" class="workshop-tracker-icon-button" aria-label="Dismiss" @click="dismissResolutionNotice">
+        <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
+      </button>
     </div>
-    <button type="button" class="workshop-tracker-resolution-close" aria-label="Dismiss" @click="dismissResolutionNotice">
-      ✕
-    </button>
-  </div>
+  </Transition>
 
-  <div v-if="!isPresenter" class="workshop-tracker-error-widget">
+  <div v-if="!isPresenter" class="workshop-tracker-error-widget" :class="{ 'wt-theme-light': !isDark }">
     <div v-if="open" class="workshop-tracker-error-panel">
       <div class="workshop-tracker-error-panel-header">
-        <span>Report a problem</span>
-        <button type="button" class="workshop-tracker-error-close" aria-label="Close" @click="toggleOpen">
-          ✕
+        <svg class="wt-icon wt-icon-warning" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z" /></svg>
+        <span class="workshop-tracker-error-panel-title">Report a problem</span>
+        <button type="button" class="workshop-tracker-icon-button" aria-label="Close" @click="toggleOpen">
+          <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
         </button>
       </div>
 
       <p v-if="submitted" class="workshop-tracker-error-status">
-        Sent — thanks! The instructor can see this now.
+        <svg class="wt-icon wt-icon-success" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" /></svg>
+        <span>Sent — thanks! The instructor can see this now.</span>
       </p>
 
       <template v-else>
@@ -232,16 +259,18 @@ onBeforeUnmount(() => {
         <div v-if="canCapture" class="workshop-tracker-error-capture">
           <button
             type="button"
-            class="workshop-tracker-error-button"
+            class="workshop-tracker-error-button workshop-tracker-error-button-outlined"
             :disabled="capturing"
             @click="captureScreen"
           >
-            {{ capturing ? 'Capturing…' : capturedBlob ? 'Retake screenshot' : 'Capture screen' }}
+            <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 2 7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z" /></svg>
+            <span>{{ capturing ? 'Capturing…' : capturedBlob ? 'Retake screenshot' : 'Capture screen' }}</span>
           </button>
-          <span v-if="capturedBlob" class="workshop-tracker-error-captured">
+          <span v-if="capturedBlob" class="workshop-tracker-error-chip">
+            <svg class="wt-icon wt-icon-success" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" /></svg>
             Screenshot attached
-            <button type="button" class="workshop-tracker-error-remove" @click="clearCapture">
-              remove
+            <button type="button" class="workshop-tracker-error-chip-remove" aria-label="Remove screenshot" @click="clearCapture">
+              <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
             </button>
           </span>
         </div>
@@ -256,7 +285,8 @@ onBeforeUnmount(() => {
           :disabled="submitting || (!text.trim() && !capturedBlob)"
           @click="submit"
         >
-          {{ submitting ? 'Sending…' : 'Send report' }}
+          <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z" /></svg>
+          <span>{{ submitting ? 'Sending…' : 'Send report' }}</span>
         </button>
       </template>
     </div>
@@ -264,15 +294,82 @@ onBeforeUnmount(() => {
     <button
       type="button"
       class="workshop-tracker-error-toggle"
+      :class="{ 'workshop-tracker-error-toggle-open': open }"
       :aria-expanded="open"
+      :aria-label="open ? 'Close report a problem' : 'Report a problem'"
       @click="toggleOpen"
     >
-      {{ open ? '✕' : '⚠️ Report a problem' }}
+      <svg v-if="open" class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
+      <template v-else>
+        <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z" /></svg>
+        <span>Report a problem</span>
+      </template>
     </button>
   </div>
 </template>
 
 <style scoped>
+/*
+ * Design tokens (Material-inspired, "Google style" per direct participant
+ * feedback): a small, deliberately-limited set applied identically here and
+ * in the dashboard's error feed (`workshop-tracker-server/public/dashboard/
+ * index.html`) even though the two can't share a stylesheet — same radius
+ * scale, same elevation shadows, same semantic color roles, same type
+ * stack, kept in sync by eye. Dark values are the defaults (this widget's
+ * historical/only look); `.wt-theme-light` overrides them when
+ * `useDarkMode()` reports the deck is in light mode.
+ */
+.workshop-tracker-error-widget,
+.workshop-tracker-resolution-toast {
+  --wt-color-primary: #8ab4f8;
+  --wt-color-on-primary: #062e6f;
+  --wt-color-error: #f28b82;
+  --wt-color-warning: #fdd663;
+  --wt-color-success: #81c995;
+  --wt-color-surface: #2d2e31;
+  --wt-color-surface-container: #37393c;
+  --wt-color-on-surface: #e8eaed;
+  --wt-color-on-surface-variant: #9aa0a6;
+  --wt-color-outline: #5f6368;
+  --wt-color-inverse-surface: #e8eaed;
+  --wt-color-inverse-on-surface: #202124;
+  --wt-radius-sm: 8px;
+  --wt-radius-md: 16px;
+  --wt-radius-full: 999px;
+  --wt-elevation-2: 0 1px 2px rgba(0, 0, 0, 0.3), 0 2px 6px 2px rgba(0, 0, 0, 0.15);
+  --wt-elevation-3: 0 1px 3px rgba(0, 0, 0, 0.3), 0 4px 8px 3px rgba(0, 0, 0, 0.15);
+  --wt-font: 'Google Sans', Roboto, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+  font-family: var(--wt-font);
+}
+.workshop-tracker-error-widget.wt-theme-light,
+.workshop-tracker-resolution-toast.wt-theme-light {
+  --wt-color-primary: #1a73e8;
+  --wt-color-on-primary: #ffffff;
+  --wt-color-error: #d93025;
+  --wt-color-warning: #ea8600;
+  --wt-color-success: #188038;
+  --wt-color-surface: #ffffff;
+  --wt-color-surface-container: #f1f3f4;
+  --wt-color-on-surface: #202124;
+  --wt-color-on-surface-variant: #5f6368;
+  --wt-color-outline: #dadce0;
+  --wt-color-inverse-surface: #303134;
+  --wt-color-inverse-on-surface: #e8eaed;
+}
+
+.wt-icon {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  display: block;
+}
+.wt-icon-warning {
+  color: var(--wt-color-warning);
+}
+.wt-icon-success {
+  color: var(--wt-color-success);
+}
+
 .workshop-tracker-error-widget {
   position: fixed;
   right: 16px;
@@ -281,144 +378,279 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 0.5em;
+  gap: 0.6em;
   font-size: 14px;
 }
+
+/* Closed state: an extended FAB (icon + label, pill, elevated, filled with
+   the primary color) — Material's standard affordance for a persistent,
+   always-available primary action floating over content. */
 .workshop-tracker-error-toggle {
-  padding: 0.6em 1em;
-  border-radius: 999px;
-  border: 1px solid rgba(128, 128, 128, 0.4);
-  background: #17181d;
-  color: #f0f0f2;
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.75em 1.1em;
+  border-radius: var(--wt-radius-full);
+  border: none;
+  background: var(--wt-color-primary);
+  color: var(--wt-color-on-primary);
+  font: inherit;
+  font-weight: 500;
   cursor: pointer;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--wt-elevation-3);
+  transition:
+    box-shadow 0.15s ease,
+    transform 0.1s ease;
 }
+.workshop-tracker-error-toggle:hover {
+  box-shadow:
+    var(--wt-elevation-3),
+    0 0 0 8px rgba(138, 180, 248, 0.12);
+}
+.workshop-tracker-error-toggle:active {
+  transform: scale(0.97);
+}
+/* Open state: collapses to a small icon-only circular FAB, since the panel
+   above already carries the label — avoids two redundant "close" targets
+   competing for attention. */
+.workshop-tracker-error-toggle-open {
+  padding: 0.65em;
+  border-radius: 50%;
+}
+.workshop-tracker-error-toggle-open .wt-icon {
+  color: var(--wt-color-on-primary);
+}
+
 .workshop-tracker-error-panel {
   display: flex;
   flex-direction: column;
-  gap: 0.6em;
-  width: min(320px, 80vw);
-  padding: 1em;
-  border-radius: 12px;
-  background: #17181d;
-  color: #f0f0f2;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  gap: 0.75em;
+  width: min(340px, 85vw);
+  padding: 1.1em;
+  border-radius: var(--wt-radius-md);
+  background: var(--wt-color-surface);
+  color: var(--wt-color-on-surface);
+  box-shadow: var(--wt-elevation-3);
 }
 .workshop-tracker-error-panel-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  font-weight: 600;
+  gap: 0.5em;
 }
-.workshop-tracker-error-close {
-  background: none;
+.workshop-tracker-error-panel-title {
+  flex: 1 1 auto;
+  font-weight: 500;
+  font-size: 1.05em;
+}
+
+/* Small circular icon button, used for every "dismiss/close" affordance —
+   a Material "icon button": no border, a faint state-layer on hover so it
+   doesn't compete with the filled/outlined buttons below it. */
+.workshop-tracker-icon-button {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
   border: none;
-  color: inherit;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--wt-color-on-surface-variant);
   cursor: pointer;
-  font-size: 1em;
-  opacity: 0.7;
+  transition: background 0.15s ease;
 }
+.workshop-tracker-icon-button:hover {
+  background: rgba(128, 128, 128, 0.16);
+  color: var(--wt-color-on-surface);
+}
+
+/* Outlined text field, Material's default for a multi-line input. */
 .workshop-tracker-error-textarea {
   width: 100%;
   resize: vertical;
-  padding: 0.5em;
-  border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  background: rgba(255, 255, 255, 0.05);
+  padding: 0.65em 0.75em;
+  border-radius: var(--wt-radius-sm);
+  border: 1px solid var(--wt-color-outline);
+  background: transparent;
   color: inherit;
   font: inherit;
 }
+.workshop-tracker-error-textarea:focus {
+  outline: none;
+  border: 2px solid var(--wt-color-primary);
+  padding: calc(0.65em - 1px) calc(0.75em - 1px);
+}
+.workshop-tracker-error-textarea::placeholder {
+  color: var(--wt-color-on-surface-variant);
+}
+
 .workshop-tracker-error-capture {
   display: flex;
   align-items: center;
   gap: 0.5em;
   flex-wrap: wrap;
 }
-.workshop-tracker-error-captured {
+
+/* Input-chip pattern for "screenshot attached": a small pill summarizing
+   an attachment, with its own trailing remove control. */
+.workshop-tracker-error-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.3em 0.5em 0.3em 0.6em;
+  border-radius: var(--wt-radius-full);
+  background: var(--wt-color-surface-container);
   font-size: 0.85em;
-  opacity: 0.85;
+  color: var(--wt-color-on-surface-variant);
 }
-.workshop-tracker-error-remove {
-  background: none;
-  border: none;
-  color: #c9930f;
-  cursor: pointer;
-  text-decoration: underline;
-  font: inherit;
+.workshop-tracker-error-chip-remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
   padding: 0;
-  margin-left: 0.3em;
-}
-.workshop-tracker-error-button {
-  padding: 0.5em 0.75em;
-  border-radius: 6px;
-  border: 1px solid rgba(128, 128, 128, 0.4);
+  margin-left: 0.15em;
+  border: none;
+  border-radius: 50%;
   background: transparent;
   color: inherit;
   cursor: pointer;
+}
+.workshop-tracker-error-chip-remove:hover {
+  background: rgba(128, 128, 128, 0.24);
+}
+.workshop-tracker-error-chip-remove .wt-icon {
+  width: 13px;
+  height: 13px;
+}
+
+/* Two button treatments give the panel a clear action hierarchy: the
+   secondary action (capture) is outlined, the primary action (send) is
+   filled with the primary color — standard Material button hierarchy. */
+.workshop-tracker-error-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45em;
+  padding: 0.55em 0.9em;
+  border-radius: var(--wt-radius-full);
+  border: none;
+  font: inherit;
+  font-weight: 500;
   font-size: 0.9em;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+.workshop-tracker-error-button-outlined {
+  background: transparent;
+  color: var(--wt-color-on-surface);
+  border: 1px solid var(--wt-color-outline);
+}
+.workshop-tracker-error-button-outlined:hover:not(:disabled) {
+  background: rgba(128, 128, 128, 0.12);
 }
 .workshop-tracker-error-button:disabled {
   cursor: default;
-  opacity: 0.6;
+  opacity: 0.38;
 }
 .workshop-tracker-error-submit {
-  border-color: rgba(47, 168, 107, 0.6);
+  width: 100%;
+  background: var(--wt-color-primary);
+  color: var(--wt-color-on-primary);
+  box-shadow: var(--wt-elevation-2);
 }
-.workshop-tracker-error-message {
-  margin: 0;
-  font-size: 0.85em;
-  color: #e08a8a;
-}
-.workshop-tracker-error-status {
-  margin: 0;
-  font-size: 0.9em;
-  color: #2fa86b;
+.workshop-tracker-error-submit:hover:not(:disabled) {
+  box-shadow: var(--wt-elevation-3);
 }
 
+.workshop-tracker-error-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4em;
+  margin: 0;
+  font-size: 0.85em;
+  color: var(--wt-color-error);
+}
+.workshop-tracker-error-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  margin: 0;
+  font-size: 0.9em;
+  color: var(--wt-color-success);
+}
+
+/*
+ * Resolution notice, as a Material Snackbar rather than the previous
+ * top-right toast card: bottom-anchored (opposite corner from the FAB, so
+ * it never collides with the widget), compact, auto-dismissing, single
+ * action. Deliberately uses the *inverse* surface color even in dark mode
+ * — Material's own snackbar spec inverts surface/on-surface so a
+ * transient message visually pops against the page instead of blending
+ * into it, which a same-color card can't do.
+ */
 .workshop-tracker-resolution-toast {
   position: fixed;
-  top: 16px;
-  right: 16px;
+  left: 16px;
+  bottom: 16px;
   z-index: 950;
   display: flex;
   align-items: flex-start;
   gap: 0.6em;
-  width: min(320px, 80vw);
-  padding: 0.85em 1em;
-  border-radius: 12px;
-  background: #17181d;
-  color: #f0f0f2;
-  border: 1px solid rgba(47, 168, 107, 0.5);
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  width: min(340px, 85vw);
+  padding: 0.85em 0.9em;
+  border-radius: var(--wt-radius-sm);
+  background: var(--wt-color-inverse-surface);
+  color: var(--wt-color-inverse-on-surface);
+  box-shadow: var(--wt-elevation-3);
   font-size: 14px;
 }
-.workshop-tracker-resolution-icon {
-  flex: 0 0 auto;
-  line-height: 1.3;
+.workshop-tracker-resolution-toast .workshop-tracker-icon-button {
+  color: var(--wt-color-inverse-on-surface);
+  opacity: 0.75;
+}
+.workshop-tracker-resolution-toast .workshop-tracker-icon-button:hover {
+  opacity: 1;
+  background: rgba(128, 128, 128, 0.24);
 }
 .workshop-tracker-resolution-body {
   flex: 1 1 auto;
   min-width: 0;
+  padding-top: 0.1em;
 }
 .workshop-tracker-resolution-title {
   margin: 0;
-  font-weight: 600;
+  font-weight: 500;
 }
 .workshop-tracker-resolution-message {
   margin: 0.3em 0 0;
-  opacity: 0.85;
+  opacity: 0.8;
   white-space: pre-wrap;
   word-break: break-word;
 }
-.workshop-tracker-resolution-close {
-  flex: 0 0 auto;
-  background: none;
-  border: none;
-  color: inherit;
-  cursor: pointer;
-  font-size: 1em;
-  opacity: 0.7;
-  padding: 0;
+
+.wt-snackbar-enter-active,
+.wt-snackbar-leave-active {
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+.wt-snackbar-enter-from,
+.wt-snackbar-leave-to {
+  opacity: 0;
+  transform: translateY(12px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workshop-tracker-error-toggle,
+  .wt-snackbar-enter-active,
+  .wt-snackbar-leave-active {
+    transition: none;
+  }
 }
 </style>

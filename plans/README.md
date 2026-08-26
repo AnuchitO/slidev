@@ -118,7 +118,7 @@ meaningful the way it is for the hardening plans above.
 | 026 | M1 — Slide sync (addon + sync server skeleton) | P1 | M | MED | — | DONE |
 | 027 | M2 — Participant identity + step tracking | P1 | M-L | MED | 026 | DONE |
 | 028 | M3 — Error reporting (text + screenshot) | P2 | M | MED | 027 | TODO |
-| 029 | M4 — Presence tracking + presenter/dashboard auth | P2 | M | MED | 027 | TODO |
+| 029 | M4 — Presence tracking + presenter/dashboard auth | P2 | M | MED | 027 | DONE |
 | 030 | M5 — Reconnect/resume + load testing + hardening | P3 | M | LOW-MED | 026, 027, 028, 029 | TODO |
 
 **Dependency notes**: 026 → 027 is a hard sequence (027 needs 026's
@@ -128,11 +128,21 @@ reporting and presence/auth touch different parts of the server and addon.
 030 depends on all four since it hardens reconnect + load + auth across the
 whole stack and performs the PRD's final end-to-end acceptance pass.
 
-**Known, deliberately deferred security gap**: 026-028 ship with presenter
-actions and the dashboard route unauthenticated by design (documented inline
-as `NOTE(security)` comments each plan introduces) — 029 is what closes this.
-Do not treat 026-028 as workshop-ready in isolation; they're de-risking
-slices of a stack that isn't safe to point at a real room until 029 lands.
+**Known, deliberately deferred security gap — now closed by 029**: 026-028
+shipped with presenter actions and the dashboard route unauthenticated by
+design (documented inline as `NOTE(security)` comments each plan
+introduces). 029 closes this for every surface that existed in its own
+worktree at the time it landed (`presenter:setSlide`, `presenter:setStep`,
+`participant:join`, `dashboard:join`, and the `/dashboard` HTTP route — see
+that package's README for the mechanism). **Merge-order caveat**: 029 was
+implemented concurrently with 028 in a separate worktree and could not see
+028's changes; if 028 introduces its own privileged surface (e.g. a
+`presenter:resolveError` event, per its own plan's sketch), whoever merges
+028 and 029 together must grep for `NOTE(security)` again post-merge and
+gate any surface 028 added the same way 029 gated the others — 029's own
+plan file's "Maintenance notes" section flags this explicitly. Don't treat
+that as 029 being incomplete; it closed everything that existed for it to
+close.
 
 ## Direction findings (not planned here — options for the maintainer)
 

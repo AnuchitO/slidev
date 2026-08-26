@@ -4,6 +4,7 @@ import {
   PARTICIPANT_STORAGE_KEY,
   readStoredParticipant,
   resolveJoinAckOutcome,
+  shouldOfferJoinAsSomeoneElse,
   writeStoredParticipant,
 } from './participantIdentity'
 
@@ -83,5 +84,26 @@ describe('resolveJoinAckOutcome', () => {
 
   it('is "resume-failed" when a resume was requested but the server minted a different id (resumed: false)', () => {
     expect(resolveJoinAckOutcome('stale-id', { participantId: 'p2', currentSlideIndex: 1, resumed: false })).toBe('resume-failed')
+  })
+})
+
+// Follow-on to plan 030: the localStorage switch (participantIdentity.ts's
+// doc comment) means a shared/kiosk browser can now silently resume a
+// *previous* person's identity indefinitely (localStorage, unlike
+// sessionStorage, doesn't clear itself when a tab closes). JoinScreen.vue's
+// "Not you? Join as someone else" link is the way out — this decides when
+// it's actually offered, pulled into a pure function for the same reason as
+// `resolveJoinAckOutcome` above.
+describe('shouldOfferJoinAsSomeoneElse', () => {
+  it('is false for a first-time join (no participantId was requested)', () => {
+    expect(shouldOfferJoinAsSomeoneElse(undefined, { participantId: 'p1', currentSlideIndex: 1, resumed: false })).toBe(false)
+  })
+
+  it('is true once the server confirms a requested id was actually resumed', () => {
+    expect(shouldOfferJoinAsSomeoneElse('p1', { participantId: 'p1', currentSlideIndex: 3, resumed: true })).toBe(true)
+  })
+
+  it('is false when a participantId was requested but the server did not resume it (fresh/fallback)', () => {
+    expect(shouldOfferJoinAsSomeoneElse('stale-id', { participantId: 'p2', currentSlideIndex: 1, resumed: false })).toBe(false)
   })
 })

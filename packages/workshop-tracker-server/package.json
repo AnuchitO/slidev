@@ -1,0 +1,23 @@
+{
+  "name": "workshop-tracker-server",
+  "type": "module",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Realtime sync server for slidev-addon-workshop-tracker (M1: slide sync only)",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsdown",
+    "start": "node dist/index.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:types",
+    "socket.io-client": "^4.8.3",
+    "tsdown": "catalog:dev",
+    "tsx": "catalog:dev",
+    "vitest": "catalog:dev"
+  }
+}

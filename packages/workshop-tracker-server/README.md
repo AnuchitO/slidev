@@ -78,13 +78,13 @@ process at `/dashboard` (see "Dashboard" below).
   `errorId` is a no-op, not an error.
 - `state:update` now also carries `errors: ErrorReport[]` — folded into the
   existing event (PRD §10's literal `state:update { currentSlideIndex,
-  participants[], errors[] }` shape) rather than a new event, per plan 028
+participants[], errors[] }` shape) rather than a new event, per plan 028
   Step 1's decision: error reports are rare compared to step-status churn,
   so the combined payload isn't a size/frequency problem, and the dashboard
   client needs no restructuring beyond rendering a new field.
 - `POST /api/screenshot` (multipart: `participantId`, `stepId`, `text?`,
   `screenshot`) — the **screenshot** error-report path (PRD §10's REST
-  upload). Deliberately the *only* path that accepts a screenshot; a request
+  upload). Deliberately the _only_ path that accepts a screenshot; a request
   with no `screenshot` file is rejected with 400 pointing at the WS
   `participant:error` event instead — the two paths never duplicate the
   identical text-only responsibility. Validates `participantId` against the
@@ -102,7 +102,7 @@ process at `/dashboard` (see "Dashboard" below).
   for a crafted `../`-laden client filename to traverse with on the write
   side. On the read side, `src/uploads.ts`'s `resolveUploadPath` rejects
   any request whose filename doesn't match that exact
-  `uuid.(png|jpg|webp)` shape *before* `sirv` ever touches the filesystem —
+  `uuid.(png|jpg|webp)` shape _before_ `sirv` ever touches the filesystem —
   defense-in-depth on top of `sirv`'s own path normalization, mirroring the
   "constrain the shape, then confirm containment" discipline from
   `plans/016-confine-export-output-path.md`. No retention/cleanup policy

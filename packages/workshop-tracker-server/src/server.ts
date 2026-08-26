@@ -2,6 +2,10 @@ import type { Server as HttpServer } from 'node:http'
 import type { StepState } from './session'
 import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
+import { fileURLToPath } from 'node:url'
+import connect from 'connect'
+import { join } from 'pathe'
+import sirv from 'sirv'
 import { Server as SocketIOServer } from 'socket.io'
 import {
   joinParticipant,
@@ -27,6 +31,12 @@ export interface WorkshopTrackerServer {
 // (plan 027 Step 1 / STOP condition 3).
 const DASHBOARD_ROOM = 'dashboard'
 
+// The dashboard (plan 027 Step 3) is served as a small static page by this
+// same process — same origin as the Socket.io server, so no CORS
+// configuration is needed for it. See this package's README for why (option
+// 1 of the two considered in the plan).
+const DASHBOARD_PUBLIC_DIR = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'public', 'dashboard')
+
 function buildStateUpdate() {
   return {
     currentSlideIndex: session.currentSlideIndex,
@@ -47,7 +57,21 @@ function broadcastStateUpdate(io: SocketIOServer) {
  * without touching process bootstrapping.
  */
 export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServerOptions = {}): WorkshopTrackerServer {
-  const httpServer = createServer()
+  // `sirv` is mounted on the connect app *before* Socket.io attaches to the
+  // same `httpServer` below. Engine.io's `attach()` caches whatever
+  // `request` listeners are already registered, removes them, and installs
+  // its own listener that intercepts only requests under its own path
+  // (`/socket.io/` by default) — everything else falls through to the
+  // cached listeners (see `engine.io`'s `Server.prototype.attach`). That's
+  // what makes serving `/dashboard` from the *same* http server safe:
+  // Socket.io's own handshake/polling traffic is untouched, and this app
+  // only ever sees non-`/socket.io/` requests. Mounting sirv under a
+  // `/dashboard` path prefix (rather than at `/`) keeps this deliberate and
+  // explicit rather than relying on that fallthrough for every path.
+  const app = connect()
+  app.use('/dashboard', sirv(DASHBOARD_PUBLIC_DIR, { single: true, dev: true, etag: true }))
+
+  const httpServer = createServer(app)
   const io = new SocketIOServer(httpServer, {
     cors: { origin: options.origin ?? '*' },
   })

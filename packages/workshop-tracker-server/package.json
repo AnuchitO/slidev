@@ -11,9 +11,13 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "connect": "catalog:prod",
+    "pathe": "catalog:prod",
+    "sirv": "catalog:prod",
     "socket.io": "^4.8.3"
   },
   "devDependencies": {
+    "@types/connect": "catalog:types",
     "@types/node": "catalog:types",
     "socket.io-client": "^4.8.3",
     "tsdown": "catalog:dev",

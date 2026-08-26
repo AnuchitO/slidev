@@ -22,6 +22,7 @@
     --copied: #c9930f;
     --done: #2fa86b;
     --offline: #6b2f3a;
+    --error: #c9524f;
   }
   * { box-sizing: border-box; }
   body {
@@ -32,6 +33,7 @@
     padding: 24px;
   }
   h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 28px 0 10px; }
   .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
   .counts {
     display: flex;
@@ -79,11 +81,97 @@
   .empty { color: var(--muted); padding: 20px; text-align: center; }
   .conn { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
   .conn.live { color: var(--done); }
+
+  .error-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .error-card {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--error);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .error-card.resolved {
+    opacity: 0.55;
+    border-left-color: var(--idle);
+  }
+  .error-thumb {
+    flex: 0 0 auto;
+    width: 72px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    cursor: zoom-in;
+    background: #000;
+  }
+  .error-body {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .error-meta {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: baseline;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .error-meta .name { color: var(--text); font-weight: 600; }
+  .error-text {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .error-actions {
+    flex: 0 0 auto;
+  }
+  .resolve-button {
+    padding: 4px 10px;
+    border-radius: 6px;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .resolve-button:disabled {
+    cursor: default;
+    opacity: 0.6;
+  }
+  .resolved-label {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 2000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.8);
+    cursor: zoom-out;
+  }
+  .lightbox img {
+    max-width: 90vw;
+    max-height: 90vh;
+    border-radius: 6px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+  }
 </style>
 </head>
 <body>
   <h1>Workshop Tracker — Instructor Dashboard</h1>
-  <p class="sub">Minimal M2 dashboard: participant roster + status for the current step. No auth yet — see the note in this file's source.</p>
+  <p class="sub">Participant roster, current-step status, and error feed. No auth yet — see the note in this file's source.</p>
   <p class="conn" id="conn">connecting…</p>
 
   <div class="counts">
@@ -91,6 +179,7 @@
     <div class="count"><span class="n" id="count-done">0</span><span class="l">done this step</span></div>
     <div class="count"><span class="n" id="count-slide">–</span><span class="l">current slide</span></div>
     <div class="count"><span class="n" id="count-step">–</span><span class="l">current stepId</span></div>
+    <div class="count"><span class="n" id="count-errors">0</span><span class="l">open errors</span></div>
   </div>
 
   <table>
@@ -106,12 +195,18 @@
   </table>
   <p class="empty" id="empty" hidden>No participants have joined yet.</p>
 
+  <h2>Error reports</h2>
+  <div class="error-feed" id="error-feed"></div>
+  <p class="empty" id="errors-empty" hidden>No error reports yet.</p>
+
   <script src="/socket.io/socket.io.js"></script>
   <script>
     const socket = io()
     const connEl = document.getElementById('conn')
     const rowsEl = document.getElementById('rows')
     const emptyEl = document.getElementById('empty')
+    const errorFeedEl = document.getElementById('error-feed')
+    const errorsEmptyEl = document.getElementById('errors-empty')
 
     socket.on('connect', () => {
       connEl.textContent = 'live'
@@ -129,7 +224,7 @@
     }
 
     function render(state) {
-      const { currentSlideIndex, currentStepId, participants, stepStatus } = state
+      const { currentSlideIndex, currentStepId, participants, stepStatus, errors } = state
 
       document.getElementById('count-slide').textContent = currentSlideIndex
       document.getElementById('count-step').textContent = currentStepId
@@ -154,6 +249,78 @@
         `
         rowsEl.appendChild(tr)
       }
+
+      renderErrors(errors || [])
+    }
+
+    // Unresolved first (newest first within each group), so the instructor
+    // sees what still needs attention without scrolling past resolved
+    // history — resolved reports stay visible (dimmed), not hidden, so a
+    // dashboard reload still shows the session's full error history (plan
+    // 028 Step 3's verification: resolved state persists server-side, not
+    // just as client-side UI state).
+    function renderErrors(errors) {
+      const openCount = errors.filter(e => !e.resolved).length
+      document.getElementById('count-errors').textContent = openCount
+
+      errorFeedEl.innerHTML = ''
+      errorsEmptyEl.hidden = errors.length > 0
+
+      const sorted = [...errors].sort((a, b) => {
+        if (a.resolved !== b.resolved)
+          return a.resolved ? 1 : -1
+        return b.ts - a.ts
+      })
+
+      for (const e of sorted) {
+        const card = document.createElement('div')
+        card.className = `error-card${e.resolved ? ' resolved' : ''}`
+
+        const thumb = e.screenshotUrl
+          ? `<img class="error-thumb" src="${escapeHtml(e.screenshotUrl)}" alt="screenshot from ${escapeHtml(e.participantName)}" data-full="${escapeHtml(e.screenshotUrl)}" />`
+          : ''
+
+        card.innerHTML = `
+          ${thumb}
+          <div class="error-body">
+            <div class="error-meta">
+              <span class="name">${escapeHtml(e.participantName)}</span>
+              <span>step: ${escapeHtml(e.stepId)}</span>
+              <span>${new Date(e.ts).toLocaleTimeString()}</span>
+            </div>
+            ${e.text ? `<p class="error-text">${escapeHtml(e.text)}</p>` : ''}
+          </div>
+          <div class="error-actions">
+            ${
+              e.resolved
+                ? '<span class="resolved-label">resolved</span>'
+                : `<button type="button" class="resolve-button" data-error-id="${escapeHtml(e.id)}">Mark resolved</button>`
+            }
+          </div>
+        `
+        errorFeedEl.appendChild(card)
+      }
+    }
+
+    errorFeedEl.addEventListener('click', (event) => {
+      const thumb = event.target.closest('[data-full]')
+      if (thumb) {
+        openLightbox(thumb.dataset.full)
+        return
+      }
+      const button = event.target.closest('.resolve-button')
+      if (button) {
+        button.disabled = true
+        socket.emit('presenter:resolveError', { errorId: button.dataset.errorId })
+      }
+    })
+
+    function openLightbox(src) {
+      const overlay = document.createElement('div')
+      overlay.className = 'lightbox'
+      overlay.innerHTML = `<img src="${escapeHtml(src)}" alt="full-size screenshot" />`
+      overlay.addEventListener('click', () => overlay.remove())
+      document.body.appendChild(overlay)
     }
 
     function escapeHtml(str) {

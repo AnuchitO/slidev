@@ -121,10 +121,18 @@ needed. Loads Socket.io's own client bundle (`/socket.io/socket.io.js`,
 served by Socket.io by default) and renders `state:update` payloads — no
 build step, no polling.
 
-Shows: live counts (joined, done-this-step/total, current slide/stepId) and
-a participant table (name, connected, status for the _current_ step, joined
-at). Counts and an error feed beyond this are 028/029's job — don't expand
-this into a full SPA without re-reading plan 027's Step 3 trade-off note.
+Shows: live counts (joined, done-this-step/total, current slide/stepId, open
+errors), a participant table (name, connected, status for the _current_
+step, joined at), and (as of plan 028) an **error feed**: participant name,
+step, timestamp, text and/or a screenshot thumbnail (click for a full-size
+lightbox — a plain image-swap overlay, no new dependency), and a "Mark
+resolved" button wired to `presenter:resolveError { errorId }`. Resolved
+reports stay visible (dimmed, sorted after open ones) rather than
+disappearing — the point is a dashboard reload still reflects resolved
+state, which lives in the server's `ErrorReport.resolved` field, not
+client-side UI state. Presence beyond "connected" is still 029's job — don't
+expand this into a full SPA without re-reading plan 027's Step 3 trade-off
+note.
 
 ## Known security gap (by design, until plan 029)
 
@@ -144,9 +152,13 @@ treat it as secure, before 029 lands.
 pnpm --filter workshop-tracker-server test
 ```
 
-`src/server.test.ts` spins up real `socket.io-client` pairs against an
-in-process server on an ephemeral port and asserts the full event contract
-above, including that `state:update` is genuinely room-scoped (a connected
-socket that never calls `dashboard:join` never receives it). Left in place
-for 028+ to extend with the error/presence events rather than starting from
-scratch.
+`src/server.test.ts` spins up real `socket.io-client` pairs (and, as of
+plan 028, real `fetch()` multipart requests) against an in-process server on
+an ephemeral port and asserts the full event contract above, including that
+`state:update` is genuinely room-scoped (a connected socket that never calls
+`dashboard:join` never receives it), and the `POST /api/screenshot` /
+`GET /uploads/:filename` contract (valid upload, unknown `participantId`,
+missing/oversized/unsupported-type file, and path-traversal rejection).
+`src/session.test.ts` and `src/uploads.test.ts` cover the pure store/path
+logic directly. Left in place for 029+ to extend with the presence events
+rather than starting from scratch.

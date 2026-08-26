@@ -23,6 +23,15 @@ Storage read/write and the shared `currentParticipant` ref live in
 `../src/participantIdentity.ts` (plan 028) rather than inline here — once
 `<ErrorReportWidget>` also needed to know "who joined", duplicating this
 logic in two components would risk the two drifting.
+
+Persists to `localStorage`, not `sessionStorage` — a follow-on fix to plan
+030's resume story (see `participantIdentity.ts`'s doc comment) so a
+closed-and-reopened tab, not just a same-tab refresh, still resumes the
+same participant. The one consequence that introduces — a shared/kiosk
+browser silently resuming the *previous* person's identity, with no way to
+say "that's not me" — is handled by the small "Not you? Join as someone
+else" button rendered after a successful resume, calling
+`clearStoredParticipant()` and re-showing this join form blank.
 -->
 <script setup lang="ts">
 import { useNav } from '@slidev/client'
@@ -33,6 +42,7 @@ import {
   currentParticipant,
   readStoredParticipant,
   resolveJoinAckOutcome,
+  shouldOfferJoinAsSomeoneElse,
   writeStoredParticipant,
 } from '../src/participantIdentity'
 
@@ -64,6 +74,16 @@ const joinError = ref('')
 // duplicate/"ghost" row on the dashboard; found via plan 030's own manual
 // server-restart verification, not a hypothetical).
 const pendingParticipantId = ref<string | undefined>()
+// True once this tab has joined by resuming an *already-known* identity —
+// either the common case (a stored participantId from a previous visit,
+// consumed automatically on mount) or the resume-fallback retry above —
+// rather than a name/room-code the participant just typed for the first
+// time. Drives the low-key "Not you?" link below: the localStorage switch
+// (see participantIdentity.ts's doc comment) means this browser will keep
+// silently resuming that identity indefinitely, which is exactly right for
+// the same person coming back, but wrong for a shared/kiosk browser that a
+// *different* person picks up next — this is their way out.
+const resumedKnownIdentity = ref(false)
 
 function join(joinName: string, joinRoomCode: string, participantId?: string) {
   submitting.value = true
@@ -103,6 +123,7 @@ function join(joinName: string, joinRoomCode: string, participantId?: string) {
       currentParticipant.value = participant
       joined.value = true
       resuming.value = false
+      resumedKnownIdentity.value = shouldOfferJoinAsSomeoneElse(participantId, ack)
     },
   )
 }
@@ -121,6 +142,24 @@ function onSubmit() {
   if (!trimmedName || !trimmedRoomCode || submitting.value)
     return
   join(trimmedName, trimmedRoomCode, pendingParticipantId.value)
+}
+
+// The way out of a silent resume (see `resumedKnownIdentity` above): drops
+// the stored identity and re-shows the join form, blank, for a fresh
+// name/room-code entry — the same shape as a first-ever join on this
+// browser. Deliberately *not* wired into the failed-resume path above
+// (that already clears storage and re-prompts on its own); this is only for
+// a *successful* resume the current person doesn't recognize as themselves.
+function joinAsSomeoneElse() {
+  clearStoredParticipant()
+  currentParticipant.value = undefined
+  pendingParticipantId.value = undefined
+  resumedKnownIdentity.value = false
+  name.value = ''
+  roomCode.value = ''
+  joinError.value = ''
+  joined.value = false
+  resuming.value = false
 }
 </script>
 
@@ -163,6 +202,14 @@ function onSubmit() {
       </button>
     </form>
   </div>
+  <button
+    v-if="!isPresenter && joined && resumedKnownIdentity"
+    type="button"
+    class="workshop-tracker-not-you"
+    @click="joinAsSomeoneElse"
+  >
+    Not you? Join as someone else
+  </button>
 </template>
 
 <style scoped>
@@ -221,5 +268,30 @@ function onSubmit() {
 .workshop-tracker-join-button:disabled {
   opacity: 0.6;
   cursor: default;
+}
+/*
+ * Deliberately understated (small, low-opacity, bottom-left) — this is the
+ * rare "wrong person on a shared/kiosk browser" case, not the common path,
+ * and must not compete with <ErrorReportWidget>'s bottom-right button or
+ * draw attention away from the deck for the (much more common) same-person
+ * resume it's an escape hatch from.
+ */
+.workshop-tracker-not-you {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 900;
+  padding: 0.3em 0.6em;
+  border: none;
+  border-radius: 6px;
+  background: rgba(10, 10, 14, 0.55);
+  color: #f0f0f2;
+  opacity: 0.55;
+  font-size: 0.7em;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+.workshop-tracker-not-you:hover {
+  opacity: 1;
 }
 </style>

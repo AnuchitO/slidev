@@ -113,6 +113,26 @@ export function resolveJoinAckOutcome(requestedParticipantId: string | undefined
 }
 
 /**
+ * Whether `JoinScreen.vue` should offer its "Not you? Join as someone else"
+ * link after this join — true only for a genuine resume of an *already-
+ * known* identity (a `participantId` was supplied, e.g. from the localStorage
+ * value read on mount, or from a previous attempt's resume-fallback id — see
+ * `pendingParticipantId` there — and the server actually resumed it), never
+ * for a name/room-code the participant just typed for the first time.
+ *
+ * A follow-on to the sessionStorage→localStorage switch (see this module's
+ * storage-backend doc comment above): localStorage doesn't clear itself when
+ * a tab closes, so a shared/kiosk browser would otherwise resume the
+ * previous person's identity with no way to say "that's not me" — this
+ * link is that way out, and this function decides when it's warranted.
+ * Pulled out as a pure function (matching `resolveJoinAckOutcome` just
+ * above) so the decision is unit-testable without mounting the component.
+ */
+export function shouldOfferJoinAsSomeoneElse(requestedParticipantId: string | undefined, ack: JoinAck): boolean {
+  return Boolean(requestedParticipantId) && ack.resumed
+}
+
+/**
  * The current browser tab's joined participant, once `JoinScreen.vue` gets
  * a `participant:join` ack — a module-scope singleton `ref`, same pattern
  * as `client.ts`'s shared socket, so `ErrorReportWidget.vue` (plan 028)

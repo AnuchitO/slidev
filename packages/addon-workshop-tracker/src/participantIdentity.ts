@@ -44,6 +44,50 @@ export function writeStoredParticipant(participant: StoredParticipant): void {
 }
 
 /**
+ * Clears a stored participant (plan 030 Step 1). Used when a *requested*
+ * resume fails (see `resolveJoinAckOutcome` below) — the stale id is no
+ * longer good for anything, so `JoinScreen.vue` drops it rather than
+ * re-attempting it on a future mount.
+ */
+export function clearStoredParticipant(): void {
+  try {
+    sessionStorage.removeItem(PARTICIPANT_STORAGE_KEY)
+  }
+  catch {
+    // Same best-effort posture as writeStoredParticipant above.
+  }
+}
+
+export interface JoinAck {
+  participantId: string
+  currentSlideIndex: number
+  /** See `workshop-tracker-server`'s `participant:join` handler / README. */
+  resumed: boolean
+}
+
+export type JoinAckOutcome = 'joined' | 'resume-failed'
+
+/**
+ * Decides whether a `participant:join` ack represents a successful resume
+ * (or an ordinary first-time join) — both of which the join screen should
+ * treat as "we're in, don't show the prompt" — versus a *requested* resume
+ * (a `participantId` was supplied) that the server couldn't honor and fell
+ * back on (PRD §4/§14's accepted server-restart/in-memory-reset case).
+ *
+ * Pulled out as a pure function (matching this package's `presenterCode.ts`/
+ * `stepId.ts` precedent) so `JoinScreen.vue`'s resume-vs-fresh-join UI
+ * decision (plan 030 Step 1) is unit-testable without mounting the
+ * component. `ack.resumed` — not id comparison — is the source of truth
+ * here; the server already knows definitively whether it revived an
+ * existing record or minted a new one (`session.ts`'s `JoinOutcome`).
+ */
+export function resolveJoinAckOutcome(requestedParticipantId: string | undefined, ack: JoinAck): JoinAckOutcome {
+  if (requestedParticipantId && !ack.resumed)
+    return 'resume-failed'
+  return 'joined'
+}
+
+/**
  * The current browser tab's joined participant, once `JoinScreen.vue` gets
  * a `participant:join` ack — a module-scope singleton `ref`, same pattern
  * as `client.ts`'s shared socket, so `ErrorReportWidget.vue` (plan 028)

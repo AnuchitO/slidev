@@ -119,7 +119,7 @@ meaningful the way it is for the hardening plans above.
 | 027 | M2 — Participant identity + step tracking | P1 | M-L | MED | 026 | DONE |
 | 028 | M3 — Error reporting (text + screenshot) | P2 | M | MED | 027 | DONE |
 | 029 | M4 — Presence tracking + presenter/dashboard auth | P2 | M | MED | 027 | DONE |
-| 030 | M5 — Reconnect/resume + load testing + hardening | P3 | M | LOW-MED | 026, 027, 028, 029 | TODO |
+| 030 | M5 — Reconnect/resume + load testing + hardening | P3 | M | LOW-MED | 026, 027, 028, 029 | DONE |
 
 **Dependency notes**: 026 → 027 is a hard sequence (027 needs 026's
 transport). 028 and 029 both depend on 027 but not on each other — they can
@@ -144,6 +144,17 @@ as every other `presenter:*` handler, and `grep -rn "NOTE(security)"` across
 `packages/` returns nothing outside historical plan documents. Do not
 reintroduce an ungated `presenter:*`/dashboard-facing handler without
 updating this note.
+
+**Initiative complete (030 landed)**: M1-M5 are all done — slide sync, step
+tracking, error reporting (text + screenshot), presence, presenter/room-code
+auth, participant reconnect/resume, and load-verified performance (50-100
+concurrent participants, both measured latencies under ~11ms against the
+PRD's ~1s target — see `packages/workshop-tracker-server/scripts/load-test-results.md`,
+re-runnable via `pnpm --filter workshop-tracker-server load-test`). Every
+PRD §15 acceptance bullet has been walked live against the full stack
+(sync server + demo deck + dashboard, run as persistent dev processes, not
+a `slidev build` export). This is the whole tracked-feature-set status, not
+just five plan files checked off.
 
 ## Direction findings (not planned here — options for the maintainer)
 

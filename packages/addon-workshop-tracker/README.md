@@ -3,18 +3,19 @@
 A Slidev addon that syncs the presenter's current slide to every connected
 participant in real time, lets participants identify themselves and
 acknowledge hands-on steps, report an error — text and/or a captured
-screenshot — and reports each participant's presence, gating
-presenter/dashboard actions behind a credential, over the companion
-[`workshop-tracker-server`](../workshop-tracker-server). Currently implements
-**M1 (slide sync), M2 (participant identity + step tracking), M3 (error
-reporting), and M4 (presence + auth)** — only M5 (reconnect/resume hardening
-
-- load testing) is still ahead. See
-  [`plans/026-workshop-tracker-m1-slide-sync.md`](../../plans/026-workshop-tracker-m1-slide-sync.md),
-  [`plans/027-workshop-tracker-m2-step-tracking.md`](../../plans/027-workshop-tracker-m2-step-tracking.md),
-  [`plans/028-workshop-tracker-m3-error-reporting.md`](../../plans/028-workshop-tracker-m3-error-reporting.md),
-  [`plans/029-workshop-tracker-m4-presence-auth.md`](../../plans/029-workshop-tracker-m4-presence-auth.md),
-  and [`plans/prd-workshop-tracking.md`](../../plans/prd-workshop-tracking.md).
+screenshot — reports each participant's presence, gates presenter/dashboard
+actions behind a credential, and resumes a participant's own identity across
+a refresh or brief network drop, over the companion
+[`workshop-tracker-server`](../workshop-tracker-server). Implements the full
+initiative — **M1 (slide sync), M2 (participant identity + step tracking),
+M3 (error reporting), M4 (presence + auth), and M5 (reconnect/resume +
+load-tested hardening)**. See
+[`plans/026-workshop-tracker-m1-slide-sync.md`](../../plans/026-workshop-tracker-m1-slide-sync.md),
+[`plans/027-workshop-tracker-m2-step-tracking.md`](../../plans/027-workshop-tracker-m2-step-tracking.md),
+[`plans/028-workshop-tracker-m3-error-reporting.md`](../../plans/028-workshop-tracker-m3-error-reporting.md),
+[`plans/029-workshop-tracker-m4-presence-auth.md`](../../plans/029-workshop-tracker-m4-presence-auth.md),
+[`plans/030-workshop-tracker-m5-hardening.md`](../../plans/030-workshop-tracker-m5-hardening.md),
+and [`plans/prd-workshop-tracking.md`](../../plans/prd-workshop-tracking.md).
 
 ## Usage
 
@@ -257,3 +258,60 @@ SaaS-grade auth). Do not point a real workshop room at this stack without
 setting both `WORKSHOP_ROOM_CODE` and `WORKSHOP_PRESENTER_CODE` on the
 server — an unset code means the server rejects every join/presenter
 action/dashboard connection outright (fail closed).
+
+## M5: reconnect/resume (plan 030 / PRD §12)
+
+`<JoinScreen>` now consumes the `participantId` it already persisted to
+`sessionStorage` (027's down payment): on mount, if one is stored, it emits
+`participant:join` with it immediately and shows a lightweight "Resuming
+your session…" message instead of the name/room-code form — a refreshing
+participant never sees a join prompt, matching PRD §12's "without
+re-joining as a 'new' participant." The server's ack now carries a
+`resumed: boolean` (see `workshop-tracker-server`'s README) — the
+authoritative signal for whether that specific resume succeeded, rather
+than the client comparing ids itself (`resolveJoinAckOutcome`,
+`src/participantIdentity.ts`, unit tested).
+
+**Resume-hijacking threat model**: a resumed identity is bound to two things
+an attacker can't cheaply obtain together — the participant room code
+(required on every `participant:join`, checked before resume is even
+considered) and the specific `participantId` itself, a 122-bit
+`crypto.randomUUID()` minted at original join time that is _never_ broadcast
+to other participant sockets (only to the presenter-code-gated dashboard
+room). That combination functions as an unguessable bearer resume token
+scoped to one browser tab's `sessionStorage`, satisfying plan 030's STOP
+condition on resume hijacking without needing a separate token scheme.
+
+**When resume fails** (the server no longer recognizes the stored id — e.g.
+it restarted mid-workshop, PRD §4/§14's accepted in-memory-reset case), the
+join form reappears, pre-filled with the same name/room code so the
+participant doesn't have to retype anything, rather than silently minting a
+"new" participant behind an unchanged UI.
+
+### Real gap found during M5: a failed resume was orphaning a "ghost" participant
+
+`session.ts`'s fallback behavior (a resume attempt against an unknown id
+mints a fresh participant, so the _server_ side is always immediately
+usable) combined with the client's above decision to _reject_ that fallback
+and re-prompt uncovered a real bug during plan 030's own manual
+server-restart verification, not a hypothetical: the client's first attempt
+was discarding the fallback's newly-minted id entirely and, on the
+participant's next click of "Join," asking the server for a **third**
+identity — orphaning the fallback's second one. That orphan can never be
+cleaned up: it shares its `socketId` with the socket that goes on to become
+the _real_ (third) participant, so `sweepStaleParticipants`'s "is this
+socket still connected" check (`workshop-tracker-server`'s `presence.ts`)
+keeps finding it alive forever, and a clean `disconnect` only updates
+whichever participant `socket.data.participantId` currently points at (the
+real one) — the dashboard would show a permanent, un-closeable duplicate row
+for the rest of the session.
+
+Fix: `JoinScreen.vue` now remembers the fallback ack's own `participantId`
+(`pendingParticipantId`) and resumes _that_ id on the next submit instead of
+requesting a fresh one — confirmed live (two-tab + real server-restart
+walkthrough) to end with exactly one dashboard row, and the server's own
+distinct log lines show the sequence as `resume failed for unknown
+participantId ... falling back to a fresh join as ...` immediately followed
+by `participant resumed: ...` for that same newly-minted id. Don't
+reintroduce a plain "just call `join()` again with no id" retry path here
+without re-reading this note.

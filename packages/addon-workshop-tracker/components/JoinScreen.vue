@@ -51,6 +51,19 @@ const resuming = ref(false)
 const name = ref('')
 const roomCode = ref('')
 const joinError = ref('')
+// Set when a resume attempt fails (see below) — the server, per its own
+// documented fallback behavior, already minted a *usable* fresh participant
+// for that failed attempt (session.ts's 'resume-fallback' outcome always
+// creates a real row, it just isn't the one the client asked to resume).
+// The next submit resumes *that* id instead of asking for yet another one:
+// without this, a second plain fresh join on the same socket would orphan
+// the fallback's participant forever (its `socket.data.participantId` gets
+// overwritten by the second join, so neither a clean disconnect nor the
+// staleness sweep — whose "socket still connected" check would still see
+// this same socket alive — would ever mark it closed, leaving a permanent
+// duplicate/"ghost" row on the dashboard; found via plan 030's own manual
+// server-restart verification, not a hypothetical).
+const pendingParticipantId = ref<string | undefined>()
 
 function join(joinName: string, joinRoomCode: string, participantId?: string) {
   submitting.value = true
@@ -74,8 +87,11 @@ function join(joinName: string, joinRoomCode: string, participantId?: string) {
       // — must not silently rejoin as a "new" participant behind an
       // unchanged UI. Drop the stale id and show the join prompt again
       // (pre-filled, so the participant doesn't have to retype anything)
-      // rather than assuming success.
+      // rather than assuming success — but remember the fallback's own new
+      // id (see `pendingParticipantId` above) so the *next* submit resumes
+      // it instead of minting yet another one.
       if (resolveJoinAckOutcome(participantId, ack) === 'resume-failed') {
+        pendingParticipantId.value = ack.participantId
         clearStoredParticipant()
         resuming.value = false
         name.value = joinName
@@ -104,7 +120,7 @@ function onSubmit() {
   const trimmedRoomCode = roomCode.value.trim()
   if (!trimmedName || !trimmedRoomCode || submitting.value)
     return
-  join(trimmedName, trimmedRoomCode)
+  join(trimmedName, trimmedRoomCode, pendingParticipantId.value)
 }
 </script>
 

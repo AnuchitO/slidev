@@ -1,19 +1,26 @@
 import type { Server as HttpServer } from 'node:http'
 import type { StepState } from './session'
 import { randomUUID } from 'node:crypto'
+import { mkdtempSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import connect from 'connect'
 import { join } from 'pathe'
 import sirv from 'sirv'
 import { Server as SocketIOServer } from 'socket.io'
+import { createScreenshotUploadHandler } from './screenshotUpload'
 import {
+  addErrorReport,
   joinParticipant,
+  listErrorReports,
   listStepStatus,
   participants,
+  resolveErrorReport,
   session,
   setStepStatus,
 } from './session'
+import { resolveUploadPath } from './uploads'
 
 export interface CreateWorkshopTrackerServerOptions {
   /** CORS origin for the Socket.io handshake. Defaults to `*`. */
@@ -43,6 +50,13 @@ function buildStateUpdate() {
     currentStepId: session.currentStepId,
     participants: [...participants.values()],
     stepStatus: listStepStatus(),
+    // PRD §10's literal `state:update` shape (`{ currentSlideIndex,
+    // participants[], errors[] }`) — folded straight into the existing
+    // payload rather than a separate event (plan 028 Step 1's decision):
+    // error reports are rare compared to step-status churn, so the combined
+    // payload isn't a size/frequency problem at realistic volumes, and the
+    // dashboard client needs no restructuring beyond rendering a new field.
+    errors: listErrorReports(),
   }
 }
 
@@ -71,10 +85,47 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
   const app = connect()
   app.use('/dashboard', sirv(DASHBOARD_PUBLIC_DIR, { single: true, dev: true, etag: true }))
 
+  // Session-scoped uploads dir (plan 028 Step 1): a fresh `mkdtemp`-ed
+  // directory per server instance, not a fixed path in the repo — matches
+  // the PRD's "keep them in memory/disk for the session, no cross-restart
+  // persistence requirement" (§4 non-goals) without needing an explicit
+  // cleanup job, and gives every test run (each of which creates its own
+  // server) an isolated directory rather than sharing one across runs.
+  const uploadsDir = mkdtempSync(join(tmpdir(), 'workshop-tracker-uploads-'))
+
+  // `GET /uploads/:filename` — served by the same `sirv` used for the
+  // dashboard, from the confined `uploadsDir` above. `resolveUploadPath`
+  // (`uploads.ts`) is checked *first*, ahead of sirv, so a path-traversal
+  // attempt or any filename that doesn't match the server's own
+  // `${randomUUID()}.${ext}` naming scheme is rejected before sirv ever
+  // touches the filesystem — defense-in-depth on top of sirv's own path
+  // normalization, not a replacement for it.
+  app.use('/uploads', (req, res, next) => {
+    const raw = (req.url ?? '').replace(/^\/+/, '').split('?')[0]
+    let requested: string
+    try {
+      requested = decodeURIComponent(raw)
+    }
+    catch {
+      // Malformed percent-encoding — not a filename this server ever wrote,
+      // reject rather than guess.
+      res.writeHead(400).end()
+      return
+    }
+    if (!resolveUploadPath(uploadsDir, requested)) {
+      res.writeHead(404).end()
+      return
+    }
+    next()
+  })
+  app.use('/uploads', sirv(uploadsDir, { dev: true, etag: true }))
+
   const httpServer = createServer(app)
   const io = new SocketIOServer(httpServer, {
     cors: { origin: options.origin ?? '*' },
   })
+
+  app.use(createScreenshotUploadHandler(uploadsDir, () => broadcastStateUpdate(io)))
 
   io.on('connection', (socket) => {
     // Sync the newly-connected client to current state immediately — needed
@@ -143,6 +194,40 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
 
     socket.on('participant:copy', handleStepAction('copied'))
     socket.on('participant:done', handleStepAction('done'))
+
+    // Text-only error report (PRD §10). The screenshot path is REST-only
+    // (`POST /api/screenshot`, `screenshotUpload.ts`) — this WS event is
+    // deliberately the *only* path for a text-only report, per plan 028
+    // Step 2's decision not to implement both a WS and a REST path for the
+    // identical text-only case.
+    socket.on('participant:error', ({ stepId, text }: { stepId: string, text?: string }) => {
+      const participantId = socket.data.participantId as string | undefined
+      // Same "no-op rather than a guess" rule as `participant:copy`/`done`
+      // above — a socket that hasn't joined has no participant to attach
+      // the report to.
+      if (!participantId)
+        return
+      const participant = participants.get(participantId)
+      if (!participant)
+        return
+      addErrorReport({
+        id: randomUUID(),
+        participantId,
+        participantName: participant.name,
+        stepId,
+        text,
+        ts: Date.now(),
+      })
+      broadcastStateUpdate(io)
+    })
+
+    socket.on('presenter:resolveError', ({ errorId }: { errorId: string }) => {
+      // NOTE(security): same no-auth gap as `presenter:setSlide`/`setStep`
+      // above — any connected socket can resolve any error report until
+      // plan 029 lands.
+      resolveErrorReport(errorId)
+      broadcastStateUpdate(io)
+    })
 
     // The dashboard (plan 027 Step 3) opts into the room-scoped broadcast
     // explicitly, rather than every connected socket being auto-joined —

@@ -28,4 +28,20 @@ const { httpServer } = createWorkshopTrackerServer({
 httpServer.listen(PORT, () => {
   // eslint-disable-next-line no-console -- deliberate startup log for a CLI-run server process, not app logging.
   console.log(`workshop-tracker-server listening on :${PORT}`)
+  // Answers "how does the presenter find out the codes to hand out" —
+  // they're the operator who just set these env vars, so echoing them back
+  // to the same terminal is just a convenience, not a leak. The dashboard
+  // page itself shows the same two values once opened (via `dashboard:join`'s
+  // ack, gated on already knowing the presenter code) as a second, harder-to-
+  // miss place to find them mid-session.
+  if (roomCode && presenterCode) {
+    // eslint-disable-next-line no-console -- deliberate startup log, see above.
+    console.log(`[workshop-tracker-server] Room code (give to participants): ${roomCode}`)
+    // eslint-disable-next-line no-console -- deliberate startup log, see above.
+    console.log(`[workshop-tracker-server] Presenter code (yours only): ${presenterCode}`)
+    // eslint-disable-next-line no-console -- deliberate startup log, see above.
+    console.log(`[workshop-tracker-server] Dashboard: http://localhost:${PORT}/dashboard?code=${presenterCode}`)
+    // eslint-disable-next-line no-console -- deliberate startup log, see above.
+    console.log(`[workshop-tracker-server] Append ?presenterCode=${presenterCode} to your own /presenter/N deck URL.`)
+  }
 })

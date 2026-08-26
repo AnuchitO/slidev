@@ -56,7 +56,7 @@ describe('joinParticipant (resume/reconnect, plan 030)', () => {
     expect(result.participant.id).toBe('p1')
     expect(participants.size).toBe(1) // no duplicate row
     // Step status keyed by the (stable) participant id survives the resume.
-    expect(stepStatus.get('p1:install-deps')).toBe('done')
+    expect(stepStatus.get('p1:install-deps')).toEqual({ state: 'done', updatedAt: 0 })
   })
 
   it('preserves joinedAt but refreshes lastSeen/socketId on resume', () => {
@@ -111,22 +111,40 @@ describe('error report store (M3)', () => {
     expect(listErrorReports()).toEqual([report])
   })
 
-  it('resolveErrorReport marks a matching report resolved and returns true', () => {
+  it('resolveErrorReport marks a matching report resolved and returns it', () => {
     addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', ts: 1 })
 
     const result = resolveErrorReport('err-1')
 
-    expect(result).toBe(true)
+    expect(result?.resolved).toBe(true)
+    expect(result?.id).toBe('err-1')
     expect(listErrorReports()[0].resolved).toBe(true)
   })
 
-  it('resolveErrorReport returns false for an unknown id and mutates nothing', () => {
+  it('resolveErrorReport returns undefined for an unknown id and mutates nothing', () => {
     addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', ts: 1 })
 
     const result = resolveErrorReport('does-not-exist')
 
-    expect(result).toBe(false)
+    expect(result).toBeUndefined()
     expect(listErrorReports()[0].resolved).toBe(false)
+  })
+
+  it('resolveErrorReport with a message trims it and stores it as resolutionMessage', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', ts: 1 })
+
+    const result = resolveErrorReport('err-1', '  keep going, you\'ve got this  ')
+
+    expect(result?.resolutionMessage).toBe('keep going, you\'ve got this')
+    expect(listErrorReports()[0].resolutionMessage).toBe('keep going, you\'ve got this')
+  })
+
+  it('resolveErrorReport with no message (or a blank one) leaves resolutionMessage unset', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', ts: 1 })
+
+    resolveErrorReport('err-1', '   ')
+
+    expect(listErrorReports()[0].resolutionMessage).toBeUndefined()
   })
 
   it('resetSessionStateForTests clears accumulated error reports', () => {

@@ -94,6 +94,50 @@
   .conn { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
   .conn.live { color: var(--done); }
 
+  .status-cell {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .step-elapsed {
+    font-size: 11px;
+    color: var(--muted);
+  }
+  /* Nudges the instructor toward checking in — plain "copied" gets no
+     special color, but sitting there for a while (thresholds below) does. */
+  .step-elapsed.stuck-warn { color: var(--copied); }
+  .step-elapsed.stuck-alert { color: var(--error); font-weight: 600; }
+
+  .codes-panel {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+    padding: 10px 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  .codes-panel .code-item { display: flex; align-items: center; gap: 6px; }
+  .codes-panel .code-label { color: var(--muted); }
+  .codes-panel code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+  .code-copy {
+    background: none;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: 4px;
+    color: inherit;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 1px 6px;
+  }
+
   .error-feed {
     display: flex;
     flex-direction: column;
@@ -144,6 +188,20 @@
   }
   .error-actions {
     flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+  }
+  .resolve-message {
+    width: 160px;
+    padding: 3px 6px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.05);
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
   }
   .resolve-button {
     padding: 4px 10px;
@@ -161,6 +219,12 @@
   .resolved-label {
     font-size: 12px;
     color: var(--muted);
+    text-align: right;
+  }
+  .resolved-message {
+    display: block;
+    font-style: italic;
+    max-width: 200px;
   }
 
   .lightbox {
@@ -185,6 +249,27 @@
   <h1>Workshop Tracker — Instructor Dashboard</h1>
   <p class="sub">Participant roster, presence, current-step status, and the error feed. Requires the presenter code (see this file's source).</p>
   <p class="conn" id="conn">connecting…</p>
+
+  <!--
+    "How does the presenter find out the room/presenter codes" — this panel
+    is the answer once the dashboard is open (the other is index.ts's
+    startup log). Safe to show here specifically: reaching this panel at all
+    already proved this viewer holds the presenter code (see
+    `requireDashboardCode`/`dashboard:join`'s gate), so echoing both codes
+    back doesn't hand anything to someone who couldn't already get here.
+  -->
+  <div class="codes-panel" id="codes-panel" hidden>
+    <div class="code-item">
+      <span class="code-label">Room code (for participants):</span>
+      <code id="code-room"></code>
+      <button type="button" class="code-copy" data-copy-target="code-room">copy</button>
+    </div>
+    <div class="code-item">
+      <span class="code-label">Presenter code (yours only):</span>
+      <code id="code-presenter"></code>
+      <button type="button" class="code-copy" data-copy-target="code-presenter">copy</button>
+    </div>
+  </div>
 
   <div class="counts">
     <div class="count"><span class="n" id="count-joined">0</span><span class="l">joined</span></div>
@@ -230,6 +315,13 @@
     const emptyEl = document.getElementById('empty')
     const errorFeedEl = document.getElementById('error-feed')
     const errorsEmptyEl = document.getElementById('errors-empty')
+    const codesPanelEl = document.getElementById('codes-panel')
+
+    // Cached so the elapsed-time ticker (below) can re-render without
+    // waiting for the next server-pushed `state:update` — "how long since
+    // Copy" needs to keep advancing between pushes, not just jump on each
+    // new event.
+    let lastState = null
 
     socket.on('connect', () => {
       socket.emit('dashboard:join', { presenterCode }, (result) => {
@@ -241,6 +333,11 @@
         }
         connEl.textContent = 'live'
         connEl.classList.add('live')
+        if (result && result.roomCode) {
+          document.getElementById('code-room').textContent = result.roomCode
+          document.getElementById('code-presenter').textContent = result.presenterCode
+          codesPanelEl.hidden = false
+        }
       })
     })
     socket.on('disconnect', () => {
@@ -248,9 +345,51 @@
       connEl.classList.remove('live')
     })
 
+    codesPanelEl.addEventListener('click', (event) => {
+      const button = event.target.closest('.code-copy')
+      if (!button)
+        return
+      const value = document.getElementById(button.dataset.copyTarget).textContent
+      navigator.clipboard?.writeText(value).then(() => {
+        const original = button.textContent
+        button.textContent = 'copied!'
+        setTimeout(() => { button.textContent = original }, 1200)
+      })
+    })
+
+    // Returns the full stepStatus entry (state + updatedAt), not just the
+    // state string — the caller needs updatedAt to render "how long since
+    // Copy" (see `renderStatusCell` below). Falls back to a synthetic
+    // 'idle' entry with no meaningful updatedAt when there's no record yet.
     function statusFor(stepStatus, participantId, stepId) {
-      const entry = stepStatus.find(s => s.participantId === participantId && s.stepId === stepId)
-      return entry ? entry.state : 'idle'
+      return stepStatus.find(s => s.participantId === participantId && s.stepId === stepId)
+        ?? { state: 'idle', updatedAt: undefined }
+    }
+
+    // "Time since Copy" as a check-in signal (feature follow-up after
+    // initial testing): only meaningful while a participant is sitting in
+    // 'copied' — i.e. they've acknowledged the command but haven't clicked
+    // Done yet, which is exactly the "might be stuck, worth a check-in"
+    // state the instructor wants a nudge about. 'done'/'idle' don't render
+    // a timer — there's nothing actionable about "how long ago they
+    // finished".
+    const STUCK_WARN_MS = 60_000 // 1 minute
+    const STUCK_ALERT_MS = 180_000 // 3 minutes
+    function formatElapsed(ms) {
+      const totalSeconds = Math.floor(ms / 1000)
+      if (totalSeconds < 60)
+        return `${totalSeconds}s`
+      const minutes = Math.floor(totalSeconds / 60)
+      const seconds = totalSeconds % 60
+      return `${minutes}m ${seconds}s`
+    }
+    function renderStatusCell(entry) {
+      const badge = `<span class="badge ${entry.state}">${entry.state}</span>`
+      if (entry.state !== 'copied' || entry.updatedAt == null)
+        return `<span class="status-cell">${badge}</span>`
+      const elapsedMs = Date.now() - entry.updatedAt
+      const cls = elapsedMs >= STUCK_ALERT_MS ? 'stuck-alert' : elapsedMs >= STUCK_WARN_MS ? 'stuck-warn' : ''
+      return `<span class="status-cell">${badge}<span class="step-elapsed ${cls}">${formatElapsed(elapsedMs)} ago</span></span>`
     }
 
     // Presence column (plan 029 Step 3, PRD §11/§15): three of the four
@@ -268,6 +407,7 @@
     }
 
     function render(state) {
+      lastState = state
       const { currentSlideIndex, currentStepId, participants, stepStatus, errors } = state
 
       document.getElementById('count-slide').textContent = currentSlideIndex
@@ -278,7 +418,7 @@
       ).length
 
       const doneCount = participants.filter(
-        p => statusFor(stepStatus, p.id, currentStepId) === 'done',
+        p => statusFor(stepStatus, p.id, currentStepId).state === 'done',
       ).length
       document.getElementById('count-done').textContent = `${doneCount}/${participants.length}`
 
@@ -286,13 +426,15 @@
       emptyEl.hidden = participants.length > 0
 
       for (const p of [...participants].sort((a, b) => a.joinedAt - b.joinedAt)) {
-        const status = p.connected ? statusFor(stepStatus, p.id, currentStepId) : 'offline'
+        const statusCell = p.connected
+          ? renderStatusCell(statusFor(stepStatus, p.id, currentStepId))
+          : `<span class="badge offline">offline</span>`
         const presence = presenceFor(p)
         const tr = document.createElement('tr')
         tr.innerHTML = `
           <td>${escapeHtml(p.name)}</td>
           <td><span class="badge ${presence.cls}">${presence.label}</span></td>
-          <td><span class="badge ${status}">${status}</span></td>
+          <td>${statusCell}</td>
           <td>${new Date(p.joinedAt).toLocaleTimeString()}</td>
         `
         rowsEl.appendChild(tr)
@@ -300,6 +442,16 @@
 
       renderErrors(errors || [])
     }
+
+    // Keeps "Xm Ys ago" advancing between server pushes — `state:update`
+    // only fires on an actual change, but elapsed time obviously keeps
+    // moving regardless. Re-renders from the cached `lastState` rather than
+    // re-fetching anything; cheap enough at this scale (PRD's 50-100
+    // participant target) to just re-run the whole render.
+    setInterval(() => {
+      if (lastState)
+        render(lastState)
+    }, 5000)
 
     // Unresolved first (newest first within each group), so the instructor
     // sees what still needs attention without scrolling past resolved
@@ -310,6 +462,22 @@
     function renderErrors(errors) {
       const openCount = errors.filter(e => !e.resolved).length
       document.getElementById('count-errors').textContent = openCount
+
+      // `renderErrors` re-runs on *every* `state:update` — including ones
+      // caused by an unrelated participant clicking Copy/Done elsewhere —
+      // plus every 5s from the elapsed-time ticker. A full `innerHTML` wipe
+      // would both erase whatever the instructor is mid-typing into a
+      // reply-message box *and* steal keyboard focus out of it (a brand new
+      // `<input>` element replaces the old one). Save each open input's
+      // value, and separately remember which one (if any) was actually
+      // focused plus its caret position, so both the text and the ability
+      // to keep typing survive the rebuild below.
+      const draftMessages = {}
+      for (const input of errorFeedEl.querySelectorAll('.resolve-message'))
+        draftMessages[input.dataset.errorId] = input.value
+      const focused = document.activeElement
+      const focusedErrorId = focused?.classList?.contains('resolve-message') ? focused.dataset.errorId : undefined
+      const focusedSelection = focusedErrorId ? [focused.selectionStart, focused.selectionEnd] : undefined
 
       errorFeedEl.innerHTML = ''
       errorsEmptyEl.hidden = errors.length > 0
@@ -328,6 +496,24 @@
           ? `<img class="error-thumb" src="${escapeHtml(e.screenshotUrl)}" alt="screenshot from ${escapeHtml(e.participantName)}" data-full="${escapeHtml(e.screenshotUrl)}" />`
           : ''
 
+        // "Mark resolved" (feature follow-up): sends an optional reply back
+        // to *this specific participant only* (`server.ts`'s
+        // `presenter:resolveError` handler) so resolving an error doesn't
+        // feel like a report vanishing into a queue — the participant sees
+        // the instructor actually responded.
+        const actions = e.resolved
+          ? `<span class="resolved-label">resolved${e.resolutionMessage ? `<span class="resolved-message">“${escapeHtml(e.resolutionMessage)}”</span>` : ''}</span>`
+          : `
+            <input
+              type="text"
+              class="resolve-message"
+              data-error-id="${escapeHtml(e.id)}"
+              placeholder="optional message back to them"
+              value="${escapeHtml(draftMessages[e.id] || '')}"
+            >
+            <button type="button" class="resolve-button" data-error-id="${escapeHtml(e.id)}">Mark resolved</button>
+          `
+
         card.innerHTML = `
           ${thumb}
           <div class="error-body">
@@ -338,15 +524,17 @@
             </div>
             ${e.text ? `<p class="error-text">${escapeHtml(e.text)}</p>` : ''}
           </div>
-          <div class="error-actions">
-            ${
-              e.resolved
-                ? '<span class="resolved-label">resolved</span>'
-                : `<button type="button" class="resolve-button" data-error-id="${escapeHtml(e.id)}">Mark resolved</button>`
-            }
-          </div>
+          <div class="error-actions">${actions}</div>
         `
         errorFeedEl.appendChild(card)
+      }
+
+      if (focusedErrorId) {
+        const restored = errorFeedEl.querySelector(`.resolve-message[data-error-id="${CSS.escape(focusedErrorId)}"]`)
+        if (restored) {
+          restored.focus()
+          restored.setSelectionRange(...focusedSelection)
+        }
       }
     }
 
@@ -358,8 +546,10 @@
       }
       const button = event.target.closest('.resolve-button')
       if (button) {
+        const errorId = button.dataset.errorId
+        const messageInput = errorFeedEl.querySelector(`.resolve-message[data-error-id="${CSS.escape(errorId)}"]`)
         button.disabled = true
-        socket.emit('presenter:resolveError', { errorId: button.dataset.errorId, presenterCode })
+        socket.emit('presenter:resolveError', { errorId, presenterCode, message: messageInput?.value || undefined })
       }
     })
 

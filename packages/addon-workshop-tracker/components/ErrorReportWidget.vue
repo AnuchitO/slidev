@@ -30,7 +30,7 @@ participant action, per PRD §5's persona split.
 -->
 <script setup lang="ts">
 import { useNav } from '@slidev/client'
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { getWorkshopSocket, getWorkshopTrackerServerUrl } from '../src/client'
 import { canCaptureScreen } from '../src/errorReportCapability'
 import { buildScreenshotFormData } from '../src/errorReportSubmission'
@@ -151,9 +151,63 @@ async function submit() {
     submitting.value = false
   }
 }
+
+// Closes the loop the other direction (feature follow-up after initial
+// testing): the instructor's "Mark resolved" on the dashboard can carry an
+// optional message, and the server sends it — targeted, not broadcast — to
+// this specific participant's own socket as `participant:errorResolved`
+// (`server.ts`'s `presenter:resolveError` handler). Shown as a dismissible
+// banner *independent* of whether the report panel above is open — a
+// participant who already closed the panel (or is mid-`<StepCommand>` on a
+// later slide) should still see that the instructor followed up, not just
+// participants who happen to have it open at that moment.
+interface ResolutionNotice {
+  message?: string
+}
+const resolutionNotice = ref<ResolutionNotice | null>(null)
+let dismissTimer: ReturnType<typeof setTimeout> | undefined
+
+function onErrorResolved(payload: { errorId: string, stepId: string, message?: string }) {
+  resolutionNotice.value = { message: payload.message }
+  clearTimeout(dismissTimer)
+  // Auto-dismiss so a banner from an earlier report doesn't linger
+  // indefinitely across many later slides — long enough to actually read a
+  // short message, short enough not to become visual clutter.
+  dismissTimer = setTimeout(() => {
+    resolutionNotice.value = null
+  }, 10_000)
+}
+
+function dismissResolutionNotice() {
+  clearTimeout(dismissTimer)
+  resolutionNotice.value = null
+}
+
+onMounted(() => {
+  getWorkshopSocket().on('participant:errorResolved', onErrorResolved)
+})
+onBeforeUnmount(() => {
+  getWorkshopSocket().off('participant:errorResolved', onErrorResolved)
+  clearTimeout(dismissTimer)
+})
 </script>
 
 <template>
+  <div v-if="!isPresenter && resolutionNotice" class="workshop-tracker-resolution-toast">
+    <span class="workshop-tracker-resolution-icon">✅</span>
+    <div class="workshop-tracker-resolution-body">
+      <p class="workshop-tracker-resolution-title">
+        The instructor marked your report resolved
+      </p>
+      <p v-if="resolutionNotice.message" class="workshop-tracker-resolution-message">
+        “{{ resolutionNotice.message }}”
+      </p>
+    </div>
+    <button type="button" class="workshop-tracker-resolution-close" aria-label="Dismiss" @click="dismissResolutionNotice">
+      ✕
+    </button>
+  </div>
+
   <div v-if="!isPresenter" class="workshop-tracker-error-widget">
     <div v-if="open" class="workshop-tracker-error-panel">
       <div class="workshop-tracker-error-panel-header">
@@ -320,5 +374,51 @@ async function submit() {
   margin: 0;
   font-size: 0.9em;
   color: #2fa86b;
+}
+
+.workshop-tracker-resolution-toast {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 950;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6em;
+  width: min(320px, 80vw);
+  padding: 0.85em 1em;
+  border-radius: 12px;
+  background: #17181d;
+  color: #f0f0f2;
+  border: 1px solid rgba(47, 168, 107, 0.5);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  font-size: 14px;
+}
+.workshop-tracker-resolution-icon {
+  flex: 0 0 auto;
+  line-height: 1.3;
+}
+.workshop-tracker-resolution-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.workshop-tracker-resolution-title {
+  margin: 0;
+  font-weight: 600;
+}
+.workshop-tracker-resolution-message {
+  margin: 0.3em 0 0;
+  opacity: 0.85;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.workshop-tracker-resolution-close {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 1em;
+  opacity: 0.7;
+  padding: 0;
 }
 </style>

@@ -243,7 +243,37 @@ describe('createWorkshopTrackerServer', () => {
 
       const ack = await joinAsDashboard(dashboard)
 
-      expect(ack).toEqual({ ok: true })
+      expect(ack.ok).toBe(true)
+    })
+
+    // Follow-up after initial manual testing ("how does the presenter find
+    // the codes"): the ack hands both codes back once the caller has
+    // already proven it holds the presenter code — safe, since anyone who
+    // could reach this point could already open the dashboard directly.
+    it('dashboard:join ack includes both codes for the dashboard page to display', async () => {
+      const dashboard = await connectClient()
+
+      const ack = await emitWithAck<{ ok: boolean, roomCode?: string, presenterCode?: string }>(
+        dashboard,
+        'dashboard:join',
+        { presenterCode: TEST_PRESENTER_CODE },
+      )
+
+      expect(ack).toEqual({ ok: true, roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE })
+    })
+
+    it('a rejected dashboard:join does not leak either code', async () => {
+      const dashboard = await connectClient()
+
+      const ack = await emitWithAck<{ ok: boolean, roomCode?: string, presenterCode?: string }>(
+        dashboard,
+        'dashboard:join',
+        { presenterCode: 'wrong-code' },
+      )
+
+      expect(ack).toEqual({ ok: false })
+      expect(ack.roomCode).toBeUndefined()
+      expect(ack.presenterCode).toBeUndefined()
     })
 
     it('a participant with a valid room code but no presenter code cannot open the dashboard', async () => {
@@ -356,7 +386,7 @@ describe('createWorkshopTrackerServer', () => {
       )
 
       expect(ack).toEqual({ stepId: 'install-deps', state: 'copied' })
-      expect(stepStatus.get(`${participantId}:install-deps`)).toBe('copied')
+      expect(stepStatus.get(`${participantId}:install-deps`)).toEqual({ state: 'copied', updatedAt: expect.any(Number) })
     })
 
     it('participant:done marks the step done and acks the caller', async () => {
@@ -370,7 +400,21 @@ describe('createWorkshopTrackerServer', () => {
       )
 
       expect(ack).toEqual({ stepId: 'install-deps', state: 'done' })
-      expect(stepStatus.get(`${participantId}:install-deps`)).toBe('done')
+      expect(stepStatus.get(`${participantId}:install-deps`)).toEqual({ state: 'done', updatedAt: expect.any(Number) })
+    })
+
+    it('updatedAt refreshes on each state transition (copy, then done, are two different timestamps)', async () => {
+      const client = await connectClient()
+      const { participantId } = await join(client) as { participantId: string }
+
+      await emitWithAck(client, 'participant:copy', { stepId: 'install-deps' })
+      const afterCopy = stepStatus.get(`${participantId}:install-deps`)!.updatedAt
+
+      await new Promise<void>(resolve => setTimeout(resolve, 10))
+      await emitWithAck(client, 'participant:done', { stepId: 'install-deps' })
+      const afterDone = stepStatus.get(`${participantId}:install-deps`)!.updatedAt
+
+      expect(afterDone).toBeGreaterThan(afterCopy)
     })
 
     it('ignores participant:copy/done from a socket that has not joined yet', async () => {
@@ -534,14 +578,14 @@ describe('createWorkshopTrackerServer', () => {
       const participant = await connectClient()
       const { participantId } = await join(participant) as { participantId: string }
 
-      const update = waitForMatchingStateUpdate<{ stepStatus: Array<{ participantId: string, stepId: string, state: string }> }>(
+      const update = waitForMatchingStateUpdate<{ stepStatus: Array<{ participantId: string, stepId: string, state: string, updatedAt: number }> }>(
         dashboard,
         payload => payload.stepStatus.some(s => s.participantId === participantId && s.stepId === 'install-deps'),
       )
       participant.emit('participant:copy', { stepId: 'install-deps' })
       const payload = await update
 
-      expect(payload.stepStatus).toContainEqual({ participantId, stepId: 'install-deps', state: 'copied' })
+      expect(payload.stepStatus).toContainEqual({ participantId, stepId: 'install-deps', state: 'copied', updatedAt: expect.any(Number) })
 
       await new Promise<void>(resolve => setTimeout(resolve, 50))
       expect(bystanderReceivedUpdate).toBe(false)
@@ -671,6 +715,71 @@ describe('createWorkshopTrackerServer', () => {
 
       expect(errorReports).toHaveLength(0)
     })
+
+    // Follow-up after initial manual testing: "Mark resolved" should close
+    // the loop back to the reporting participant, optionally with a message
+    // — targeted at *that participant's own socket*, not broadcast to
+    // everyone and not just visible on the dashboard.
+    it('presenter:resolveError with a message notifies only the reporting participant\'s own socket', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+
+      const bystander = await connectClient()
+      await join(bystander, 'Bob')
+      let bystanderNotified = false
+      bystander.on('participant:errorResolved', () => {
+        bystanderNotified = true
+      })
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      const notified = waitFor<{ errorId: string, stepId: string, message?: string }>(reporter, 'participant:errorResolved')
+      const presenter = await connectClient()
+      presenter.emit('presenter:resolveError', { errorId, presenterCode: TEST_PRESENTER_CODE, message: '  keep going, almost there!  ' })
+      const notification = await notified
+
+      expect(notification).toEqual({ errorId, stepId: 'install-deps', message: 'keep going, almost there!' })
+      expect(errorReports.find(e => e.id === errorId)?.resolutionMessage).toBe('keep going, almost there!')
+
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+      expect(bystanderNotified).toBe(false)
+    })
+
+    it('presenter:resolveError with no message still notifies the participant, with message undefined', async () => {
+      const reporter = await connectClient()
+      await join(reporter)
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string }> }>(
+        dashboard,
+        payload => payload.errors.length > 0,
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      const notified = waitFor<{ errorId: string, message?: string }>(reporter, 'participant:errorResolved')
+      const presenter = await connectClient()
+      presenter.emit('presenter:resolveError', { errorId, presenterCode: TEST_PRESENTER_CODE })
+      const notification = await notified
+
+      expect(notification.message).toBeUndefined()
+    })
   })
 
   describe('post /api/screenshot (M3)', () => {
@@ -795,6 +904,57 @@ describe('createWorkshopTrackerServer', () => {
 
       const response2 = await fetch(`${url}/uploads/not-a-real-uuid.png`)
       expect(response2.status).not.toBe(200)
+    })
+  })
+
+  // Bug found in manual browser testing: the participant's browser loads
+  // the deck from a *different* origin (Slidev's own dev server) than this
+  // sync server, so `POST /api/screenshot` is a cross-origin `fetch()`.
+  // Node's own `fetch` (used throughout this file) doesn't enforce CORS —
+  // the requests above always "worked" from Node's point of view even
+  // before the fix — so this suite could never have caught the real
+  // symptom (a *browser* refusing to let JS read a same-request response
+  // lacking `Access-Control-Allow-Origin`) by itself. What it *can* verify,
+  // and what the fix actually is, is that the header is present and correct
+  // — that's sufficient for a browser to accept the response.
+  describe('cors (cross-origin browser fetch from the Slidev deck)', () => {
+    it('post /api/screenshot response carries Access-Control-Allow-Origin', async () => {
+      const client = await connectClient()
+      const { participantId } = await join(client) as { participantId: string }
+
+      const form = new FormData()
+      form.set('participantId', participantId)
+      form.set('stepId', 'install-deps')
+      form.set('screenshot', new Blob([ONE_PIXEL_PNG], { type: 'image/png' }), 'shot.png')
+
+      const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
+
+      expect(response.headers.get('access-control-allow-origin')).toBe('*')
+    })
+
+    it('an OPTIONS preflight gets a 204 with the CORS headers, not a 404/405', async () => {
+      const response = await fetch(`${url}/api/screenshot`, { method: 'OPTIONS' })
+
+      expect(response.status).toBe(204)
+      expect(response.headers.get('access-control-allow-origin')).toBe('*')
+      expect(response.headers.get('access-control-allow-methods')).toContain('POST')
+    })
+
+    it('respects a configured origin instead of always using the wildcard', async () => {
+      await server.io.close()
+      await new Promise<void>(resolve => server.httpServer.close(() => resolve()))
+      server = createWorkshopTrackerServer({
+        roomCode: TEST_ROOM_CODE,
+        presenterCode: TEST_PRESENTER_CODE,
+        origin: 'http://localhost:3030',
+      })
+      await new Promise<void>(resolve => server.httpServer.listen(0, resolve))
+      const { port } = server.httpServer.address() as AddressInfo
+      url = `http://localhost:${port}`
+
+      const response = await fetch(`${url}/api/screenshot`, { method: 'OPTIONS' })
+
+      expect(response.headers.get('access-control-allow-origin')).toBe('http://localhost:3030')
     })
   })
 })

@@ -55,8 +55,18 @@ export interface Participant {
   socketId: string
 }
 
-// Keyed as `${participantId}:${stepId}`.
-export const stepStatus = new Map<string, StepState>()
+/**
+ * Keyed as `${participantId}:${stepId}`. Value carries `updatedAt` (not just
+ * the raw `StepState`) so `listStepStatus()` can report "how long has this
+ * participant been sitting in `'copied'`" — see `StepStatusEntry`'s own doc
+ * comment for why that matters.
+ */
+export interface StepStatusValue {
+  state: StepState
+  updatedAt: number
+}
+
+export const stepStatus = new Map<string, StepStatusValue>()
 export const participants = new Map<string, Participant>()
 
 /**
@@ -129,22 +139,35 @@ export function joinParticipant(name: string, existingId: string | undefined, ge
 }
 
 export function setStepStatus(participantId: string, stepId: string, state: StepState): void {
-  stepStatus.set(`${participantId}:${stepId}`, state)
+  stepStatus.set(`${participantId}:${stepId}`, { state, updatedAt: Date.now() })
 }
 
 export interface StepStatusEntry {
   participantId: string
   stepId: string
   state: StepState
+  /**
+   * When this `(participantId, stepId)` pair last changed state — added so
+   * the dashboard can show "how long since they clicked Copy" as a
+   * check-in-with-them signal (a participant sitting in `'copied'` for a
+   * long time, never reaching `'done'`, is exactly who the instructor wants
+   * to notice without walking over). Set fresh on every `setStepStatus`
+   * call, including a `'copied'` → `'copied'` no-op call (there isn't one —
+   * copy/done only ever fire on an actual click) and a state transition
+   * (`'copied'` → `'done'`), so "time since last change" is always accurate,
+   * not just "time since first copy".
+   */
+  updatedAt: number
 }
 
 export function listStepStatus(): StepStatusEntry[] {
-  return [...stepStatus.entries()].map(([key, state]) => {
+  return [...stepStatus.entries()].map(([key, value]) => {
     const separatorIndex = key.indexOf(':')
     return {
       participantId: key.slice(0, separatorIndex),
       stepId: key.slice(separatorIndex + 1),
-      state,
+      state: value.state,
+      updatedAt: value.updatedAt,
     }
   })
 }
@@ -166,6 +189,15 @@ export interface ErrorReport {
   screenshotUrl?: string
   ts: number
   resolved: boolean
+  /**
+   * An optional reply the instructor typed in alongside "Mark resolved"
+   * (dashboard, plan 028 Step 3 + the later engagement follow-up) — sent
+   * back to the reporting participant's own socket only (`server.ts`'s
+   * `presenter:resolveError` handler), not broadcast, and kept here too so
+   * it's visible in the dashboard's own resolved-report history after the
+   * fact, not just in the one-shot notification the participant saw.
+   */
+  resolutionMessage?: string
 }
 
 // Append-only for the session's lifetime — no retention/cleanup policy
@@ -186,17 +218,22 @@ export function addErrorReport(report: Omit<ErrorReport, 'resolved'>): ErrorRepo
 
 /**
  * Marks a report resolved by id (the dashboard's `presenter:resolveError`
- * handler, plan 028 Step 3). Returns whether a matching report was found —
- * an unknown `errorId` is a no-op, not an error, mirroring `setStepStatus`'s
- * "no-op rather than a guess" precedent for a socket acting on an id it
- * doesn't recognize.
+ * handler, plan 028 Step 3). Returns the updated report (so the caller can
+ * read `participantId`/`stepId` to notify that participant back — see
+ * `server.ts`'s handler — without a second lookup), or `undefined` if no
+ * report matched — an unknown `errorId` is a no-op, not an error, mirroring
+ * `setStepStatus`'s "no-op rather than a guess" precedent for a socket
+ * acting on an id it doesn't recognize.
  */
-export function resolveErrorReport(errorId: string): boolean {
+export function resolveErrorReport(errorId: string, message?: string): ErrorReport | undefined {
   const report = errorReports.find(r => r.id === errorId)
   if (!report)
-    return false
+    return undefined
   report.resolved = true
-  return true
+  const trimmed = message?.trim()
+  if (trimmed)
+    report.resolutionMessage = trimmed
+  return report
 }
 
 export function listErrorReports(): ErrorReport[] {

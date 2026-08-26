@@ -142,6 +142,36 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
   // `/dashboard` path prefix (rather than at `/`) keeps this deliberate and
   // explicit rather than relying on that fallthrough for every path.
   const app = connect()
+
+  // CORS (fixes a real bug found in manual testing): the participant's
+  // browser loads the deck from Slidev's own dev server (e.g.
+  // `localhost:3030`) and `fetch()`s `POST /api/screenshot` on *this*
+  // server (e.g. `localhost:3710`) directly — a cross-origin request.
+  // `multipart/form-data` with no custom headers is a CORS-safelisted
+  // "simple request", so the browser still *sends* it and this server still
+  // processes the upload (which is why the dashboard could already show a
+  // screenshot that the reporting participant's own browser insisted had
+  // failed to send) — but without an `Access-Control-Allow-Origin` header on
+  // the response, the browser refuses to let the page's own JS read that
+  // response, so `fetch()` rejects and `ErrorReportWidget.vue` shows "Could
+  // not send the report" for a request that, server-side, fully succeeded.
+  // Socket.io's own `cors` option (below) only covers its own handshake —
+  // it does nothing for plain HTTP routes served by this `connect` app, so
+  // they need their own CORS header. Applied globally (not just on
+  // `/api/screenshot`) since `/dashboard` and `/uploads` are same-origin in
+  // normal use and an extra allow-origin header on a same-origin response is
+  // simply ignored by the browser — cheaper than special-casing one route.
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', options.origin ?? '*')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204).end()
+      return
+    }
+    next()
+  })
+
   app.use('/dashboard', requireDashboardCode(authConfig))
   app.use('/dashboard', sirv(DASHBOARD_PUBLIC_DIR, { single: true, dev: true, etag: true }))
 
@@ -337,7 +367,7 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
       broadcastStateUpdate(io)
     })
 
-    socket.on('presenter:resolveError', ({ errorId, presenterCode }: { errorId: string, presenterCode?: string }) => {
+    socket.on('presenter:resolveError', ({ errorId, presenterCode, message }: { errorId: string, presenterCode?: string, message?: string }) => {
       // Plan 029 Step 1: same presenter-credential gate as `presenter:setSlide`
       // / `presenter:setStep` above — resolving a report is exactly as
       // privileged as moving everyone's slide. (This handler was added by
@@ -346,8 +376,27 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
       // documented merge-order caveat.)
       if (!isValidPresenterCode(authConfig, presenterCode))
         return
-      resolveErrorReport(errorId)
+      const report = resolveErrorReport(errorId, message)
       broadcastStateUpdate(io)
+      if (!report)
+        return
+      // Close the loop back to the *specific* participant who filed this
+      // report — not a broadcast, and not the dashboard room (they already
+      // got it via the `state:update` above). `participant.socketId` always
+      // points at that participant's *current* socket (kept fresh by
+      // `joinParticipant` on every join, including a resume on a new
+      // socket after a refresh — plan 030), so this reaches them even if
+      // they reconnected since filing the report. If they've disconnected
+      // entirely, `io.to(...)` on a socket id with nobody listening is a
+      // harmless no-op — there's nothing to notify.
+      const reporter = participants.get(report.participantId)
+      if (reporter) {
+        io.to(reporter.socketId).emit('participant:errorResolved', {
+          errorId: report.id,
+          stepId: report.stepId,
+          message: report.resolutionMessage,
+        })
+      }
     })
 
     // PRD §10 `participant:visibility { state }` — reported by the addon's
@@ -389,7 +438,7 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
     // the joining socket only, mirroring `slide:sync`'s late-joiner pattern
     // above, so a freshly-opened dashboard tab doesn't have to wait for the
     // next mutation to render anything.
-    socket.on('dashboard:join', ({ presenterCode }: { presenterCode?: string } = {}, ack?: (result: { ok: boolean }) => void) => {
+    socket.on('dashboard:join', ({ presenterCode }: { presenterCode?: string } = {}, ack?: (result: { ok: boolean, roomCode?: string, presenterCode?: string }) => void) => {
       // Plan 029 Step 1: same presenter credential as `presenter:*` above —
       // opening the dashboard is exactly as privileged as moving everyone's
       // slide, so it shares the same gate rather than a weaker one.
@@ -399,7 +448,15 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
       }
       socket.join(DASHBOARD_ROOM)
       socket.emit('state:update', buildStateUpdate())
-      ack?.({ ok: true })
+      // Hand both codes back so the dashboard page can display them for the
+      // operator to copy — safe to do here specifically because reaching
+      // this line already proved the caller holds the presenter code (the
+      // higher-privilege of the two secrets), so echoing the room code back
+      // doesn't reveal anything to someone who couldn't already open this
+      // same dashboard. Answers "how does the presenter find the codes to
+      // hand out" without a separate discovery mechanism — see also
+      // `index.ts`'s startup log, the other place they're surfaced.
+      ack?.({ ok: true, roomCode: authConfig.roomCode, presenterCode: authConfig.presenterCode })
     })
 
     socket.on('disconnect', () => {

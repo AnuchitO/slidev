@@ -115,7 +115,7 @@ meaningful the way it is for the hardening plans above.
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Status |
 |------|-------|----------|--------|------|------------|--------|
-| 026 | M1 — Slide sync (addon + sync server skeleton) | P1 | M | MED | — | TODO |
+| 026 | M1 — Slide sync (addon + sync server skeleton) | P1 | M | MED | — | DONE |
 | 027 | M2 — Participant identity + step tracking | P1 | M-L | MED | 026 | TODO |
 | 028 | M3 — Error reporting (text + screenshot) | P2 | M | MED | 027 | TODO |
 | 029 | M4 — Presence tracking + presenter/dashboard auth | P2 | M | MED | 027 | TODO |

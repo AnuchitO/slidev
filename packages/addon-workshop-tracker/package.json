@@ -8,11 +8,16 @@
     "slidev-addon",
     "slidev"
   ],
+  "scripts": {
+    "test": "vitest run"
+  },
   "dependencies": {
     "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
+    "@slidev/client": "workspace:*",
     "@slidev/types": "workspace:*",
+    "vitest": "catalog:dev",
     "vue": "catalog:frontend",
     "vue-router": "catalog:frontend"
   }

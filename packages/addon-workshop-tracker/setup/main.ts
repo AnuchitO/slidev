@@ -1,5 +1,6 @@
 import { defineAppSetup } from '@slidev/types'
-import { createWorkshopSocket } from '../src/client'
+import { getWorkshopSocket } from '../src/client'
+import { resolveStepId } from '../src/stepId'
 
 // Matches the route path format `slidePath.ts` produces:
 // `presenter ? `/presenter/${no}` : `/${no}``. No other formats exist for
@@ -22,7 +23,7 @@ function isPresenterPath(path: string): boolean {
 // `inject()`. Only the `router` object passed as an argument is safe to use;
 // parse the route path directly instead.
 export default defineAppSetup(({ router }) => {
-  const socket = createWorkshopSocket()
+  const socket = getWorkshopSocket()
 
   // Guards against a participant's remote-driven navigation re-triggering
   // `presenter:setSlide` — only matters if that participant is ever on the
@@ -71,7 +72,17 @@ export default defineAppSetup(({ router }) => {
     if (applyingRemoteChange || !isPresenterPath(to.path))
       return
     const index = slideNoFromPath(to.path)
-    if (index != null)
-      socket.emit('presenter:setSlide', { index })
+    if (index != null) {
+      // `to.meta.slide.frontmatter` is a plain property on the *resolved*
+      // route object, not an `inject()`-based composable — safe to read
+      // here even though this handler runs from `setup/main.ts` (see the
+      // file-level comment above on why `useNav()`/`useSlideContext()`
+      // aren't used in this file). Reported alongside `presenter:setSlide`
+      // so the dashboard's "current step" column (plan 027 Step 3) doesn't
+      // require the server to parse deck markdown itself; see
+      // `workshop-tracker-server`'s README for the server-side half of this.
+      const stepId = resolveStepId(to.meta?.slide?.frontmatter, index)
+      socket.emit('presenter:setSlide', { index, stepId })
+    }
   })
 })

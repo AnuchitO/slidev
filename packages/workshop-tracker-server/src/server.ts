@@ -241,7 +241,12 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
       'participant:join',
       (
         { name, participantId, roomCode }: { name: string, participantId?: string, roomCode?: string },
-        ack?: (payload: { participantId: string, currentSlideIndex: number } | { error: 'invalid_room_code' }) => void,
+        // `resumed` (plan 030 Step 1) tells the caller whether a *requested*
+        // resume (a `participantId` was supplied) actually succeeded — the
+        // addon's `JoinScreen.vue` uses this to distinguish "resumed
+        // silently, skip the join prompt" from "resume fell back to a fresh
+        // identity, show the prompt again" rather than assuming success.
+        ack?: (payload: { participantId: string, currentSlideIndex: number, resumed: boolean } | { error: 'invalid_room_code' }) => void,
       ) => {
         // Plan 029 Step 1: the participant room code, distinct from (and
         // lower-privilege than) the presenter credential above. Rejected via
@@ -252,9 +257,31 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
           ack?.({ error: 'invalid_room_code' })
           return
         }
-        const participant = joinParticipant(name, participantId, randomUUID, socket.id)
+        const { participant, outcome } = joinParticipant(name, participantId, randomUUID, socket.id)
+        // Plan 030 Step 1: log a resume distinctly from both a normal
+        // first-time join and a *failed* resume — an operator watching the
+        // server's own logs during a real session needs to be able to tell
+        // "someone just joined" apart from "someone's resume silently fell
+        // back to a fresh identity" (e.g. the server restarted mid-workshop
+        // and lost its in-memory registry — PRD §4/§14's accepted case, not
+        // an error).
+        if (outcome === 'resumed') {
+          // eslint-disable-next-line no-console -- deliberate operator-facing log, not app logging.
+          console.log(`[workshop-tracker-server] participant resumed: ${participant.name} (${participant.id})`)
+        }
+        else if (outcome === 'resume-fallback') {
+          console.warn(
+            `[workshop-tracker-server] resume failed for unknown participantId "${participantId}" `
+            + `(server restarted, or a stale id from a different session) — `
+            + `falling back to a fresh join as ${participant.name} (${participant.id})`,
+          )
+        }
+        else {
+          // eslint-disable-next-line no-console -- deliberate operator-facing log, not app logging.
+          console.log(`[workshop-tracker-server] participant joined: ${participant.name} (${participant.id})`)
+        }
         socket.data.participantId = participant.id
-        ack?.({ participantId: participant.id, currentSlideIndex: session.currentSlideIndex })
+        ack?.({ participantId: participant.id, currentSlideIndex: session.currentSlideIndex, resumed: outcome === 'resumed' })
         broadcastStateUpdate(io)
       },
     )

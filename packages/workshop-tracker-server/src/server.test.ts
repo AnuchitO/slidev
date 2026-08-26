@@ -3,7 +3,7 @@ import type { Socket as ClientSocket } from 'socket.io-client'
 import type { WorkshopTrackerServer } from './server'
 import { Buffer } from 'node:buffer'
 import { io as ioClient } from 'socket.io-client'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createWorkshopTrackerServer } from './server'
 import { errorReports, participants, resetSessionStateForTests, session, stepStatus } from './session'
 
@@ -280,27 +280,67 @@ describe('createWorkshopTrackerServer', () => {
       )
 
       const second = await connectClient()
-      const secondAck = await emitWithAck<{ participantId: string }>(
+      const secondAck = await emitWithAck<{ participantId: string, resumed: boolean }>(
         second,
         'participant:join',
         { name: 'Ada', participantId: firstAck.participantId, roomCode: TEST_ROOM_CODE },
       )
 
       expect(secondAck.participantId).toBe(firstAck.participantId)
+      expect(secondAck.resumed).toBe(true)
       expect(participants.size).toBe(1)
     })
 
-    it('mints a fresh id when a client-supplied participantId is unknown to the server', async () => {
+    it('mints a fresh id when a client-supplied participantId is unknown to the server, with resumed: false (plan 030)', async () => {
       const client = await connectClient()
 
-      const ack = await emitWithAck<{ participantId: string }>(
+      const ack = await emitWithAck<{ participantId: string, resumed: boolean }>(
         client,
         'participant:join',
         { name: 'Ada', participantId: 'guessed-id-from-a-different-server-run', roomCode: TEST_ROOM_CODE },
       )
 
       expect(ack.participantId).not.toBe('guessed-id-from-a-different-server-run')
+      expect(ack.resumed).toBe(false)
       expect(participants.size).toBe(1)
+    })
+
+    it('a resumed rejoin keeps the original name even if a different one is supplied (plan 030 STOP condition)', async () => {
+      const first = await connectClient()
+      const firstAck = await emitWithAck<{ participantId: string }>(
+        first,
+        'participant:join',
+        { name: 'Ada', roomCode: TEST_ROOM_CODE },
+      )
+
+      const second = await connectClient()
+      await emitWithAck<{ participantId: string, resumed: boolean }>(
+        second,
+        'participant:join',
+        { name: 'Someone Else Entirely', participantId: firstAck.participantId, roomCode: TEST_ROOM_CODE },
+      )
+
+      expect(participants.get(firstAck.participantId)?.name).toBe('Ada')
+    })
+
+    it('logs a resume distinctly from a fresh join and from a failed resume (plan 030 operator-visibility requirement)', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const first = await connectClient()
+      const firstAck = await emitWithAck<{ participantId: string }>(first, 'participant:join', { name: 'Ada', roomCode: TEST_ROOM_CODE })
+      expect(logSpy.mock.calls.some(args => String(args[0]).includes('participant joined'))).toBe(true)
+
+      const second = await connectClient()
+      await emitWithAck(second, 'participant:join', { name: 'Ada', participantId: firstAck.participantId, roomCode: TEST_ROOM_CODE })
+      expect(logSpy.mock.calls.some(args => String(args[0]).includes('participant resumed'))).toBe(true)
+
+      const third = await connectClient()
+      await emitWithAck(third, 'participant:join', { name: 'Ada', participantId: 'unknown-id', roomCode: TEST_ROOM_CODE })
+      expect(warnSpy.mock.calls.some(args => String(args[0]).includes('resume failed'))).toBe(true)
+
+      logSpy.mockRestore()
+      warnSpy.mockRestore()
     })
   })
 

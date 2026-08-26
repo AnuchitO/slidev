@@ -3,7 +3,7 @@
   "type": "module",
   "version": "0.0.0",
   "private": true,
-  "description": "Realtime sync server for slidev-addon-workshop-tracker (M1: slide sync only)",
+  "description": "Realtime sync server for slidev-addon-workshop-tracker (M1-M3: slide sync, step tracking, error reporting)",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsdown",
@@ -11,12 +11,14 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "busboy": "^1.6.0",
     "connect": "catalog:prod",
     "pathe": "catalog:prod",
     "sirv": "catalog:prod",
     "socket.io": "^4.8.3"
   },
   "devDependencies": {
+    "@types/busboy": "^1.5.4",
     "@types/connect": "catalog:types",
     "@types/node": "catalog:types",
     "socket.io-client": "^4.8.3",

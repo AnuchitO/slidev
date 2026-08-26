@@ -18,18 +18,17 @@ any component's setup context (see that file's own comment), so it can't use
 extension point for exactly this "persistent component across all slides"
 use case, and avoids re-solving the injection-context problem 026 already
 hit once.
+
+Storage read/write and the shared `currentParticipant` ref live in
+`../src/participantIdentity.ts` (plan 028) rather than inline here — once
+`<ErrorReportWidget>` also needed to know "who joined", duplicating this
+logic in two components would risk the two drifting.
 -->
 <script setup lang="ts">
 import { useNav } from '@slidev/client'
 import { onMounted, ref } from 'vue'
 import { getWorkshopSocket } from '../src/client'
-
-const STORAGE_KEY = 'workshop-tracker:participant'
-
-interface StoredParticipant {
-  participantId: string
-  name: string
-}
+import { currentParticipant, readStoredParticipant, writeStoredParticipant } from '../src/participantIdentity'
 
 const { isPresenter } = useNav()
 
@@ -37,40 +36,15 @@ const joined = ref(false)
 const submitting = ref(false)
 const name = ref('')
 
-function readStoredParticipant(): StoredParticipant | undefined {
-  try {
-    const raw = sessionStorage.getItem(STORAGE_KEY)
-    if (!raw)
-      return undefined
-    const parsed = JSON.parse(raw)
-    if (typeof parsed?.participantId === 'string' && typeof parsed?.name === 'string')
-      return parsed
-    return undefined
-  }
-  catch {
-    // sessionStorage can throw (private browsing, disabled storage) — treat
-    // the same as "nothing stored", falling back to asking for a name.
-    return undefined
-  }
-}
-
-function writeStoredParticipant(participant: StoredParticipant) {
-  try {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(participant))
-  }
-  catch {
-    // Best-effort only — 030's fuller reconnect/resume story can revisit if
-    // this ever needs to be reliable rather than a nice-to-have.
-  }
-}
-
 function join(joinName: string, participantId?: string) {
   submitting.value = true
   getWorkshopSocket().emit(
     'participant:join',
     { name: joinName, participantId },
     (ack: { participantId: string, currentSlideIndex: number }) => {
-      writeStoredParticipant({ participantId: ack.participantId, name: joinName })
+      const participant = { participantId: ack.participantId, name: joinName }
+      writeStoredParticipant(participant)
+      currentParticipant.value = participant
       submitting.value = false
       joined.value = true
     },

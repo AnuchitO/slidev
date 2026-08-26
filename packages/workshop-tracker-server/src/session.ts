@@ -90,11 +90,65 @@ export function listStepStatus(): StepStatusEntry[] {
 }
 
 /**
- * Resets all M2 state — participants, step status, and the current step id
- * — back to a fresh session. Test-only: production never needs to reset a
- * running server's state; `beforeEach` in `server.test.ts` uses this so
- * tests don't leak participant/step state into each other via these
- * singleton maps (mirroring how M1's tests reset `session.currentSlideIndex`
+ * `ErrorReport` (PRD §9, plan 028 Step 1): a participant's text and/or
+ * screenshot report tied to `participantId`/`stepId`. `resolved` is a M3
+ * addition on top of the PRD's literal shape — the dashboard's
+ * mark-resolved action (plan 028 Step 3) needs somewhere server-side to
+ * live so resolved state survives a dashboard page reload, per that step's
+ * own verification note.
+ */
+export interface ErrorReport {
+  id: string
+  participantId: string
+  participantName: string
+  stepId: string
+  text?: string
+  screenshotUrl?: string
+  ts: number
+  resolved: boolean
+}
+
+// Append-only for the session's lifetime — no retention/cleanup policy
+// (plan 028's explicit out-of-scope call: no cross-restart persistence
+// requirement in the PRD, §4 non-goals).
+export const errorReports: ErrorReport[] = []
+
+/**
+ * Adds a new `ErrorReport`. Callers pass everything but `resolved` — a
+ * freshly-reported error always starts unresolved; nothing in this plan's
+ * scope ever creates one pre-resolved.
+ */
+export function addErrorReport(report: Omit<ErrorReport, 'resolved'>): ErrorReport {
+  const full: ErrorReport = { ...report, resolved: false }
+  errorReports.push(full)
+  return full
+}
+
+/**
+ * Marks a report resolved by id (the dashboard's `presenter:resolveError`
+ * handler, plan 028 Step 3). Returns whether a matching report was found —
+ * an unknown `errorId` is a no-op, not an error, mirroring `setStepStatus`'s
+ * "no-op rather than a guess" precedent for a socket acting on an id it
+ * doesn't recognize.
+ */
+export function resolveErrorReport(errorId: string): boolean {
+  const report = errorReports.find(r => r.id === errorId)
+  if (!report)
+    return false
+  report.resolved = true
+  return true
+}
+
+export function listErrorReports(): ErrorReport[] {
+  return errorReports
+}
+
+/**
+ * Resets all M2/M3 state — participants, step status, current step id, and
+ * error reports — back to a fresh session. Test-only: production never
+ * needs to reset a running server's state; `beforeEach` in `server.test.ts`
+ * uses this so tests don't leak state into each other via these singleton
+ * maps/arrays (mirroring how M1's tests reset `session.currentSlideIndex`
  * directly).
  */
 export function resetSessionStateForTests(): void {
@@ -102,4 +156,5 @@ export function resetSessionStateForTests(): void {
   session.currentStepId = '1'
   participants.clear()
   stepStatus.clear()
+  errorReports.length = 0
 }

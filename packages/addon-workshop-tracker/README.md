@@ -1,13 +1,15 @@
 # slidev-addon-workshop-tracker
 
 A Slidev addon that syncs the presenter's current slide to every connected
-participant in real time, and (as of M2) lets participants identify
-themselves and acknowledge hands-on steps, over the companion
+participant in real time, lets participants identify themselves and
+acknowledge hands-on steps (M2), and (as of M3) report an error — text
+and/or a captured screenshot — over the companion
 [`workshop-tracker-server`](../workshop-tracker-server). Currently
-implements **M1 (slide sync) and M2 (participant identity + step
-tracking)** — error reporting, presence, and auth are still ahead. See
+implements **M1 (slide sync), M2 (participant identity + step tracking),
+and M3 (error reporting)** — presence and auth are still ahead. See
 [`plans/026-workshop-tracker-m1-slide-sync.md`](../../plans/026-workshop-tracker-m1-slide-sync.md),
 [`plans/027-workshop-tracker-m2-step-tracking.md`](../../plans/027-workshop-tracker-m2-step-tracking.md),
+[`plans/028-workshop-tracker-m3-error-reporting.md`](../../plans/028-workshop-tracker-m3-error-reporting.md),
 and [`plans/prd-workshop-tracking.md`](../../plans/prd-workshop-tracking.md).
 
 ## Usage
@@ -97,8 +99,36 @@ runs before any addon's `setup/main.ts` executes).
   component rather than living in `setup/main.ts` alongside
   `presenter:setSlide`.
 
-Both `<JoinScreen>` and `<StepReporter>` are mounted via
-[`global-top.vue`](./global-top.vue) — Slidev's documented **Global Layers**
+- **`<ErrorReportWidget>`** (`components/ErrorReportWidget.vue`, plan 028) —
+  a small floating "⚠️ Report a problem" button (bottom-right, every slide)
+  that expands into a form: a text box (always available, the required
+  PRD §10/§12 fallback) and a "Capture screen" button shown only when
+  `canCaptureScreen` (`src/errorReportCapability.ts`, unit tested) is
+  true — explicit feature detection (`navigator.mediaDevices?.getDisplayMedia`
+  exists **and** the origin is `https:` or `localhost`), not
+  try/catch-and-hope, so a participant on a browser/context lacking the API
+  never sees a button that would only fail when clicked. Capture uses the
+  standard "one `<video>` frame → `<canvas>` → `Blob`" technique and stops
+  every track immediately after grabbing the frame (so the browser's
+  "sharing your screen" indicator disappears right away, not only once the
+  form is submitted). Submission is exactly one of two paths, matching the
+  server's split responsibility (see the server's README):
+  - A captured screenshot → `POST /api/screenshot` (REST, multipart body
+    built by `src/errorReportSubmission.ts`, unit tested).
+  - Text-only → the WS `participant:error { stepId, text }` event on the
+    same shared socket `<StepCommand>` uses.
+
+  Reads the current participant from `src/participantIdentity.ts`'s shared
+  `currentParticipant` ref (a module-scope singleton, same pattern as
+  `client.ts`'s shared socket) — `<JoinScreen>` sets it on a successful
+  `participant:join` ack; both components now read/write participant
+  identity through this one module instead of each keeping its own copy
+  (a small refactor `JoinScreen.vue` picked up alongside this widget, see
+  that file's own comment). Hidden on the presenter route
+  (`useNav().isPresenter`) — error reporting is a participant action.
+
+`<JoinScreen>`, `<StepReporter>`, and `<ErrorReportWidget>` are all mounted
+via [`global-top.vue`](./global-top.vue) — Slidev's documented **Global Layers**
 extension point (<https://sli.dev/features/global-layers>,
 `packages/slidev/node/virtual/global-layers.ts`): a `global-top.{ts,js,vue}`
 file at an addon/theme root is auto-rendered once, persisting across every

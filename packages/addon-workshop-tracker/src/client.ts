@@ -4,10 +4,20 @@ import { io } from 'socket.io-client'
 let socket: Socket | undefined
 
 /**
- * Resolves the sync server URL from an env var (simplest option for M1;
- * revisit headmatter-driven config later if operators need a per-deck
- * override without env vars — not needed to hit M1's acceptance bar) and
- * returns a single shared connection.
+ * Resolves the sync server's base URL from an env var (simplest option for
+ * M1; revisit headmatter-driven config later if operators need a per-deck
+ * override without env vars — not needed to hit M1's acceptance bar).
+ * Shared by `getWorkshopSocket()` below (the Socket.io connection) and
+ * `ErrorReportWidget.vue`'s plain `fetch()` call to `POST /api/screenshot`
+ * (plan 028) — both need the *same* origin, so this is the one place that
+ * reads the env var rather than each call site re-deriving it.
+ */
+export function getWorkshopTrackerServerUrl(): string {
+  return import.meta.env.VITE_WORKSHOP_TRACKER_SERVER_URL ?? 'http://localhost:3710'
+}
+
+/**
+ * Returns a single shared Socket.io connection to the sync server.
  *
  * Memoized at module scope rather than created fresh per call: `setup/main.ts`
  * (app-level, pre-mount) and the M2 components (`StepCommand.vue`,
@@ -20,9 +30,7 @@ let socket: Socket | undefined
  * context).
  */
 export function getWorkshopSocket(): Socket {
-  if (!socket) {
-    const url = import.meta.env.VITE_WORKSHOP_TRACKER_SERVER_URL ?? 'http://localhost:3710'
-    socket = io(url, { autoConnect: true, reconnection: true })
-  }
+  if (!socket)
+    socket = io(getWorkshopTrackerServerUrl(), { autoConnect: true, reconnection: true })
   return socket
 }

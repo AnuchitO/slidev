@@ -5,6 +5,15 @@ export const PARTICIPANT_STORAGE_KEY = 'workshop-tracker:participant'
 export interface StoredParticipant {
   participantId: string
   name: string
+  /**
+   * Persisted alongside identity (plan 029) so a same-tab reload can
+   * auto-rejoin without re-prompting for the code — this is the low(er)-
+   * privilege participant room code (PRD §12), not the presenter
+   * credential, so sessionStorage is an acceptable place for it (unlike the
+   * presenter code — see `presenterCode.ts`'s comment on why *that* one is
+   * never persisted/embedded anywhere).
+   */
+  roomCode: string
 }
 
 export function readStoredParticipant(): StoredParticipant | undefined {
@@ -13,7 +22,7 @@ export function readStoredParticipant(): StoredParticipant | undefined {
     if (!raw)
       return undefined
     const parsed = JSON.parse(raw)
-    if (typeof parsed?.participantId === 'string' && typeof parsed?.name === 'string')
+    if (typeof parsed?.participantId === 'string' && typeof parsed?.name === 'string' && typeof parsed?.roomCode === 'string')
       return parsed
     return undefined
   }

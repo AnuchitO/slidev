@@ -1,5 +1,6 @@
 import { defineAppSetup } from '@slidev/types'
 import { getWorkshopSocket } from '../src/client'
+import { getPresenterCodeFromUrl } from '../src/presenterCode'
 
 // Matches the route path format `slidePath.ts` produces:
 // `presenter ? `/presenter/${no}` : `/${no}``. No other formats exist for
@@ -71,7 +72,11 @@ export default defineAppSetup(({ router }) => {
     if (applyingRemoteChange || !isPresenterPath(to.path))
       return
     const index = slideNoFromPath(to.path)
-    if (index != null)
-      socket.emit('presenter:setSlide', { index })
+    if (index != null) {
+      // Plan 029 Step 1: the server rejects this event without a valid
+      // presenter credential — see `getPresenterCodeFromUrl`'s own comment
+      // for why it's read from the URL rather than baked into this bundle.
+      socket.emit('presenter:setSlide', { index, presenterCode: getPresenterCodeFromUrl() })
+    }
   })
 })

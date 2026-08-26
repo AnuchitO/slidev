@@ -5,10 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Workshop Tracker — Dashboard</title>
 <!--
-  NOTE(security): this route has no auth (plan 027, same documented gap as
-  026's presenter route) — anyone who knows/guesses this URL can open it.
-  Plan 029 (M4) adds a join code that gates presenter/dashboard access. Do
-  not point this at a real workshop room before 029 lands.
+  Auth (plan 029 / PRD §12): the HTTP GET for this page itself is gated by
+  `server.ts`'s `requireDashboardCode` middleware on a `?code=` query param
+  (a 401 is returned before this HTML is ever served if it's missing/wrong —
+  see that function's own comment for why a query param over HTTP Basic).
+  The *same* code is read back out of `location.search` below and sent as
+  `presenterCode` on the `dashboard:join` socket event, which is gated
+  server-side by the identical presenter-credential check `presenter:*`
+  events use — opening the dashboard is exactly as privileged as moving
+  everyone's slide. One credential, one place it lives (the URL the operator
+  hands out), never embedded in this file itself.
 -->
 <style>
   :root {
@@ -23,6 +29,9 @@
     --done: #2fa86b;
     --offline: #6b2f3a;
     --error: #c9524f;
+    --presence-visible: #2fa86b;
+    --presence-hidden: #c9930f;
+    --presence-closed: #6b2f3a;
   }
   * { box-sizing: border-box; }
   body {
@@ -78,6 +87,9 @@
   .badge.copied { background: var(--copied); }
   .badge.done { background: var(--done); }
   .badge.offline { background: var(--offline); color: #e6e9ef; }
+  .badge.presence-visible { background: var(--presence-visible); }
+  .badge.presence-hidden { background: var(--presence-hidden); }
+  .badge.presence-closed { background: var(--presence-closed); color: #e6e9ef; }
   .empty { color: var(--muted); padding: 20px; text-align: center; }
   .conn { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
   .conn.live { color: var(--done); }
@@ -171,11 +183,12 @@
 </head>
 <body>
   <h1>Workshop Tracker — Instructor Dashboard</h1>
-  <p class="sub">Participant roster, current-step status, and error feed. No auth yet — see the note in this file's source.</p>
+  <p class="sub">Participant roster, presence, current-step status, and the error feed. Requires the presenter code (see this file's source).</p>
   <p class="conn" id="conn">connecting…</p>
 
   <div class="counts">
     <div class="count"><span class="n" id="count-joined">0</span><span class="l">joined</span></div>
+    <div class="count"><span class="n" id="count-viewing">0</span><span class="l">viewing now</span></div>
     <div class="count"><span class="n" id="count-done">0</span><span class="l">done this step</span></div>
     <div class="count"><span class="n" id="count-slide">–</span><span class="l">current slide</span></div>
     <div class="count"><span class="n" id="count-step">–</span><span class="l">current stepId</span></div>
@@ -186,13 +199,21 @@
     <thead>
       <tr>
         <th>Participant</th>
-        <th>Connected</th>
+        <th>Presence</th>
         <th>Status (current step)</th>
         <th>Joined at</th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
+  <!--
+    PRD §11/§15's "never joined" presence state has no row here by design —
+    there's no roster of expected participants in this single-session model
+    (PRD §14 leaves multi-session/invite-list scope open), so "never joined"
+    is represented by simple absence from this table, distinguishable from
+    an explicit "closed" row (plan 029 Step 3) for someone who *did* join
+    and later left/dropped.
+  -->
   <p class="empty" id="empty" hidden>No participants have joined yet.</p>
 
   <h2>Error reports</h2>
@@ -201,6 +222,8 @@
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
+    const presenterCode = new URLSearchParams(location.search).get('code') || undefined
+
     const socket = io()
     const connEl = document.getElementById('conn')
     const rowsEl = document.getElementById('rows')
@@ -209,9 +232,16 @@
     const errorsEmptyEl = document.getElementById('errors-empty')
 
     socket.on('connect', () => {
-      connEl.textContent = 'live'
-      connEl.classList.add('live')
-      socket.emit('dashboard:join')
+      socket.emit('dashboard:join', { presenterCode }, (result) => {
+        if (result && result.ok === false) {
+          connEl.textContent = 'presenter code rejected — append ?code=<presenterCode> to this page\'s URL and reload'
+          connEl.classList.remove('live')
+          socket.disconnect()
+          return
+        }
+        connEl.textContent = 'live'
+        connEl.classList.add('live')
+      })
     })
     socket.on('disconnect', () => {
       connEl.textContent = 'disconnected — retrying…'
@@ -223,12 +253,29 @@
       return entry ? entry.state : 'idle'
     }
 
+    // Presence column (plan 029 Step 3, PRD §11/§15): three of the four
+    // states it distinguishes render here per-row ("never joined" is
+    // absence from the table entirely — see the HTML comment above). Driven
+    // by `visibility` (not the raw `connected` flag alone) so "away" (tab
+    // backgrounded, socket still live) reads differently from "closed"
+    // (socket actually gone, via a clean disconnect or the staleness sweep).
+    function presenceFor(p) {
+      if (!p.connected || p.visibility === 'closed')
+        return { label: 'closed', cls: 'presence-closed' }
+      if (p.visibility === 'hidden')
+        return { label: 'away', cls: 'presence-hidden' }
+      return { label: 'viewing now', cls: 'presence-visible' }
+    }
+
     function render(state) {
       const { currentSlideIndex, currentStepId, participants, stepStatus, errors } = state
 
       document.getElementById('count-slide').textContent = currentSlideIndex
       document.getElementById('count-step').textContent = currentStepId
       document.getElementById('count-joined').textContent = participants.length
+      document.getElementById('count-viewing').textContent = participants.filter(
+        p => presenceFor(p).label === 'viewing now',
+      ).length
 
       const doneCount = participants.filter(
         p => statusFor(stepStatus, p.id, currentStepId) === 'done',
@@ -240,10 +287,11 @@
 
       for (const p of [...participants].sort((a, b) => a.joinedAt - b.joinedAt)) {
         const status = p.connected ? statusFor(stepStatus, p.id, currentStepId) : 'offline'
+        const presence = presenceFor(p)
         const tr = document.createElement('tr')
         tr.innerHTML = `
           <td>${escapeHtml(p.name)}</td>
-          <td>${p.connected ? 'yes' : 'no'}</td>
+          <td><span class="badge ${presence.cls}">${presence.label}</span></td>
           <td><span class="badge ${status}">${status}</span></td>
           <td>${new Date(p.joinedAt).toLocaleTimeString()}</td>
         `
@@ -311,7 +359,7 @@
       const button = event.target.closest('.resolve-button')
       if (button) {
         button.disabled = true
-        socket.emit('presenter:resolveError', { errorId: button.dataset.errorId })
+        socket.emit('presenter:resolveError', { errorId: button.dataset.errorId, presenterCode })
       }
     })
 

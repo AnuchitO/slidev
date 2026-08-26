@@ -35,17 +35,27 @@ const { isPresenter } = useNav()
 const joined = ref(false)
 const submitting = ref(false)
 const name = ref('')
+const roomCode = ref('')
+const joinError = ref('')
 
-function join(joinName: string, participantId?: string) {
+function join(joinName: string, joinRoomCode: string, participantId?: string) {
   submitting.value = true
+  joinError.value = ''
   getWorkshopSocket().emit(
     'participant:join',
-    { name: joinName, participantId },
-    (ack: { participantId: string, currentSlideIndex: number }) => {
-      const participant = { participantId: ack.participantId, name: joinName }
+    { name: joinName, participantId, roomCode: joinRoomCode },
+    (ack: { participantId: string, currentSlideIndex: number } | { error: string }) => {
+      submitting.value = false
+      // Plan 029: the server rejects a wrong/missing room code via this ack
+      // rather than a forced disconnect — surface it so the participant can
+      // correct the code and retry without reloading the page.
+      if ('error' in ack) {
+        joinError.value = 'That room code was not accepted — check it and try again.'
+        return
+      }
+      const participant = { participantId: ack.participantId, name: joinName, roomCode: joinRoomCode }
       writeStoredParticipant(participant)
       currentParticipant.value = participant
-      submitting.value = false
       joined.value = true
     },
   )
@@ -54,14 +64,15 @@ function join(joinName: string, participantId?: string) {
 onMounted(() => {
   const stored = readStoredParticipant()
   if (stored)
-    join(stored.name, stored.participantId)
+    join(stored.name, stored.roomCode, stored.participantId)
 })
 
 function onSubmit() {
-  const trimmed = name.value.trim()
-  if (!trimmed || submitting.value)
+  const trimmedName = name.value.trim()
+  const trimmedRoomCode = roomCode.value.trim()
+  if (!trimmedName || !trimmedRoomCode || submitting.value)
     return
-  join(trimmed)
+  join(trimmedName, trimmedRoomCode)
 }
 </script>
 
@@ -83,7 +94,18 @@ function onSubmit() {
         :disabled="submitting"
         class="workshop-tracker-join-input"
       >
-      <button type="submit" class="workshop-tracker-join-button" :disabled="submitting || !name.trim()">
+      <input
+        v-model="roomCode"
+        type="text"
+        placeholder="Room code"
+        autocomplete="off"
+        :disabled="submitting"
+        class="workshop-tracker-join-input"
+      >
+      <p v-if="joinError" class="workshop-tracker-join-error">
+        {{ joinError }}
+      </p>
+      <button type="submit" class="workshop-tracker-join-button" :disabled="submitting || !name.trim() || !roomCode.trim()">
         {{ submitting ? 'Joining…' : 'Join' }}
       </button>
     </form>
@@ -120,6 +142,11 @@ function onSubmit() {
   margin: 0;
   font-size: 0.85em;
   opacity: 0.75;
+}
+.workshop-tracker-join-error {
+  margin: 0;
+  font-size: 0.85em;
+  color: #e35d5d;
 }
 .workshop-tracker-join-input {
   padding: 0.5em 0.75em;

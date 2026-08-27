@@ -315,18 +315,18 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         // an error).
         if (outcome === 'resumed') {
           // eslint-disable-next-line no-console -- deliberate operator-facing log, not app logging.
-          console.log(`[slidev-muan-companion-server] participant resumed: ${participant.name} (${participant.id})`)
+          console.log(`[muan-companion-server] participant resumed: ${participant.name} (${participant.id})`)
         }
         else if (outcome === 'resume-fallback') {
           console.warn(
-            `[slidev-muan-companion-server] resume failed for unknown participantId "${participantId}" `
+            `[muan-companion-server] resume failed for unknown participantId "${participantId}" `
             + `(server restarted, or a stale id from a different session) — `
             + `falling back to a fresh join as ${participant.name} (${participant.id})`,
           )
         }
         else {
           // eslint-disable-next-line no-console -- deliberate operator-facing log, not app logging.
-          console.log(`[slidev-muan-companion-server] participant joined: ${participant.name} (${participant.id})`)
+          console.log(`[muan-companion-server] participant joined: ${participant.name} (${participant.id})`)
         }
         socket.data.participantId = participant.id
         ack?.({ participantId: participant.id, currentSlideIndex: session.currentSlideIndex, resumed: outcome === 'resumed' })

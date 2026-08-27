@@ -971,6 +971,46 @@ importers:
         specifier: catalog:prod
         version: 2.4.2
 
+  packages/muan-companion-server:
+    dependencies:
+      busboy:
+        specifier: ^1.6.0
+        version: 1.6.0
+      connect:
+        specifier: catalog:prod
+        version: 3.7.0(supports-color@8.1.1)
+      pathe:
+        specifier: catalog:prod
+        version: 2.0.3
+      sirv:
+        specifier: catalog:prod
+        version: 3.0.2
+      socket.io:
+        specifier: ^4.8.3
+        version: 4.8.3(supports-color@8.1.1)
+    devDependencies:
+      '@types/busboy':
+        specifier: ^1.5.4
+        version: 1.5.4
+      '@types/connect':
+        specifier: catalog:types
+        version: 3.4.38
+      '@types/node':
+        specifier: catalog:types
+        version: 26.2.0
+      socket.io-client:
+        specifier: ^4.8.3
+        version: 4.8.3(supports-color@8.1.1)
+      tsdown:
+        specifier: catalog:dev
+        version: 0.22.14(@volar/typescript@2.4.28(typescript@6.0.3))(tsx@4.23.12)(typescript@6.0.3)(unrun@0.2.26(@emnapi/core@2.0.0-alpha.3)(@emnapi/runtime@2.0.0-alpha.3)(synckit@0.11.12))(vue-tsc@3.3.10(typescript@6.0.3))
+      tsx:
+        specifier: catalog:dev
+        version: 4.23.12
+      vitest:
+        specifier: catalog:dev
+        version: 4.1.10(@types/node@26.2.0)(jsdom@30.0.1)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.28.0)(jiti@2.7.0)(terser@5.49.0)(tsx@4.23.12)(yaml@2.9.0))
+
   packages/parser:
     dependencies:
       '@antfu/utils':
@@ -1233,46 +1273,6 @@ importers:
       '@types/plantuml-encoder':
         specifier: catalog:types
         version: 1.4.2
-
-  packages/slidev-muan-companion-server:
-    dependencies:
-      busboy:
-        specifier: ^1.6.0
-        version: 1.6.0
-      connect:
-        specifier: catalog:prod
-        version: 3.7.0(supports-color@8.1.1)
-      pathe:
-        specifier: catalog:prod
-        version: 2.0.3
-      sirv:
-        specifier: catalog:prod
-        version: 3.0.2
-      socket.io:
-        specifier: ^4.8.3
-        version: 4.8.3(supports-color@8.1.1)
-    devDependencies:
-      '@types/busboy':
-        specifier: ^1.5.4
-        version: 1.5.4
-      '@types/connect':
-        specifier: catalog:types
-        version: 3.4.38
-      '@types/node':
-        specifier: catalog:types
-        version: 26.2.0
-      socket.io-client:
-        specifier: ^4.8.3
-        version: 4.8.3(supports-color@8.1.1)
-      tsdown:
-        specifier: catalog:dev
-        version: 0.22.14(@volar/typescript@2.4.28(typescript@6.0.3))(tsx@4.23.12)(typescript@6.0.3)(unrun@0.2.26(@emnapi/core@2.0.0-alpha.3)(@emnapi/runtime@2.0.0-alpha.3)(synckit@0.11.12))(vue-tsc@3.3.10(typescript@6.0.3))
-      tsx:
-        specifier: catalog:dev
-        version: 4.23.12
-      vitest:
-        specifier: catalog:dev
-        version: 4.1.10(@types/node@26.2.0)(jsdom@30.0.1)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.28.0)(jiti@2.7.0)(terser@5.49.0)(tsx@4.23.12)(yaml@2.9.0))
 
   packages/types:
     dependencies:

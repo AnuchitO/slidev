@@ -29,7 +29,7 @@ export interface StoredParticipant {
  * storage is unnecessary standing exposure with no real benefit, since a
  * resume of an *already-known* identity doesn't actually need the room code
  * at all — the unguessable `participantId` this struct carries is itself
- * the resume credential (see `slidev-muan-companion-server`'s `session.ts` /
+ * the resume credential (see `muan-companion-server`'s `session.ts` /
  * `server.ts` for the server-side half of this). The room code is only ever
  * asked for again on a genuinely *fresh* join, or the rare case where a
  * resume attempt fails (e.g. the server restarted) — both go through
@@ -84,7 +84,7 @@ export function clearStoredParticipant(): void {
 export interface JoinAck {
   participantId: string
   currentSlideIndex: number
-  /** See `slidev-muan-companion-server`'s `participant:join` handler / README. */
+  /** See `muan-companion-server`'s `participant:join` handler / README. */
   resumed: boolean
 }
 

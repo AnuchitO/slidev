@@ -6,7 +6,7 @@ acknowledge hands-on steps, report an error — text and/or a captured
 screenshot — reports each participant's presence, gates presenter/dashboard
 actions behind a credential, and resumes a participant's own identity across
 a refresh or brief network drop, over the companion
-[`slidev-muan-companion-server`](../slidev-muan-companion-server). Implements the full
+[`muan-companion-server`](../muan-companion-server). Implements the full
 initiative — **M1 (slide sync), M2 (participant identity + step tracking),
 M3 (error reporting), M4 (presence + auth), and M5 (reconnect/resume +
 load-tested hardening)**. See
@@ -47,7 +47,7 @@ addons:
 (A deck outside this monorepo, consuming the addon as a real published or
 `file:`-linked dependency, is unaffected — see below.)
 
-Then run the sync server (`pnpm --filter slidev-muan-companion-server dev`,
+Then run the sync server (`pnpm --filter muan-companion-server dev`,
 configured with `SLIDEV_MUAN_COMPANION_ROOM_CODE`/`SLIDEV_MUAN_COMPANION_PRESENTER_CODE` — see that
 package's README) alongside the Slidev dev server. By default the addon
 connects to `http://localhost:3710`; override with
@@ -192,7 +192,7 @@ but not `to.meta.slide.frontmatter`.
 Fix: `stepId` reporting was pulled out into its own component
 (`StepReporter.vue`, a real mounted component using `useNav()`) and its own
 server event (`presenter:setStep`, separate from `presenter:setSlide`) — see
-`slidev-muan-companion-server`'s README for the server-side half. Don't
+`muan-companion-server`'s README for the server-side half. Don't
 reintroduce frontmatter reads in `setup/main.ts`; use a mounted component
 (via Global Layers or a slide-scoped component) instead.
 
@@ -237,7 +237,7 @@ in play — but out of scope for M1.
 ## Auth (plan 029 / PRD §12)
 
 `presenter:setSlide`/`presenter:setStep` now require a `presenterCode`,
-verified server-side (`slidev-muan-companion-server`'s `src/auth.ts`); a
+verified server-side (`muan-companion-server`'s `src/auth.ts`); a
 participant's browser navigating to a `/presenter/:no` route without it has
 those events silently rejected, so it can no longer move/relabel everyone
 else's slide and step. `participant:join` now similarly requires a
@@ -255,7 +255,7 @@ too, which is exactly the failure mode plan 029's STOP condition rules out
 one browser tab whose URL the instructor set it on — never in the shipped
 bundle.
 
-The `/dashboard` route (served by `slidev-muan-companion-server`) is gated the
+The `/dashboard` route (served by `muan-companion-server`) is gated the
 same way, at the HTTP layer — see that package's own README for the full
 picture (including the honestly-scoped threat model: this is
 LAN-workshop-appropriate auth, not brute-force/rate-limit-hardened
@@ -273,7 +273,7 @@ follow-on fix — see below): on mount, if one is stored, it emits
 your session…" message instead of the name/room-code form — a refreshing
 participant never sees a join prompt, matching PRD §12's "without
 re-joining as a 'new' participant." The server's ack now carries a
-`resumed: boolean` (see `slidev-muan-companion-server`'s README) — the
+`resumed: boolean` (see `muan-companion-server`'s README) — the
 authoritative signal for whether that specific resume succeeded, rather
 than the client comparing ids itself (`resolveJoinAckOutcome`,
 `src/participantIdentity.ts`, unit tested).
@@ -343,7 +343,7 @@ above) it wasn't buying any real protection against resume hijacking either.
 Fix: `participantIdentity.ts`'s `StoredParticipant` no longer has a
 `roomCode` field at all, and `server.ts`'s `participant:join` handler
 exempts a resume of an already-known `participantId` from the room-code gate
-entirely (see `slidev-muan-companion-server`'s README for the server-side
+entirely (see `muan-companion-server`'s README for the server-side
 reasoning). The auto-resume call in `<JoinScreen>`'s `onMounted` sends no
 room code — it doesn't need one for the common case (same person, this
 session) to keep working exactly as before.
@@ -371,7 +371,7 @@ identity — orphaning the fallback's second one. That orphan can never be
 cleaned up: at the time this was found, it shared its (singular, pre-follow-
 up-fix) `socketId` with the socket that goes on to become the _real_ (third)
 participant, so `sweepStaleParticipants`'s "is this socket still connected"
-check (`slidev-muan-companion-server`'s `presence.ts`) kept finding it alive
+check (`muan-companion-server`'s `presence.ts`) kept finding it alive
 forever, and a clean `disconnect` only updated whichever participant
 `socket.data.participantId` currently pointed at (the real one) — the
 dashboard would show a permanent, un-closeable duplicate row for the rest of

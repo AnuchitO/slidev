@@ -1,4 +1,4 @@
-# slidev-muan-companion-server
+# muan-companion-server
 
 Realtime sync server for [`slidev-addon-muan-companion`](../addon-muan-companion).
 Currently implements **M1 (slide sync), M2 (participant identity + step
@@ -21,7 +21,7 @@ duration of a workshop.
 
 ```bash
 SLIDEV_MUAN_COMPANION_ROOM_CODE=<pick-one> SLIDEV_MUAN_COMPANION_PRESENTER_CODE=<pick-another> \
-  pnpm --filter slidev-muan-companion-server dev
+  pnpm --filter muan-companion-server dev
 ```
 
 Starts an HTTP + Socket.io server listening on `:3710` (override with the
@@ -299,7 +299,7 @@ together).
 ## Testing
 
 ```bash
-pnpm --filter slidev-muan-companion-server test
+pnpm --filter muan-companion-server test
 ```
 
 `src/server.test.ts` spins up real `socket.io-client` pairs (connected over

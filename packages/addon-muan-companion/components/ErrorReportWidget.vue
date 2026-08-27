@@ -40,7 +40,7 @@ Theme: reacts live to Slidev's own dark/light signal (`useDarkMode()` from
 `@slidev/client`, the same composable the deck's own toggle drives) via a
 `wt-theme-light` modifier class carrying a light token override — a small
 lift since the signal is already exported for exactly this kind of
-consumption. The dashboard side of this redesign (`slidev-muan-companion-server/
+consumption. The dashboard side of this redesign (`muan-companion-server/
 public/dashboard/index.html`) intentionally stays dark-only: it's a
 separate standalone page the instructor opens directly, not embedded in
 the deck, so there's no equivalent theme signal to react to there.
@@ -312,7 +312,7 @@ onBeforeUnmount(() => {
 /*
  * Design tokens (Material-inspired, "Google style" per direct participant
  * feedback): a small, deliberately-limited set applied identically here and
- * in the dashboard's error feed (`slidev-muan-companion-server/public/dashboard/
+ * in the dashboard's error feed (`muan-companion-server/public/dashboard/
  * index.html`) even though the two can't share a stylesheet — same radius
  * scale, same elevation shadows, same semantic color roles, same type
  * stack, kept in sync by eye. Dark values are the defaults (this widget's

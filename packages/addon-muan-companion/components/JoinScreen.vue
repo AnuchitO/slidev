@@ -273,7 +273,11 @@ function onForciblyDisconnected(reason: string) {
   if (reason !== 'io server disconnect')
     return
   resetToFreshJoin()
-  joinError.value = 'You were removed from this workshop by the instructor. Enter your name and the room code to join again.'
+  // The join form itself (rendered right below this message once `joined`
+  // flips back to false) already shows the name/room-code fields — telling
+  // them to "enter your name and room code" on top of that was redundant,
+  // reported from live use.
+  joinError.value = 'You were removed from this workshop by the instructor.'
   // Same "manual disconnect never auto-reconnects" reasoning as
   // `joinAsSomeoneElse` above — except here the server already did the
   // disconnecting; this side just needs to bring the socket back so a
@@ -354,6 +358,12 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 0.75em;
   min-width: 280px;
+  /* Without this, a long message in `.join-error` below had nothing
+     stopping it from stretching the whole card wider to fit on one line —
+     reported from live use (the "you were removed" message). `min()` caps
+     it at a sane width on desktop while still shrinking on a narrow
+     viewport, same pattern `ErrorReportWidget.vue`'s panels use. */
+  max-width: min(360px, 90vw);
   padding: 2em;
   border-radius: 12px;
   background: #17181d;
@@ -373,6 +383,11 @@ onBeforeUnmount(() => {
   margin: 0;
   font-size: 0.85em;
   color: #e35d5d;
+  /* Wraps onto multiple lines within the now-capped card width instead of
+     forcing it wider — belt-and-suspenders alongside `.join-card`'s own
+     `max-width` above (this still matters for a single unbroken long
+     word/token that `max-width` alone wouldn't wrap). */
+  overflow-wrap: break-word;
 }
 .slidev-muan-companion-join-input {
   padding: 0.5em 0.75em;

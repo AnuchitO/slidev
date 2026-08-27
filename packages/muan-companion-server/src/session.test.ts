@@ -2,13 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   addErrorReport,
   addParticipantMessage,
+  addPendingConnection,
   addPresenterMessage,
   confirmResolution,
   errorReports,
   joinParticipant,
   listErrorReports,
+  listPendingConnections,
   participants,
+  removeParticipant,
   removeParticipantSocket,
+  removePendingConnection,
   resetSessionStateForTests,
   resolveErrorReport,
   setStepStatus,
@@ -178,6 +182,85 @@ describe('removeParticipantSocket (multi-tab presence, follow-up fix)', () => {
     // for the same socket must not report `true` again (no second broadcast
     // for something that already happened).
     expect(removeParticipantSocket('p1', 'tab-1')).toBe(false)
+  })
+})
+
+describe('pending connections (pre-join dashboard visibility)', () => {
+  beforeEach(() => {
+    resetSessionStateForTests()
+  })
+
+  it('addPendingConnection registers a connection, listed by listPendingConnections', () => {
+    addPendingConnection('socket-1', 1000)
+
+    expect(listPendingConnections()).toEqual([{ socketId: 'socket-1', connectedAt: 1000 }])
+  })
+
+  it('addPendingConnection defaults connectedAt to now when omitted', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(5000)
+    addPendingConnection('socket-1')
+    vi.useRealTimers()
+
+    expect(listPendingConnections()).toEqual([{ socketId: 'socket-1', connectedAt: 5000 }])
+  })
+
+  it('removePendingConnection removes it and returns true', () => {
+    addPendingConnection('socket-1', 1000)
+
+    expect(removePendingConnection('socket-1')).toBe(true)
+    expect(listPendingConnections()).toEqual([])
+  })
+
+  it('removePendingConnection on an unknown socketId is a no-op returning false', () => {
+    expect(removePendingConnection('never-connected')).toBe(false)
+  })
+
+  it('tracks multiple pending connections independently', () => {
+    addPendingConnection('socket-1', 1000)
+    addPendingConnection('socket-2', 2000)
+
+    expect(listPendingConnections()).toEqual([
+      { socketId: 'socket-1', connectedAt: 1000 },
+      { socketId: 'socket-2', connectedAt: 2000 },
+    ])
+
+    removePendingConnection('socket-1')
+
+    expect(listPendingConnections()).toEqual([{ socketId: 'socket-2', connectedAt: 2000 }])
+  })
+})
+
+describe('removeParticipant (the presenter "kick" action)', () => {
+  beforeEach(() => {
+    resetSessionStateForTests()
+  })
+
+  it('deletes the participant record and returns it', () => {
+    joinParticipant('Ada', undefined, () => 'p1', 'tab-1')
+
+    const removed = removeParticipant('p1')
+
+    expect(removed?.id).toBe('p1')
+    expect(removed?.name).toBe('Ada')
+    expect(participants.has('p1')).toBe(false)
+  })
+
+  it('a subsequent join with the removed id cannot resume — it is treated as an unknown id', () => {
+    joinParticipant('Ada', undefined, () => 'p1', 'tab-1')
+    removeParticipant('p1')
+
+    // Mirrors `server.ts`'s `isKnownResume` check: once the record is gone,
+    // `joinParticipant` has nothing to resume, so this is a fresh join
+    // (a new id is minted) rather than reviving the kicked participant.
+    const { outcome, participant } = joinParticipant('Ada', 'p1', () => 'p2', 'tab-2')
+
+    expect(outcome).toBe('resume-fallback')
+    expect(participant.id).toBe('p2')
+  })
+
+  it('returns undefined for an unknown id and mutates nothing', () => {
+    expect(removeParticipant('does-not-exist')).toBeUndefined()
   })
 })
 

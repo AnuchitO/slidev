@@ -3,12 +3,13 @@
 Realtime sync server for [`slidev-addon-muan-companion`](../addon-muan-companion).
 Implements the full **M1-M5** workshop-tracking initiative (slide sync,
 participant identity + step tracking, error/help reporting, presence +
-auth, reconnect/resume + load-tested hardening), plus two post-ship
+auth, reconnect/resume + load-tested hardening), plus three post-ship
 passes: the **"Ask for Help" redesign** (two-way problem/question reports
 with a confirm/reopen loop and presenter↔participant messaging, instead of
-a one-shot "resolved") and **self-serve join** (auto-generated room/
-presenter codes when unset, plus a shareable join link + QR code on the
-dashboard). See
+a one-shot "resolved"), **self-serve join** (auto-generated room/presenter
+codes when unset, plus a shareable join link + QR code on the dashboard),
+and **participant management** (pending-connection visibility for
+not-yet-joined browsers, plus a presenter "kick" action). See
 [`plans/026-workshop-tracker-m1-slide-sync.md`](../../plans/026-workshop-tracker-m1-slide-sync.md)
 through
 [`plans/030-workshop-tracker-m5-hardening.md`](../../plans/030-workshop-tracker-m5-hardening.md),
@@ -172,11 +173,48 @@ confusing "wrong code" error the participant never actually triggered.
   `joinQrDataUrl` are `undefined` together whenever no room code is
   configured (there's nothing valid to share yet). Participant sockets
   never emit this.
-- `state:update { currentSlideIndex, currentStepId, participants[], stepStatus[] }`
+- `state:update { currentSlideIndex, currentStepId, participants[], pendingConnections[], stepStatus[] }`
   (server → dashboard room only) — sent on every state-affecting event above
   plus `disconnect`/the staleness sweep. Room-scoped, not broadcast to every
   connected socket, so participant clients don't receive the full roster/
   step-status payload on every other participant's keystroke.
+
+**Post-ship: pending connections + kick (participant management)**
+
+Reported from live use: `JoinScreen.vue`'s join-screen overlay is a
+client-side UI gate, not a content access control — deleting it via
+devtools lets a browser watch the deck without ever calling
+`participant:join`. This can't be closed here (nothing server-side can,
+short of gating the deck's own static assets — out of scope for this
+addon), so instead it's made visible and actionable:
+
+- `participant:connecting` (client → server, no payload, no ack) — emitted
+  once by `JoinScreen.vue` on mount, whenever a real participant browser is
+  about to show the join form (never by the presenter's own route or the
+  dashboard's own socket — see that component's own guard). Adds a
+  `PendingConnection { socketId, connectedAt }` (`session.ts`), broadcast in
+  `state:update`'s new `pendingConnections[]` field, so the dashboard shows
+  an anonymous "someone's here" row immediately.
+- A pending connection is removed — and the row transitions in place to a
+  real participant row — the moment that same socket's `participant:join`
+  succeeds. It's also removed (with a broadcast) if the socket disconnects
+  before ever joining.
+- `presenter:kickPendingConnection { socketId, presenterCode }` (client →
+  server) — requires a valid `presenterCode`. Force-disconnects that socket
+  (`io.sockets.sockets.get(socketId)?.disconnect(true)`) and clears its
+  pending entry.
+- `presenter:kickParticipant { participantId, presenterCode }` (client →
+  server) — requires a valid `presenterCode`. **Fully deletes** the
+  participant record (`removeParticipant`, `session.ts`) before
+  disconnecting every one of their sockets — deliberately a hard delete,
+  not the soft `close` a normal disconnect produces: a merely-closed
+  participant's id remains a valid resume token (see "Auth" above), so a
+  plain disconnect alone would let them silently rejoin without the
+  presenter's intervention meaning anything. After a kick, a later
+  `participant:join` with the old id finds nothing to resume and falls
+  through to an ordinary fresh join (room code required again) — kicking
+  someone is not the same as banning them; anyone who still has the room
+  code can rejoin as a new participant.
 
 **M4 (presence)**
 
@@ -325,7 +363,14 @@ reports, deliberately excluding `awaiting_confirmation` since those are
 already actioned and just waiting on the participant), a participant table
 (name, **presence** — viewing now / away / closed, driven by `visibility` +
 `connected` rather than `connected` alone — status for the _current_ step,
-joined at), and the **"Help requests" feed**: each card shows a `kind` tag
+joined at, and a **"Remove" button** per row wired to
+`presenter:kickParticipant`/`presenter:kickPendingConnection`, see "Post-ship:
+pending connections + kick" above), interleaved with anonymous **pending
+connection** rows (someone's socket connected and announced itself via
+`participant:connecting` but hasn't joined yet — sorted into the same table
+by connection/join time, transitioning in place to a named row once they
+join rather than appearing as a separate entry), and the **"Help requests"
+feed**: each card shows a `kind` tag
 (problem/question), a colored `status` chip (open/reopened share the
 "needs attention" red; `awaiting_confirmation` is blue/"in flight";
 `resolved` is green/dimmed), the original text and/or a screenshot

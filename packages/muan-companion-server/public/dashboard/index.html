@@ -129,9 +129,32 @@
   .badge.presence-visible { background: var(--presence-visible); }
   .badge.presence-hidden { background: var(--presence-hidden); }
   .badge.presence-closed { background: var(--presence-closed); color: #e6e9ef; }
+  /* `pending` (someone's socket connected, `participant:connecting` fired,
+     but they haven't submitted the join form yet — see the render
+     function's own comment) reuses the neutral `--idle` tone rather than a
+     new color: it's not a status worth alarming over, just "not resolved
+     into a real participant yet". */
+  .badge.pending { background: var(--idle); color: #e6e9ef; }
   .empty { color: var(--muted); padding: 20px; text-align: center; }
   .conn { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
   .conn.live { color: var(--done); }
+  .pending-name { color: var(--muted); font-style: italic; }
+  /* "Remove" — the presenter's kick action per roster row. Deliberately the
+     page's only *destructive*-toned button (the `--error` role, otherwise
+     reserved for the help-request feed's "needs attention" state) — this is
+     the one action on this page that ends someone's connection, and it
+     should read as consequential, not blend in with the neutral
+     `.code-copy`-style buttons elsewhere. */
+  .kick-button {
+    background: none;
+    border: 1px solid var(--error);
+    border-radius: 4px;
+    color: var(--error);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 8px;
+  }
+  .kick-button:hover { background: rgba(242, 139, 130, 0.12); }
 
   .status-cell {
     display: flex;
@@ -620,6 +643,7 @@
         <th>Presence</th>
         <th>Status (current step)</th>
         <th>Joined at</th>
+        <th>Actions</th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
@@ -821,7 +845,7 @@
 
     function render(state) {
       lastState = state
-      const { currentSlideIndex, currentStepId, participants, stepStatus, errors } = state
+      const { currentSlideIndex, currentStepId, participants, pendingConnections, stepStatus, errors } = state
 
       document.getElementById('count-slide').textContent = currentSlideIndex
       document.getElementById('count-step').textContent = currentStepId
@@ -836,25 +860,72 @@
       document.getElementById('count-done').textContent = `${doneCount}/${participants.length}`
 
       rowsEl.innerHTML = ''
-      emptyEl.hidden = participants.length > 0
+      emptyEl.hidden = participants.length > 0 || (pendingConnections || []).length > 0
 
-      for (const p of [...participants].sort((a, b) => a.joinedAt - b.joinedAt)) {
-        const statusCell = p.connected
-          ? renderStatusCell(statusFor(stepStatus, p.id, currentStepId))
-          : `<span class="badge offline">offline</span>`
-        const presence = presenceFor(p)
+      // Pending connections (someone's browser is here, `participant:connecting`
+      // fired, but they haven't submitted the join form yet — see
+      // `server.ts`'s own comment on why this exists at all) render in the
+      // *same* table, interleaved with real participants by connection/join
+      // time, rather than a separate section — the point of this feature is
+      // that a row appears the moment someone shows up and simply updates in
+      // place (anonymous → their name) once they join, not that anonymous
+      // visitors get a visually separate "waiting area". A discriminant
+      // (`kind`) is all that distinguishes the two shapes below.
+      const rows = [
+        ...participants.map(p => ({ kind: 'participant', at: p.joinedAt, data: p })),
+        ...(pendingConnections || []).map(c => ({ kind: 'pending', at: c.connectedAt, data: c })),
+      ].sort((a, b) => a.at - b.at)
+
+      for (const row of rows) {
         const tr = document.createElement('tr')
-        tr.innerHTML = `
-          <td>${escapeHtml(p.name)}</td>
-          <td><span class="badge ${presence.cls}">${presence.label}</span></td>
-          <td>${statusCell}</td>
-          <td>${new Date(p.joinedAt).toLocaleTimeString()}</td>
-        `
+        if (row.kind === 'pending') {
+          const c = row.data
+          tr.innerHTML = `
+            <td class="pending-name">Someone joining…</td>
+            <td><span class="badge pending">connecting</span></td>
+            <td>—</td>
+            <td>${new Date(c.connectedAt).toLocaleTimeString()}</td>
+            <td><button type="button" class="kick-button" data-action="kick-pending" data-socket-id="${escapeHtml(c.socketId)}">Remove</button></td>
+          `
+        }
+        else {
+          const p = row.data
+          const statusCell = p.connected
+            ? renderStatusCell(statusFor(stepStatus, p.id, currentStepId))
+            : `<span class="badge offline">offline</span>`
+          const presence = presenceFor(p)
+          tr.innerHTML = `
+            <td>${escapeHtml(p.name)}</td>
+            <td><span class="badge ${presence.cls}">${presence.label}</span></td>
+            <td>${statusCell}</td>
+            <td>${new Date(p.joinedAt).toLocaleTimeString()}</td>
+            <td><button type="button" class="kick-button" data-action="kick-participant" data-participant-id="${escapeHtml(p.id)}">Remove</button></td>
+          `
+        }
         rowsEl.appendChild(tr)
       }
 
       renderErrors(errors || [])
     }
+
+    // One delegated listener for both "Remove" button variants (pending vs.
+    // joined) — same reasoning as `errorFeedEl`'s single delegated listener
+    // below: rows are rebuilt wholesale on every render, so binding to
+    // individual buttons would mean re-binding on every single `state:update`.
+    // No local optimistic removal here (unlike the error feed's composer
+    // input clearing) — the row disappears on the next `state:update`, which
+    // `presenter:kick*`'s own broadcast fires immediately after.
+    rowsEl.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-action]')
+      if (!button)
+        return
+      if (button.dataset.action === 'kick-pending') {
+        socket.emit('presenter:kickPendingConnection', { socketId: button.dataset.socketId, presenterCode })
+        return
+      }
+      if (button.dataset.action === 'kick-participant')
+        socket.emit('presenter:kickParticipant', { participantId: button.dataset.participantId, presenterCode })
+    })
 
     // Keeps "Xm Ys ago" advancing between server pushes — `state:update`
     // only fires on an actual change, but elapsed time obviously keeps

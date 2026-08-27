@@ -830,6 +830,193 @@ describe('createMuanCompanionServer', () => {
     })
   })
 
+  describe('pending connections + kick (presenter roster management)', () => {
+    it('participant:connecting adds a pending connection visible on the dashboard', async () => {
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      await joinAsDashboard(dashboard)
+      await initialSnapshot
+
+      const client = await connectClient()
+      const update = waitForMatchingStateUpdate<{ pendingConnections: Array<{ socketId: string }> }>(
+        dashboard,
+        p => p.pendingConnections.length > 0,
+      )
+      client.emit('participant:connecting')
+      const payload = await update
+
+      expect(payload.pendingConnections).toEqual([{ socketId: client.id, connectedAt: expect.any(Number) }])
+    })
+
+    it('participant:join removes the pending connection in the same update the participant appears in', async () => {
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      await joinAsDashboard(dashboard)
+      await initialSnapshot
+
+      const client = await connectClient()
+      const pending = waitForMatchingStateUpdate<{ pendingConnections: unknown[] }>(
+        dashboard,
+        p => p.pendingConnections.length > 0,
+      )
+      client.emit('participant:connecting')
+      await pending
+
+      const joined = waitForMatchingStateUpdate<{ pendingConnections: unknown[], participants: Array<{ name: string }> }>(
+        dashboard,
+        p => p.participants.some(x => x.name === 'Ada'),
+      )
+      await join(client, 'Ada')
+      const payload = await joined
+
+      expect(payload.pendingConnections).toEqual([])
+    })
+
+    it('disconnecting before ever joining removes the pending connection and notifies the dashboard', async () => {
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      await joinAsDashboard(dashboard)
+      await initialSnapshot
+
+      const client = await connectClient()
+      const pending = waitForMatchingStateUpdate<{ pendingConnections: unknown[] }>(
+        dashboard,
+        p => p.pendingConnections.length > 0,
+      )
+      client.emit('participant:connecting')
+      await pending
+
+      const gone = waitForMatchingStateUpdate<{ pendingConnections: unknown[] }>(
+        dashboard,
+        p => p.pendingConnections.length === 0,
+      )
+      client.disconnect()
+
+      const payload = await gone
+      expect(payload.pendingConnections).toEqual([])
+    })
+
+    it('presenter:kickPendingConnection disconnects the socket and clears it from the dashboard', async () => {
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      await joinAsDashboard(dashboard)
+      await initialSnapshot
+
+      const client = await connectClient()
+      const pending = waitForMatchingStateUpdate<{ pendingConnections: Array<{ socketId: string }> }>(
+        dashboard,
+        p => p.pendingConnections.length > 0,
+      )
+      client.emit('participant:connecting')
+      const { pendingConnections } = await pending
+      const socketId = pendingConnections[0].socketId
+
+      const disconnected = waitFor(client, 'disconnect')
+      const presenter = await connectClient()
+      presenter.emit('presenter:kickPendingConnection', { socketId, presenterCode: TEST_PRESENTER_CODE })
+
+      await disconnected
+    })
+
+    it('presenter:kickPendingConnection without a valid presenterCode is a no-op', async () => {
+      const client = await connectClient()
+      client.emit('participant:connecting')
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      let disconnected = false
+      client.on('disconnect', () => {
+        disconnected = true
+      })
+
+      const presenter = await connectClient()
+      presenter.emit('presenter:kickPendingConnection', { socketId: client.id, presenterCode: 'wrong' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(disconnected).toBe(false)
+    })
+
+    it('presenter:kickParticipant disconnects every one of the participant\'s sockets and removes them from the dashboard', async () => {
+      const tab1 = await connectClient()
+      const { participantId } = await join(tab1, 'Ada') as { participantId: string }
+      const tab2 = await connectClient()
+      await emitWithAck(tab2, 'participant:join', { name: 'Ada', participantId, roomCode: TEST_ROOM_CODE })
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      await joinAsDashboard(dashboard)
+      await initialSnapshot
+
+      const removed = waitForMatchingStateUpdate<{ participants: Array<{ id: string }> }>(
+        dashboard,
+        p => !p.participants.some(x => x.id === participantId),
+      )
+      const tab1Disconnected = waitFor(tab1, 'disconnect')
+      const tab2Disconnected = waitFor(tab2, 'disconnect')
+
+      const presenter = await connectClient()
+      presenter.emit('presenter:kickParticipant', { participantId, presenterCode: TEST_PRESENTER_CODE })
+
+      await Promise.all([tab1Disconnected, tab2Disconnected, removed])
+      expect(participants.has(participantId)).toBe(false)
+    })
+
+    it('a kicked participant\'s old id cannot resume — a later join with it falls back to a fresh identity', async () => {
+      const client = await connectClient()
+      const { participantId } = await join(client, 'Ada') as { participantId: string }
+
+      const presenter = await connectClient()
+      presenter.emit('presenter:kickParticipant', { participantId, presenterCode: TEST_PRESENTER_CODE })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      // A fresh socket attempting to resume the now-deleted id, with the
+      // correct room code (a real resume wouldn't need one, but this id no
+      // longer resolves to anything the server considers "already known" —
+      // see `isKnownResume` in this file — so the room-code gate applies
+      // exactly like a brand-new join).
+      const retry = await connectClient()
+      const ack = await emitWithAck<{ participantId: string, resumed: boolean }>(
+        retry,
+        'participant:join',
+        { name: 'Ada', participantId, roomCode: TEST_ROOM_CODE },
+      )
+
+      expect(ack.resumed).toBe(false)
+      expect(ack.participantId).not.toBe(participantId)
+    })
+
+    it('presenter:kickParticipant without a valid presenterCode is a no-op', async () => {
+      const client = await connectClient()
+      const { participantId } = await join(client, 'Ada') as { participantId: string }
+
+      let disconnected = false
+      client.on('disconnect', () => {
+        disconnected = true
+      })
+
+      const presenter = await connectClient()
+      presenter.emit('presenter:kickParticipant', { participantId, presenterCode: 'wrong' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(disconnected).toBe(false)
+      expect(participants.has(participantId)).toBe(true)
+    })
+
+    it('presenter:kickParticipant on an unknown id is a no-op (no crash, no broadcast storm)', async () => {
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      await joinAsDashboard(dashboard)
+      await initialSnapshot
+
+      const presenter = await connectClient()
+      presenter.emit('presenter:kickParticipant', { participantId: 'does-not-exist', presenterCode: TEST_PRESENTER_CODE })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      // Reaching here without throwing/hanging is the assertion; nothing
+      // else should have changed.
+      expect(participants.size).toBe(0)
+    })
+  })
+
   describe('dashboard broadcast (M2)', () => {
     it('sends an immediate state:update snapshot to a socket that joins the dashboard room', async () => {
       const client = await connectClient()

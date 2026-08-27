@@ -17,13 +17,17 @@ import { createScreenshotUploadHandler } from './screenshotUpload'
 import {
   addErrorReport,
   addParticipantMessage,
+  addPendingConnection,
   addPresenterMessage,
   confirmResolution,
   joinParticipant,
   listErrorReports,
+  listPendingConnections,
   listStepStatus,
   participants,
+  removeParticipant,
   removeParticipantSocket,
+  removePendingConnection,
   resolveErrorReport,
   session,
   setStepStatus,
@@ -128,6 +132,15 @@ function buildStateUpdate() {
     currentSlideIndex: session.currentSlideIndex,
     currentStepId: session.currentStepId,
     participants: [...participants.values()],
+    // Sockets that connected and announced themselves (`participant:connecting`
+    // below) but haven't completed `participant:join` yet — the "someone's
+    // here but we don't know their name" visibility feature. A *separate*
+    // field from `participants` above, not folded in as a fake participant
+    // row: `Participant` requires a real `name`/`id`, and every other
+    // consumer of `participants` (error reports, step status, the resume
+    // flow) genuinely needs that to be true. The dashboard renders the two
+    // together (see `public/dashboard/index.html`).
+    pendingConnections: listPendingConnections(),
     stepStatus: listStepStatus(),
     // PRD §10's literal `state:update` shape (`{ currentSlideIndex,
     // participants[], errors[] }`) — folded straight into the existing
@@ -330,6 +343,25 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // creep.
     socket.emit('slide:sync', { index: session.currentSlideIndex })
 
+    // Pre-join dashboard visibility: `JoinScreen.vue` emits this once, on
+    // mount, before the participant has typed a name or clicked Join —
+    // *not* automatically on every connection, which is what lets this stay
+    // participant-specific rather than also firing for the presenter's own
+    // route or the dashboard's own socket (neither ever mounts
+    // `JoinScreen.vue`, so neither ever emits this). Reported from live use:
+    // the join screen is a client-side UI gate, not a content access
+    // control (see that component's own comment) — a participant can bypass
+    // it via devtools and watch the deck without ever joining. This can't
+    // close that gap (nothing server-side can, short of gating the deck's
+    // own static assets, well outside this addon's scope), but it makes the
+    // presence visible on the dashboard instead of invisible, and pairs
+    // with `presenter:kickPendingConnection` below to let the presenter
+    // disconnect a socket they don't want around.
+    socket.on('participant:connecting', () => {
+      addPendingConnection(socket.id)
+      broadcastStateUpdate(io)
+    })
+
     socket.on('presenter:setSlide', ({ index, presenterCode }: { index: number, presenterCode?: string }) => {
       // Plan 029 Step 1: gated on the presenter credential, distinct from
       // the participant room code. Invalid/missing code is a silent no-op
@@ -423,6 +455,14 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
           console.log(`[muan-companion-server] participant joined: ${participant.name} (${participant.id})`)
         }
         socket.data.participantId = participant.id
+        // This socket has a real identity now — it's no longer "someone's
+        // here but we don't know their name yet" (see `participant:connecting`
+        // above). Removing it here, in the same tick as the state mutation
+        // above and the broadcast below, is what makes the dashboard's row
+        // transition from an anonymous placeholder to the real name in one
+        // atomic update rather than a flicker of "disappeared, then
+        // reappeared as someone else".
+        removePendingConnection(socket.id)
         ack?.({ participantId: participant.id, currentSlideIndex: session.currentSlideIndex, resumed: outcome === 'resumed' })
         broadcastStateUpdate(io)
       },
@@ -638,6 +678,59 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       touchLastSeen(socket.data.participantId as string | undefined)
     })
 
+    // Participant management from the dashboard: the presenter's way of
+    // removing someone from the live roster, for either of the two rows the
+    // dashboard now shows — a joined participant, or a still-anonymous
+    // pending connection (see `participant:connecting` above). Two separate
+    // events rather than one overloaded one, since the two cases look up
+    // and disconnect by different keys (`participantId` vs. a raw
+    // `socket.id`) with no shared logic worth factoring out.
+    //
+    // `io.sockets.sockets.get(id)?.disconnect(true)` is the same "force a
+    // real disconnect" mechanism `JoinScreen.vue`'s "Join as someone else"
+    // fix relies on client-side (see that component's own comment) — it
+    // triggers this same server's `disconnect` handler below for real,
+    // reusing its already-correct cleanup rather than duplicating it here.
+    // The `true` argument closes the underlying transport immediately
+    // (not just the Socket.io-level session), matching what a presenter
+    // clicking "kick" actually wants: this browser stops working *now*, not
+    // "on its next reconnect attempt".
+    socket.on('presenter:kickParticipant', ({ participantId, presenterCode }: { participantId: string, presenterCode?: string }) => {
+      if (!isValidPresenterCode(authConfig, presenterCode))
+        return
+      // `removeParticipant` (session.ts) is the hard delete — see its own
+      // doc comment for why a mere disconnect isn't enough to actually kick
+      // someone (they could just silently auto-resume). Disconnect every
+      // socket of theirs *after* deleting the record, not before: once the
+      // record is gone, a same-tick `disconnect` firing synchronously for
+      // any of these sockets would otherwise hit `removeParticipantSocket`
+      // looking up an id `removeParticipant` already deleted — harmless
+      // (it no-ops on an unknown id) but backwards from the intended order.
+      const removed = removeParticipant(participantId)
+      if (!removed)
+        return
+      for (const socketId of removed.socketIds)
+        io.sockets.sockets.get(socketId)?.disconnect(true)
+      broadcastStateUpdate(io)
+    })
+
+    // The pending-connection equivalent — there's no `Participant` record to
+    // delete (they never joined), just a socket to disconnect and a pending
+    // entry to clear. `removePendingConnection` also runs from that
+    // socket's own `disconnect` handler above once it actually disconnects,
+    // so this could arguably skip calling it here — but doing it eagerly
+    // means the dashboard's row disappears immediately on the presenter's
+    // own broadcast rather than waiting on a second round-trip for the
+    // disconnect event to come back through.
+    socket.on('presenter:kickPendingConnection', ({ socketId, presenterCode }: { socketId: string, presenterCode?: string }) => {
+      if (!isValidPresenterCode(authConfig, presenterCode))
+        return
+      if (!removePendingConnection(socketId))
+        return
+      io.sockets.sockets.get(socketId)?.disconnect(true)
+      broadcastStateUpdate(io)
+    })
+
     // The dashboard (plan 027 Step 3) opts into the room-scoped broadcast
     // explicitly, rather than every connected socket being auto-joined —
     // participant sockets never emit this. Sends one immediate snapshot to
@@ -701,8 +794,17 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
 
     socket.on('disconnect', () => {
       const participantId = socket.data.participantId as string | undefined
-      if (!participantId)
+      if (!participantId) {
+        // Never joined — if this socket had announced itself as pending
+        // (`participant:connecting` above), it needs to disappear from the
+        // dashboard too, not just linger as a "still connecting" row
+        // forever. A presenter/dashboard socket (never pending in the first
+        // place) hits `removePendingConnection`'s own no-op path here,
+        // matching this handler's pre-existing behavior for those.
+        if (removePendingConnection(socket.id))
+          broadcastStateUpdate(io)
         return
+      }
       // A clean Socket.io `disconnect` is a definitive, immediate signal for
       // *this one socket* — mark the participant `closed` right away rather
       // than waiting for the periodic sweep below (plan 029 Step 3: "use

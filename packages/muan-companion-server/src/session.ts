@@ -80,6 +80,54 @@ export const stepStatus = new Map<string, StepStatusValue>()
 export const participants = new Map<string, Participant>()
 
 /**
+ * A socket that has connected but not yet completed `participant:join` —
+ * the "someone's here but hasn't told us their name yet" visibility the
+ * dashboard needs (reported from live use: `JoinScreen.vue`'s join-screen
+ * overlay is a client-side UI gate, not a content access control — deleting
+ * it via devtools lets a browser watch the deck without ever joining; see
+ * that component's own comment for why that's inherent to how a
+ * client-rendered SPA works, not fixable purely client-side). This doesn't
+ * close that gap — it can't be closed here — it makes the presence visible
+ * to the presenter instead, and pairs with `removeParticipant`/the
+ * `presenter:kick*` events below to let them disconnect a socket they don't
+ * want around.
+ *
+ * Keyed by socket id, not participant id — there is no participant id yet.
+ * Only ever populated for a socket that explicitly announces itself via
+ * `participant:connecting` (`server.ts`) — the presenter's own route and
+ * the dashboard's own socket never emit that event, so neither shows up
+ * here despite both being ordinary Socket.io connections too.
+ */
+export interface PendingConnection {
+  socketId: string
+  connectedAt: number
+}
+
+export const pendingConnections = new Map<string, PendingConnection>()
+
+export function addPendingConnection(socketId: string, now: number = Date.now()): void {
+  pendingConnections.set(socketId, { socketId, connectedAt: now })
+}
+
+/**
+ * Removes a pending connection — called both when it graduates into a real
+ * `Participant` via `joinParticipant` succeeding, and when the socket
+ * disconnects before ever joining. A socket id with no pending entry (e.g.
+ * the presenter's or dashboard's own socket, which never emitted
+ * `participant:connecting` in the first place) is a harmless no-op. Returns
+ * whether an entry actually existed (`Map.delete`'s own return value) so
+ * `server.ts`'s `disconnect` handler knows whether there's a now-vanished
+ * pending row to broadcast.
+ */
+export function removePendingConnection(socketId: string): boolean {
+  return pendingConnections.delete(socketId)
+}
+
+export function listPendingConnections(): PendingConnection[] {
+  return [...pendingConnections.values()]
+}
+
+/**
  * How a `participant:join` call was actually resolved (plan 030 / PRD §12
  * resilience). Distinguishes a normal first-time join from a genuine resume
  * from one that *attempted* to resume but couldn't — the server logs each
@@ -193,6 +241,36 @@ export function removeParticipantSocket(participantId: string, socketId: string)
   participant.connected = false
   participant.visibility = 'closed'
   return true
+}
+
+/**
+ * Fully deletes a participant's record — the presenter's "kick" action
+ * (dashboard, `presenter:kickParticipant`). Deliberately a hard delete, not
+ * the soft `removeParticipantSocket` close above: a merely-`closed`
+ * participant can still silently auto-resume (their `participantId` remains
+ * a valid resume token — see `joinParticipant`'s doc comment on why that's
+ * intentional for the ordinary "closed the tab" case), which would make
+ * "kick" meaningless — they'd just reappear the moment their browser
+ * reconnects. Deleting the record outright means a later `participant:join`
+ * with this id finds nothing to resume and falls through to an ordinary
+ * fresh join instead (room code required again — `server.ts`'s
+ * `isKnownResume` check). Their past `ErrorReport`s are left as-is
+ * (append-only, no retention policy — same posture as every other mutator
+ * in this file) — a kicked participant's prior help requests still show up
+ * in the dashboard's history, just against a `participantId` that no longer
+ * resolves to a live roster row.
+ *
+ * Returns the removed participant (so the caller can read its `socketIds`
+ * to actually disconnect them — see `server.ts`'s handler), or `undefined`
+ * for an unknown id — a no-op, not an error, same "trust the caller"
+ * posture as every other mutator here.
+ */
+export function removeParticipant(participantId: string): Participant | undefined {
+  const participant = participants.get(participantId)
+  if (!participant)
+    return undefined
+  participants.delete(participantId)
+  return participant
 }
 
 export function setStepStatus(participantId: string, stepId: string, state: StepState): void {
@@ -412,6 +490,7 @@ export function resetSessionStateForTests(): void {
   session.currentSlideIndex = 1
   session.currentStepId = '1'
   participants.clear()
+  pendingConnections.clear()
   stepStatus.clear()
   errorReports.length = 0
 }

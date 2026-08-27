@@ -156,6 +156,20 @@ function join(joinName: string, joinRoomCode: string | undefined, participantId?
 }
 
 onMounted(() => {
+  // Pre-join dashboard visibility (`server.ts`'s `participant:connecting`
+  // handler): lets the presenter see "someone's here" the moment a
+  // participant browser loads, before they've typed a name or clicked
+  // Join. Guarded on `!isPresenter` — this component mounts on *every*
+  // route (its template's own `v-if="!isPresenter"` only hides the overlay,
+  // it doesn't stop `onMounted` from running) — without this guard the
+  // presenter's own tab would show up as an anonymous "pending" row on
+  // their own dashboard, which would be actively confusing. Fired
+  // unconditionally otherwise (whether about to auto-resume below or show
+  // the fresh-join form) — either way this socket is "here but not joined
+  // yet" until the `participant:join` call further down actually succeeds.
+  if (!isPresenter.value)
+    getWorkshopSocket().emit('participant:connecting')
+
   const stored = readStoredParticipant()
   if (stored) {
     resuming.value = true

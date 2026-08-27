@@ -114,8 +114,20 @@ viewing right now, how many are done with the current step (out of the
 total), your current slide/step, and how many help requests "need
 attention" (see below).
 
-**Participant table** — one row per participant:
+**Participant table** — one row per participant, plus rows for people who
+have connected but haven't finished joining yet:
 
+- **"Someone joining…" rows**: the instant a participant's browser loads the
+  deck — before they've typed a name or clicked Join — a row appears for
+  them, labeled anonymously with a "connecting" badge. Once they submit the
+  join form, that same row updates in place to show their actual name; it
+  never disappears and reappears as a separate row. This exists because the
+  join screen is a client-side prompt, not a lock: someone technical enough
+  to open their browser's dev tools and delete that overlay can watch your
+  slides without ever typing a name or room code. That's an inherent
+  limitation of how any web-based deck like this works, not something we
+  can fully prevent — this feature just makes it visible to you instead of
+  invisible, and gives you a way to act on it (see "Remove" below).
 - **Presence**: _viewing now_ (tab open and focused), _away_ (tab open but
   backgrounded — they alt-tabbed or switched apps), or _closed_
   (disconnected — closed the tab, lost network, or never came back after a
@@ -127,6 +139,15 @@ attention" (see below).
   after about a minute, and a stronger alert color after about three
   minutes. That's your cue to check in with them, even remotely.
 - Joined-at time.
+- **Remove**: a button on every row (joined or still-connecting) that
+  disconnects that person. For someone who hasn't joined, this is a clean
+  removal — they never had an identity to come back with. For an already-
+  joined participant, this fully deletes their record: if they try to
+  rejoin afterward, they start over as a brand-new participant (room code
+  required again) rather than silently resuming with their old progress
+  intact. Use it to clear out someone who shouldn't be there, or a stray
+  test connection — not as a way to permanently ban someone, since they can
+  still rejoin fresh with the room code unless you also change it.
 
 **Help requests feed** — every problem report and question participants
 send, newest/most-urgent first:

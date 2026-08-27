@@ -178,6 +178,86 @@
   }
 
   /*
+   * "Share this workshop" — deliberately a *separate*, much bigger surface
+   * from `.codes-panel` above rather than an extra row bolted onto it: that
+   * panel is a small reference the instructor glances at ("what was the
+   * code again"), while this one is meant to be projected/screen-shared to
+   * an entire room of participants standing across it trying to scan a
+   * phone camera at it, so every dimension here (QR size, link font size,
+   * padding) is sized for "readable from the back of the room," not for a
+   * compact settings-style row. Placed ahead of `.counts` in the markup
+   * below — "get everyone in the room" is the very first thing an
+   * instructor does at the start of a session, before there's anything in
+   * the counts/table worth looking at yet.
+   */
+  .share-panel {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+    padding: 20px 24px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--wt-radius-md);
+    box-shadow: var(--wt-elevation-1);
+  }
+  .share-qr {
+    /* White padding around the QR image regardless of the page's dark theme
+       — a QR reader needs real light-on-dark contrast at its quiet zone, and
+       this page's own `--panel`/`--bg` are both dark, which a raw
+       `<img>` with a transparent PNG background would sit directly on top
+       of. `QRCode.toDataURL`'s default PNG background is white, so this
+       just makes sure nothing here fights that. */
+    flex: 0 0 auto;
+    width: 176px;
+    height: 176px;
+    padding: 10px;
+    background: #fff;
+    border-radius: var(--wt-radius-sm);
+    display: block;
+  }
+  .share-info {
+    flex: 1 1 320px;
+    min-width: 0;
+  }
+  .share-panel h2 {
+    margin: 0 0 4px;
+    font-size: 18px;
+  }
+  .share-hint {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .share-link-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .share-link {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--wt-primary);
+    text-decoration: none;
+    word-break: break-all;
+    padding: 6px 10px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: var(--wt-radius-sm);
+  }
+  .share-link:hover { text-decoration: underline; }
+  /*
+   * `.code-copy` itself (size, border, cursor) is reused as-is from the
+   * small codes-panel above — same visual language, this button just needs
+   * to be a bit more clickable at this panel's larger scale.
+   */
+  .share-link-row .code-copy {
+    font-size: 13px;
+    padding: 5px 12px;
+  }
+
+  /*
    * "Help requests" section only — see the `--wt-*` token comment in
    * `:root` above. `.error-reports` opts this section into the shared
    * Material type stack without touching the rest of the page's typography.
@@ -468,6 +548,32 @@
   <p class="conn" id="conn">connecting…</p>
 
   <!--
+    "Share this workshop" — the join link + QR code, meant to be shown to
+    the whole room (projector/screen-share), not just glanced at by the
+    instructor the way `#codes-panel` below is. Placed ahead of `.counts`:
+    getting people into the room is the first thing an instructor does at
+    the start of a session, before the counts/table have anything in them
+    worth looking at.
+
+    Hidden until `dashboard:join`'s ack actually supplies a `joinUrl` —
+    exactly the same "nothing valid to show yet" gate `#codes-panel` uses,
+    for the same reason: `buildJoinUrl` (`server.ts`) returns `undefined`
+    whenever no room code is configured, and a QR code encoding "undefined"
+    would be actively misleading rather than merely empty.
+  -->
+  <div class="share-panel" id="share-panel" hidden>
+    <img class="share-qr" id="share-qr" alt="QR code to join this workshop" />
+    <div class="share-info">
+      <h2>Share this workshop</h2>
+      <p class="share-hint">Scan the QR code, or share the link below (Teams, Zoom chat, Slack…) so participants can join directly — no need to type the room code by hand.</p>
+      <div class="share-link-row">
+        <a class="share-link" id="share-link" target="_blank" rel="noopener"></a>
+        <button type="button" class="code-copy" data-copy-target="share-link">copy link</button>
+      </div>
+    </div>
+  </div>
+
+  <!--
     "How does the presenter find out the room/presenter codes" — this panel
     is the answer once the dashboard is open (the other is index.ts's
     startup log). Safe to show here specifically: reaching this panel at all
@@ -556,6 +662,9 @@
     const errorFeedEl = document.getElementById('error-feed')
     const errorsEmptyEl = document.getElementById('errors-empty')
     const codesPanelEl = document.getElementById('codes-panel')
+    const sharePanelEl = document.getElementById('share-panel')
+    const shareLinkEl = document.getElementById('share-link')
+    const shareQrEl = document.getElementById('share-qr')
 
     // Inline Material-style icons (see the token/icon comment in `:root`
     // above) — the same glyphs `ErrorReportWidget.vue` uses, kept as plain
@@ -623,6 +732,19 @@
           document.getElementById('code-presenter').textContent = result.presenterCode
           codesPanelEl.hidden = false
         }
+        // The shareable join link + QR code (see `#share-panel`'s own HTML
+        // comment for why this is a separate, bigger panel from
+        // `#codes-panel` above). `joinUrl`/`joinQrDataUrl` are only present
+        // on the ack when `server.ts`'s `buildJoinUrl` found a room code
+        // configured — same "nothing valid to show" gate as the codes panel
+        // just above, so this stays hidden rather than rendering a broken
+        // link/QR when there's nothing to point it at.
+        if (result && result.joinUrl) {
+          shareLinkEl.textContent = result.joinUrl
+          shareLinkEl.href = result.joinUrl
+          shareQrEl.src = result.joinQrDataUrl
+          sharePanelEl.hidden = false
+        }
       })
     })
     socket.on('disconnect', () => {
@@ -630,7 +752,13 @@
       connEl.classList.remove('live')
     })
 
-    codesPanelEl.addEventListener('click', (event) => {
+    // One shared handler for every `.code-copy` button on the page —
+    // `#codes-panel`'s two small copy buttons and `#share-panel`'s "copy
+    // link" button all use the identical class/`data-copy-target` contract
+    // (copy the target element's `textContent`, flash "copied!" for
+    // 1.2s), so this is registered on `document` once rather than
+    // duplicating the same listener body per panel.
+    document.addEventListener('click', (event) => {
       const button = event.target.closest('.code-copy')
       if (!button)
         return

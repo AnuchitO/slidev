@@ -4,8 +4,21 @@ import type { MuanCompanionServer } from './server'
 import { Buffer } from 'node:buffer'
 import { io as ioClient } from 'socket.io-client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMuanCompanionServer } from './server'
+import { createMuanCompanionServer, DEFAULT_DECK_URL } from './server'
 import { errorReports, participants, resetSessionStateForTests, session, stepStatus } from './session'
+
+// The full `dashboard:join` ack shape (M4's two codes, plus the join-link/QR
+// fields added for the shareable-join-link feature) — declared once here
+// rather than inlined at every call site below, several of which only care
+// about a subset of these fields.
+interface DashboardJoinAck {
+  ok: boolean
+  roomCode?: string
+  presenterCode?: string
+  deckUrl?: string
+  joinUrl?: string
+  joinQrDataUrl?: string
+}
 
 // A minimal, valid 1x1 PNG (the smallest real PNG that decodes) — used as
 // the multipart `screenshot` file in the upload tests below so they exercise
@@ -320,19 +333,19 @@ describe('createMuanCompanionServer', () => {
     it('dashboard:join ack includes both codes for the dashboard page to display', async () => {
       const dashboard = await connectClient()
 
-      const ack = await emitWithAck<{ ok: boolean, roomCode?: string, presenterCode?: string }>(
+      const ack = await emitWithAck<DashboardJoinAck>(
         dashboard,
         'dashboard:join',
         { presenterCode: TEST_PRESENTER_CODE },
       )
 
-      expect(ack).toEqual({ ok: true, roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE })
+      expect(ack).toMatchObject({ ok: true, roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE })
     })
 
     it('a rejected dashboard:join does not leak either code', async () => {
       const dashboard = await connectClient()
 
-      const ack = await emitWithAck<{ ok: boolean, roomCode?: string, presenterCode?: string }>(
+      const ack = await emitWithAck<DashboardJoinAck>(
         dashboard,
         'dashboard:join',
         { presenterCode: 'wrong-code' },
@@ -349,6 +362,66 @@ describe('createMuanCompanionServer', () => {
 
       const ack = await emitWithAck<{ ok: boolean }>(participant, 'dashboard:join', {})
       expect(ack).toEqual({ ok: false })
+    })
+
+    // The "shareable join link + QR code" feature: `dashboard:join`'s ack
+    // carries `deckUrl`/`joinUrl`/`joinQrDataUrl` alongside the two codes
+    // above, computed by `buildJoinUrl`/`getJoinQrDataUrl` (`server.ts`).
+    // This describe block's own `beforeEach` stands up a *second* server
+    // (mirroring the pattern the `cors`/staleness-sweep tests above already
+    // use for a non-default `options` value) so both the "configured" and
+    // "unconfigured" cases below get a real server instance rather than one
+    // test having to mutate global state mid-run.
+    describe('join link + QR code (dashboard:join)', () => {
+      it('includes a well-formed joinUrl and a non-empty joinQrDataUrl when a room code is configured', async () => {
+        const dashboard = await connectClient()
+
+        const ack = await emitWithAck<DashboardJoinAck>(
+          dashboard,
+          'dashboard:join',
+          { presenterCode: TEST_PRESENTER_CODE },
+        )
+
+        expect(ack.ok).toBe(true)
+        expect(ack.deckUrl).toBe(DEFAULT_DECK_URL)
+        expect(ack.joinUrl).toBe(`${DEFAULT_DECK_URL}?roomCode=${encodeURIComponent(TEST_ROOM_CODE)}`)
+        // A real, decodable data URL, not just a non-empty string — a
+        // truncated/corrupt encode would still be "non-empty" but wouldn't
+        // start with the correct MIME prefix or carry a plausible amount of
+        // base64 payload after it.
+        expect(ack.joinQrDataUrl).toMatch(/^data:image\/png;base64,/)
+        expect(ack.joinQrDataUrl!.length).toBeGreaterThan(100)
+      })
+
+      it('omits joinUrl and joinQrDataUrl entirely when no room code is configured (fail closed, nothing to show)', async () => {
+        // A separate server instance with no `roomCode` at all — mirrors how
+        // the `cors`/staleness-sweep tests above construct a server with
+        // different `options` rather than mutating the shared one.
+        await server.io.close()
+        await new Promise<void>(resolve => server.httpServer.close(() => resolve()))
+        server = createMuanCompanionServer({ presenterCode: TEST_PRESENTER_CODE })
+        await new Promise<void>(resolve => server.httpServer.listen(0, resolve))
+        const { port } = server.httpServer.address() as AddressInfo
+        url = `http://localhost:${port}`
+
+        const dashboard = await connectClient()
+        const ack = await emitWithAck<DashboardJoinAck>(
+          dashboard,
+          'dashboard:join',
+          { presenterCode: TEST_PRESENTER_CODE },
+        )
+
+        expect(ack.ok).toBe(true)
+        // `authConfig.roomCode` defaults to `''` when unset (falsy, but not
+        // itself `undefined` — see `createMuanCompanionServer`), which is
+        // exactly the "not configured" input `buildJoinUrl` treats as "no
+        // link to build". `deckUrl` is still present (it's independent,
+        // static server config — see its own doc comment) even though
+        // there's nothing to link it to yet.
+        expect(ack.deckUrl).toBe(DEFAULT_DECK_URL)
+        expect(ack.joinUrl).toBeUndefined()
+        expect(ack.joinQrDataUrl).toBeUndefined()
+      })
     })
   })
 

@@ -45,6 +45,7 @@ import {
   shouldOfferJoinAsSomeoneElse,
   writeStoredParticipant,
 } from '../src/participantIdentity'
+import { getRoomCodeFromUrl } from '../src/roomCode'
 
 const { isPresenter } = useNav()
 
@@ -163,7 +164,21 @@ onMounted(() => {
     // (server-side gate, `server.ts`'s `participant:join` handler); if the
     // server doesn't recognize this id, the `error` branch above handles it.
     join(stored.name, undefined, stored.participantId)
+    return
   }
+  // The ordinary fresh-join form is about to show (no stored identity to
+  // resume) — prefill `roomCode` from the shareable join link's `?roomCode=`
+  // query param (`muan-companion-server`'s `buildJoinUrl` / the dashboard's
+  // "Share this workshop" panel) when the participant arrived via that link
+  // or its QR code, rather than typing the code from a shout-out across the
+  // room. This is a *convenience prefill*, not a bypass of the join step
+  // itself: `roomCode` here only ever seeds the input's initial value — the
+  // participant still has to type their own name and click "Join" (`onSubmit`
+  // above) for a real `participant:join` to fire. Nothing in this branch
+  // submits on their behalf.
+  const roomCodeFromUrl = getRoomCodeFromUrl()
+  if (roomCodeFromUrl)
+    roomCode.value = roomCodeFromUrl
 })
 
 function onSubmit() {

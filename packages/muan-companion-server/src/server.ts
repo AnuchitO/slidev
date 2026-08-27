@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import connect from 'connect'
 import { join } from 'pathe'
+import QRCode from 'qrcode'
 import sirv from 'sirv'
 import { Server as SocketIOServer } from 'socket.io'
 import { isValidPresenterCode, isValidRoomCode } from './auth'
@@ -55,6 +56,54 @@ export interface CreateMuanCompanionServerOptions {
    * without waiting a real 15s+ for staleness to accrue on every run.
    */
   sweepIntervalMs?: number
+  /**
+   * The URL a participant's browser should land on to join the deck itself —
+   * i.e. Slidev's own dev server, a *different* process/port from this one
+   * (see the package README's architecture notes: this server is the
+   * companion sync backend, not the thing that serves slide content).
+   * Defaults to `DEFAULT_DECK_URL` (Slidev's own default dev port) when
+   * unset, so a server started with no configuration at all still produces a
+   * well-formed (if likely wrong for the operator's real setup) join URL
+   * rather than an obviously-broken one — matches this option's own
+   * optionality: `index.ts` always supplies a real value (from
+   * `SLIDEV_MUAN_COMPANION_DECK_URL`, itself defaulted the same way — see
+   * that file), but a server constructed directly (every test in
+   * `server.test.ts` that doesn't care about the join link) shouldn't have
+   * to supply one just to exercise unrelated behavior.
+   */
+  deckUrl?: string
+}
+
+/**
+ * Slidev's own default `dev`/`preview` port
+ * (https://sli.dev/guide/) — the sane fallback for `deckUrl` when an
+ * operator hasn't set `SLIDEV_MUAN_COMPANION_DECK_URL` (e.g. a quick local
+ * trial run). Exported so `index.ts` can default its own env-var read to the
+ * same* literal rather than two copies of this string drifting apart.
+ */
+export const DEFAULT_DECK_URL = 'http://localhost:3030'
+
+/**
+ * Builds the participant-facing "join this workshop" URL from the deck URL
+ * and room code — the single place this specific query-param name/encoding
+ * is decided, shared by `createMuanCompanionServer`'s `dashboard:join`
+ * payload (consumed by the dashboard's "Share this workshop" panel) and
+ * `index.ts`'s startup log, so the two can never drift apart on the exact
+ * shape participants are expected to arrive with (the addon's
+ * `getRoomCodeFromUrl` — `addon-muan-companion/src/roomCode.ts` — is the
+ * other half of this contract: it reads back exactly the `roomCode` param
+ * this function writes).
+ *
+ * Returns `undefined` when there's no room code to embed — a join link with
+ * no code in it would silently send participants to the ordinary join form
+ * with nothing prefilled, which isn't a "link", it's just the deck's plain
+ * URL. Matches this file's existing fail-closed posture elsewhere (e.g. the
+ * dashboard's codes panel showing nothing until both codes are known): if
+ * the operator hasn't configured a room code, there's nothing valid to
+ * share yet.
+ */
+export function buildJoinUrl(deckUrl: string, roomCode: string): string | undefined {
+  return roomCode ? `${deckUrl}?roomCode=${encodeURIComponent(roomCode)}` : undefined
 }
 
 export interface MuanCompanionServer {
@@ -132,6 +181,48 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
   const authConfig: WorkshopAuthConfig = {
     roomCode: options.roomCode ?? '',
     presenterCode: options.presenterCode ?? '',
+  }
+
+  // Computed once, here, rather than per-request: both the deck URL and the
+  // room code are fixed for this server process's entire lifetime today (no
+  // dynamic code rotation exists — see the README's threat-model note), so
+  // there's nothing that would make a second computation ever differ from
+  // the first. `joinUrl` is `undefined` whenever `buildJoinUrl` finds no room
+  // code configured — see that function's own doc comment for why that's the
+  // right behavior rather than emitting a link that doesn't actually work.
+  const deckUrl = options.deckUrl ?? DEFAULT_DECK_URL
+  const joinUrl = buildJoinUrl(deckUrl, authConfig.roomCode)
+
+  // `QRCode.toDataURL` is async (it's doing real PNG encoding work), and
+  // deliberately *not* awaited right here at server-construction time: this
+  // function is called synchronously by every test in `server.test.ts` (and
+  // by `index.ts` before `httpServer.listen`), and forcing all of them to
+  // pay for a PNG encode up front — for a value most of them never touch —
+  // would slow the whole suite for no benefit. Instead this is computed
+  // lazily, the *first* time anything actually asks for it
+  // (`getJoinQrDataUrl` below, called from the `dashboard:join` handler), and
+  // the resulting `Promise` (not just its resolved value) is cached in this
+  // closure so a second dashboard tab opening moments later reuses the same
+  // in-flight/completed encode instead of re-generating identical bytes.
+  // Caching the `Promise` rather than waiting for it once and caching the
+  // string is what makes that safe against two `dashboard:join` calls racing
+  // before the first encode finishes.
+  let joinQrDataUrlPromise: Promise<string | undefined> | undefined
+  function getJoinQrDataUrl(): Promise<string | undefined> {
+    if (!joinUrl)
+      return Promise.resolve(undefined)
+    if (!joinQrDataUrlPromise) {
+      // `.catch(() => undefined)` rather than letting a rejection propagate:
+      // `dashboard:join`'s handler `await`s this directly, and socket.io
+      // doesn't catch a listener's own async rejections for you — an
+      // unhandled one here would surface as a process-level
+      // `unhandledRejection`, not a contained failure. The QR code is a
+      // convenience on top of the plain `joinUrl` text link (still shown
+      // regardless), not load-bearing, so degrading to "no QR image" beats
+      // crashing the dashboard connection over it.
+      joinQrDataUrlPromise = QRCode.toDataURL(joinUrl).catch(() => undefined)
+    }
+    return joinQrDataUrlPromise
   }
 
   // `sirv` is mounted on the connect app *before* Socket.io attaches to the
@@ -553,7 +644,29 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // the joining socket only, mirroring `slide:sync`'s late-joiner pattern
     // above, so a freshly-opened dashboard tab doesn't have to wait for the
     // next mutation to render anything.
-    socket.on('dashboard:join', ({ presenterCode }: { presenterCode?: string } = {}, ack?: (result: { ok: boolean, roomCode?: string, presenterCode?: string }) => void) => {
+    socket.on('dashboard:join', async ({ presenterCode }: { presenterCode?: string } = {}, ack?: (result: {
+      ok: boolean
+      roomCode?: string
+      presenterCode?: string
+      /**
+       * The Slidev deck URL participants should open — see
+       * `CreateMuanCompanionServerOptions.deckUrl`'s own doc comment. Always
+       * present alongside `ok: true`: unlike `joinUrl`/`joinQrDataUrl` below,
+       * this doesn't depend on a room code being configured (it's just the
+       * server's own static config), so there's no "nothing valid to show
+       * yet" case for it the way there is for the other two.
+       */
+      deckUrl?: string
+      /** See `buildJoinUrl`'s doc comment — `undefined` iff no room code is configured. */
+      joinUrl?: string
+      /**
+       * A `data:image/png;base64,...` string encoding `joinUrl` (see
+       * `getJoinQrDataUrl` above) — `undefined` in lockstep with `joinUrl`
+       * (there's nothing to encode without it), never a separate failure
+       * mode of its own.
+       */
+      joinQrDataUrl?: string
+    }) => void) => {
       // Plan 029 Step 1: same presenter credential as `presenter:*` above —
       // opening the dashboard is exactly as privileged as moving everyone's
       // slide, so it shares the same gate rather than a weaker one.
@@ -570,8 +683,20 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // doesn't reveal anything to someone who couldn't already open this
       // same dashboard. Answers "how does the presenter find the codes to
       // hand out" without a separate discovery mechanism — see also
-      // `index.ts`'s startup log, the other place they're surfaced.
-      ack?.({ ok: true, roomCode: authConfig.roomCode, presenterCode: authConfig.presenterCode })
+      // `index.ts`'s startup log, the other place they're surfaced. The join
+      // URL/QR code are exactly as safe to hand back for the same reason —
+      // they're derived entirely from `roomCode`, already justified above —
+      // and `getJoinQrDataUrl` resolves synchronously-fast after the first
+      // call (see its own comment), so awaiting it here doesn't meaningfully
+      // delay this ack.
+      ack?.({
+        ok: true,
+        roomCode: authConfig.roomCode,
+        presenterCode: authConfig.presenterCode,
+        deckUrl,
+        joinUrl,
+        joinQrDataUrl: await getJoinQrDataUrl(),
+      })
     })
 
     socket.on('disconnect', () => {

@@ -37,8 +37,8 @@ export default antfu({
       // packages — see plans/026-workshop-tracker-m1-slide-sync.md's
       // "Current state" — adding them to the catalog is a separate decision
       // for the maintainer, out of scope for that plan).
-      'packages/workshop-tracker-server/package.json',
-      'packages/addon-workshop-tracker/package.json',
+      'packages/muan-companion-server/package.json',
+      'packages/addon-muan-companion/package.json',
     ],
   })
   .remove('antfu/markdown/rules')

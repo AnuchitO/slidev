@@ -180,7 +180,31 @@ function onSubmit() {
 // browser. Deliberately *not* wired into the failed-resume path above
 // (that already clears storage and re-prompts on its own); this is only for
 // a *successful* resume the current person doesn't recognize as themselves.
+//
+// Bug fix (reported from live use): clearing local storage/state alone left
+// the *server* still thinking the old identity is connected — this tab's
+// socket is shared across the whole addon (`client.ts`'s memoized
+// `getWorkshopSocket()`), so it never actually disconnects just because this
+// component resets its own refs, and nothing else ever removes it from the
+// old participant's `socketIds` (`session.ts`). The old row sat on the
+// dashboard as "viewing now" forever — a permanent ghost — because
+// `removeParticipantSocket` (the *only* thing that ever clears a socket out
+// of that array) only runs from the server's `disconnect` handler.
+//
+// Forcing an actual disconnect + reconnect here, before resetting anything
+// else, makes the server run that same handler for real: it releases this
+// socket from the old identity (marking it `closed` unless another tab of
+// theirs is still open — same multi-tab-safe behavior a real tab close
+// gets), and the reconnect hands back a fresh socket id for the *new*
+// identity's upcoming `participant:join` to attach to instead of reusing the
+// old one. Manual `.disconnect()` intentionally does not auto-reconnect on
+// its own even with `reconnection: true` (that option only covers
+// *unexpected* drops) — `.connect()` right after is required, not optional.
 function joinAsSomeoneElse() {
+  const socket = getWorkshopSocket()
+  socket.disconnect()
+  socket.connect()
+
   clearStoredParticipant()
   currentParticipant.value = undefined
   pendingParticipantId.value = undefined

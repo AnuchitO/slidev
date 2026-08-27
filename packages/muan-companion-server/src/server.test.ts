@@ -565,6 +565,58 @@ describe('createMuanCompanionServer', () => {
       expect(row?.visibility).toBe('closed')
     })
 
+    // Follow-up bug found in live use: `JoinScreen.vue`'s "Not you? Join as
+    // someone else" used to only clear the client's own local state, never
+    // telling the server this socket was done with the old identity —
+    // leaving a permanent ghost row on the dashboard (still `connected`)
+    // since nothing ever ran `removeParticipantSocket` for it. The fix is
+    // client-side (force a real disconnect + reconnect of the shared socket
+    // before joining fresh — see that component's own comment), but the
+    // server-side behavior it now relies on is exactly this: a socket that
+    // disconnects and reconnects, then joins as a *different* identity, must
+    // leave the old identity properly closed rather than still pointing at
+    // the (now differently-used) live socket.
+    it('disconnecting and rejoining fresh on the same underlying socket closes the old identity, not a ghost row', async () => {
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      await joinAsDashboard(dashboard)
+      await initialSnapshot
+
+      const client = await connectClient()
+      const { participantId: oldId } = await join(client, 'Ada') as { participantId: string }
+      await waitForMatchingStateUpdate<{ participants: Array<{ id: string }> }>(
+        dashboard,
+        p => p.participants.some(x => x.id === oldId),
+      )
+
+      // Mirrors `joinAsSomeoneElse()`: disconnect, reconnect the same client
+      // object (a new underlying socket id from the server's point of view),
+      // then join as a brand-new identity with no `participantId` — exactly
+      // what a participant typing a fresh name after clicking "Not you?"
+      // produces.
+      const oldClosed = waitForMatchingStateUpdate<{ participants: Array<{ id: string, connected: boolean }> }>(
+        dashboard,
+        p => p.participants.some(x => x.id === oldId && !x.connected),
+      )
+      client.disconnect()
+      client.connect()
+      await new Promise<void>(resolve => client.once('connect', () => resolve()))
+      await oldClosed
+
+      const { participantId: newId } = await join(client, 'Bob') as { participantId: string }
+      const finalPayload = await waitForMatchingStateUpdate<{ participants: Array<{ id: string, connected: boolean, name: string }> }>(
+        dashboard,
+        p => p.participants.some(x => x.id === newId),
+      )
+
+      expect(newId).not.toBe(oldId)
+      const oldRow = finalPayload.participants.find(p => p.id === oldId)
+      const newRow = finalPayload.participants.find(p => p.id === newId)
+      expect(oldRow?.connected).toBe(false)
+      expect(newRow?.connected).toBe(true)
+      expect(newRow?.name).toBe('Bob')
+    })
+
     // Follow-up bug found in live use: open a second tab (localStorage
     // resume — plan 030's follow-on fix — means it resumes the *same*
     // participant, on a second socket), close that second tab, and the

@@ -815,9 +815,28 @@ describe('createMuanCompanionServer', () => {
       const payload = await update
 
       expect(payload.errors).toContainEqual(
-        expect.objectContaining({ participantId, stepId: 'install-deps', text: 'npm install failed', resolved: false }),
+        expect.objectContaining({ participantId, stepId: 'install-deps', text: 'npm install failed', kind: 'problem', status: 'open' }),
       )
       expect(errorReports).toHaveLength(1)
+    })
+
+    it('participant:error with kind: "question" creates a question-kind report', async () => {
+      const client = await connectClient()
+      const { participantId } = await join(client) as { participantId: string }
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const update = waitForMatchingStateUpdate<{ errors: Array<{ participantId: string, kind: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      client.emit('participant:error', { stepId: 'install-deps', text: 'how do I undo this?', kind: 'question' })
+      const payload = await update
+
+      expect(payload.errors).toContainEqual(expect.objectContaining({ participantId, kind: 'question' }))
     })
 
     it('ignores participant:error from a socket that has not joined yet', async () => {
@@ -829,7 +848,7 @@ describe('createMuanCompanionServer', () => {
       expect(errorReports).toHaveLength(0)
     })
 
-    it('presenter:resolveError marks a report resolved and broadcasts the update', async () => {
+    it('presenter:resolveError moves a report to awaiting_confirmation and broadcasts the update', async () => {
       const client = await connectClient()
       const { participantId } = await join(client) as { participantId: string }
 
@@ -847,15 +866,15 @@ describe('createMuanCompanionServer', () => {
       const errorId = errors[0].id
 
       const presenter = await connectClient()
-      const resolved = waitForMatchingStateUpdate<{ errors: Array<{ id: string, resolved: boolean }> }>(
+      const resolved = waitForMatchingStateUpdate<{ errors: Array<{ id: string, status: string }> }>(
         dashboard,
-        payload => payload.errors.some(e => e.id === errorId && e.resolved),
+        payload => payload.errors.some(e => e.id === errorId && e.status === 'awaiting_confirmation'),
       )
       presenter.emit('presenter:resolveError', { errorId, presenterCode: TEST_PRESENTER_CODE })
       const resolvedPayload = await resolved
 
-      expect(resolvedPayload.errors.find(e => e.id === errorId)?.resolved).toBe(true)
-      expect(errorReports.find(e => e.id === errorId)?.resolved).toBe(true)
+      expect(resolvedPayload.errors.find(e => e.id === errorId)?.status).toBe('awaiting_confirmation')
+      expect(errorReports.find(e => e.id === errorId)?.status).toBe('awaiting_confirmation')
     })
 
     it('presenter:resolveError on an unknown id is a no-op (no crash, no broadcast storm)', async () => {
@@ -899,13 +918,15 @@ describe('createMuanCompanionServer', () => {
       const { errors } = await created
       const errorId = errors[0].id
 
-      const notified = waitFor<{ errorId: string, stepId: string, message?: string }>(reporter, 'participant:errorResolved')
+      const notified = waitFor<{ errorId: string, stepId: string, status: string, message?: string }>(reporter, 'participant:errorResolved')
       const presenter = await connectClient()
       presenter.emit('presenter:resolveError', { errorId, presenterCode: TEST_PRESENTER_CODE, message: '  keep going, almost there!  ' })
       const notification = await notified
 
-      expect(notification).toEqual({ errorId, stepId: 'install-deps', message: 'keep going, almost there!' })
-      expect(errorReports.find(e => e.id === errorId)?.resolutionMessage).toBe('keep going, almost there!')
+      expect(notification).toEqual({ errorId, stepId: 'install-deps', status: 'awaiting_confirmation', message: 'keep going, almost there!' })
+      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([
+        { from: 'presenter', text: 'keep going, almost there!', ts: expect.any(Number) },
+      ])
 
       await new Promise<void>(resolve => setTimeout(resolve, 50))
       expect(bystanderNotified).toBe(false)
@@ -934,6 +955,179 @@ describe('createMuanCompanionServer', () => {
       const notification = await notified
 
       expect(notification.message).toBeUndefined()
+    })
+
+    it('presenter:sendMessage appends a thread message and pushes it to the reporting participant live', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      const pushed = waitFor<{ errorId: string, stepId: string, text: string }>(reporter, 'participant:message')
+      const presenter = await connectClient()
+      presenter.emit('presenter:sendMessage', { errorId, presenterCode: TEST_PRESENTER_CODE, text: 'still looking into it' })
+      const notification = await pushed
+
+      expect(notification).toEqual({ errorId, stepId: 'install-deps', text: 'still looking into it' })
+      expect(errorReports.find(e => e.id === errorId)?.status).toBe('open')
+      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([
+        { from: 'presenter', text: 'still looking into it', ts: expect.any(Number) },
+      ])
+    })
+
+    it('presenter:sendMessage without a valid presenterCode is a no-op', async () => {
+      const reporter = await connectClient()
+      await join(reporter)
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string }> }>(
+        dashboard,
+        payload => payload.errors.length > 0,
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      const presenter = await connectClient()
+      presenter.emit('presenter:sendMessage', { errorId, presenterCode: 'wrong', text: 'nope' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([])
+    })
+
+    it('participant:confirmResolution(true) resolves the report and updates the dashboard', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      const presenter = await connectClient()
+      const awaitingConfirmation = waitForMatchingStateUpdate<{ errors: Array<{ id: string, status: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.id === errorId && e.status === 'awaiting_confirmation'),
+      )
+      presenter.emit('presenter:resolveError', { errorId, presenterCode: TEST_PRESENTER_CODE, message: 'try this' })
+      await awaitingConfirmation
+
+      const confirmed = waitForMatchingStateUpdate<{ errors: Array<{ id: string, status: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.id === errorId && e.status === 'resolved'),
+      )
+      reporter.emit('participant:confirmResolution', { errorId, confirmed: true, message: 'yep, fixed!' })
+      const resolvedPayload = await confirmed
+
+      expect(resolvedPayload.errors.find(e => e.id === errorId)?.status).toBe('resolved')
+      expect(errorReports.find(e => e.id === errorId)?.thread.at(-1)).toEqual({ from: 'participant', text: 'yep, fixed!', ts: expect.any(Number) })
+    })
+
+    it('participant:confirmResolution(false) reopens the report', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      const presenter = await connectClient()
+      presenter.emit('presenter:resolveError', { errorId, presenterCode: TEST_PRESENTER_CODE, message: 'try this' })
+
+      const reopened = waitForMatchingStateUpdate<{ errors: Array<{ id: string, status: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.id === errorId && e.status === 'reopened'),
+      )
+      reporter.emit('participant:confirmResolution', { errorId, confirmed: false, message: 'still broken' })
+      const reopenedPayload = await reopened
+
+      expect(reopenedPayload.errors.find(e => e.id === errorId)?.status).toBe('reopened')
+    })
+
+    it('participant:confirmResolution from a socket that does not own the report is a no-op', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+      const bystander = await connectClient()
+      await join(bystander, 'Bob')
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      bystander.emit('participant:confirmResolution', { errorId, confirmed: true })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(errorReports.find(e => e.id === errorId)?.status).toBe('open')
+    })
+
+    it('participant:addMessage appends a follow-up to the reporter\'s own report', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'how do I fix this?', kind: 'question' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      const update = waitForMatchingStateUpdate<{ errors: Array<{ id: string, thread: Array<{ text: string }> }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.id === errorId && e.thread.length > 0),
+      )
+      reporter.emit('participant:addMessage', { errorId, text: 'also, does this affect step 2?' })
+      const updatedPayload = await update
+
+      expect(updatedPayload.errors.find(e => e.id === errorId)?.thread).toEqual([
+        { from: 'participant', text: 'also, does this affect step 2?', ts: expect.any(Number) },
+      ])
     })
   })
 

@@ -1,6 +1,6 @@
 import type { Server as HttpServer, IncomingMessage, ServerResponse } from 'node:http'
 import type { WorkshopAuthConfig } from './auth'
-import type { ParticipantVisibility, StepState } from './session'
+import type { HelpRequestKind, ParticipantVisibility, StepState } from './session'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
 import { createServer } from 'node:http'
@@ -15,6 +15,9 @@ import { HEARTBEAT_INTERVAL_MS, sweepStaleParticipants } from './presence'
 import { createScreenshotUploadHandler } from './screenshotUpload'
 import {
   addErrorReport,
+  addParticipantMessage,
+  addPresenterMessage,
+  confirmResolution,
   joinParticipant,
   listErrorReports,
   listStepStatus,
@@ -353,15 +356,19 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     socket.on('participant:copy', handleStepAction('copied'))
     socket.on('participant:done', handleStepAction('done'))
 
-    // Text-only error report (PRD §10). The screenshot path is REST-only
-    // (`POST /api/screenshot`, `screenshotUpload.ts`) — this WS event is
+    // Text-only report (PRD §10, extended by the "Ask for Help" redesign to
+    // carry `kind`). The screenshot path is REST-only (`POST
+    // /api/screenshot`, `screenshotUpload.ts`) — this WS event is
     // deliberately the *only* path for a text-only report, per plan 028
     // Step 2's decision not to implement both a WS and a REST path for the
-    // identical text-only case. No presenter/room-code check beyond having
-    // joined: same "a socket can only act as the participant it joined as"
-    // rule as `participant:copy`/`done` below — the room code was already
-    // checked once, at `participant:join`.
-    socket.on('participant:error', ({ stepId, text }: { stepId: string, text?: string }) => {
+    // identical text-only case. `kind` defaults to `'problem'` for callers
+    // predating the redesign (or any client that omits it) — only the
+    // widget's new "Ask a question" tab ever sends `'question'` explicitly.
+    // No presenter/room-code check beyond having joined: same "a socket can
+    // only act as the participant it joined as" rule as
+    // `participant:copy`/`done` below — the room code was already checked
+    // once, at `participant:join`.
+    socket.on('participant:error', ({ stepId, text, kind }: { stepId: string, text?: string, kind?: HelpRequestKind }) => {
       const participantId = socket.data.participantId as string | undefined
       // Same "no-op rather than a guess" rule as `participant:copy`/`done`
       // above — a socket that hasn't joined has no participant to attach
@@ -376,6 +383,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         participantId,
         participantName: participant.name,
         stepId,
+        kind: kind ?? 'problem',
         text,
         ts: Date.now(),
       })
@@ -384,6 +392,36 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       touchLastSeen(participantId)
       broadcastStateUpdate(io)
     })
+
+    // Looks up the report and the participant who filed it, or does nothing
+    // — shared by every handler below that needs to notify the *specific*
+    // reporting participant back (mirrors `presenter:resolveError`'s
+    // original inline version of this same lookup pair, pulled out once a
+    // second handler needed it too).
+    function reporterOf(report: { participantId: string } | undefined) {
+      return report ? participants.get(report.participantId) : undefined
+    }
+
+    // The ownership check `participant:confirmResolution` and
+    // `participant:addMessage` below both need: a report exists *and* it
+    // belongs to the calling socket's own participant. Returns the report
+    // itself (not just a boolean) so callers don't need a second lookup.
+    function errorReportOwnedBy(errorId: string, participantId: string) {
+      return listErrorReports().find(r => r.id === errorId && r.participantId === participantId)
+    }
+
+    // Targets *every* socket currently in `reporter.socketIds`, not just
+    // one: a participant can have this identity open in more than one tab
+    // (the `localStorage` resume), and `.to()` accepts an array of rooms —
+    // each socket is implicitly in a room named by its own id — so every
+    // open tab of theirs sees the notification, not just whichever tab
+    // happened to join most recently. If they've disconnected entirely,
+    // `socketIds` is empty and `io.to([])` is a harmless no-op — there's
+    // nothing to notify.
+    function notifyReporter(reporter: { socketIds: string[] } | undefined, event: string, payload: unknown) {
+      if (reporter)
+        io.to(reporter.socketIds).emit(event, payload)
+    }
 
     socket.on('presenter:resolveError', ({ errorId, presenterCode, message }: { errorId: string, presenterCode?: string, message?: string }) => {
       // Plan 029 Step 1: same presenter-credential gate as `presenter:setSlide`
@@ -394,28 +432,86 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // documented merge-order caveat.)
       if (!isValidPresenterCode(authConfig, presenterCode))
         return
+      // Redesign: this no longer resolves outright — `resolveErrorReport`
+      // moves the report to `'awaiting_confirmation'`, the participant gets
+      // the final word via `participant:confirmResolution` below. Close the
+      // loop back to the *specific* participant who filed this report — not
+      // a broadcast, and not the dashboard room (they already got it via
+      // the `state:update` below).
       const report = resolveErrorReport(errorId, message)
       broadcastStateUpdate(io)
       if (!report)
         return
-      // Close the loop back to the *specific* participant who filed this
-      // report — not a broadcast, and not the dashboard room (they already
-      // got it via the `state:update` above). Targets *every* socket
-      // currently in `reporter.socketIds`, not just one: a participant can
-      // have this identity open in more than one tab (the `localStorage`
-      // resume), and `.to()` accepts an array of rooms — each socket is
-      // implicitly in a room named by its own id — so every open tab of
-      // theirs sees the notification, not just whichever tab happened to
-      // join most recently. If they've disconnected entirely, `socketIds` is
-      // empty and `io.to([])` is a harmless no-op — there's nothing to notify.
-      const reporter = participants.get(report.participantId)
-      if (reporter) {
-        io.to(reporter.socketIds).emit('participant:errorResolved', {
-          errorId: report.id,
-          stepId: report.stepId,
-          message: report.resolutionMessage,
-        })
-      }
+      notifyReporter(reporterOf(report), 'participant:errorResolved', {
+        errorId: report.id,
+        stepId: report.stepId,
+        status: report.status,
+        // Trimmed the same way `resolveErrorReport` trims before storing —
+        // echo back what was actually kept (undefined for blank/whitespace),
+        // not the raw, possibly-untrimmed input.
+        message: message?.trim() || undefined,
+      })
+    })
+
+    // The "message box" redesign: lets the presenter reply on a report's
+    // thread — "still looking into it", answering a question — without
+    // forcing a binary "ignore or mark resolved" choice. Doesn't touch
+    // `status` at all (unlike `presenter:resolveError` above); the dashboard
+    // sees the new thread entry via the `state:update` broadcast below, and
+    // the reporting participant is pushed the same message live so they
+    // don't have to reopen the widget to notice it.
+    socket.on('presenter:sendMessage', ({ errorId, presenterCode, text }: { errorId: string, presenterCode?: string, text: string }) => {
+      if (!isValidPresenterCode(authConfig, presenterCode))
+        return
+      const report = addPresenterMessage(errorId, text)
+      if (!report)
+        return
+      broadcastStateUpdate(io)
+      notifyReporter(reporterOf(report), 'participant:message', {
+        errorId: report.id,
+        stepId: report.stepId,
+        text: report.thread.at(-1)!.text,
+      })
+    })
+
+    // The other half of the confirm/reopen redesign: the participant's
+    // answer to "did that actually fix it?" after `presenter:resolveError`
+    // above put a report in `'awaiting_confirmation'`. Restricted to the
+    // *reporting* participant's own socket — same "a socket can only act as
+    // the participant it joined as" rule as `participant:copy`/`done` —
+    // rather than trusting whatever `errorId` shows up: an `errorId` isn't a
+    // secret the way `participantId` is (it's visible to the dashboard, and
+    // in principle guessable-ish as a UUID others hold), so this check is
+    // what actually stops one participant from confirming/reopening
+    // another's report, not just a UI nicety.
+    socket.on('participant:confirmResolution', ({ errorId, confirmed, message }: { errorId: string, confirmed: boolean, message?: string }) => {
+      const participantId = socket.data.participantId as string | undefined
+      if (!participantId)
+        return
+      const report = errorReportOwnedBy(errorId, participantId)
+      if (!report)
+        return
+      confirmResolution(errorId, confirmed, message)
+      touchLastSeen(participantId)
+      broadcastStateUpdate(io)
+    })
+
+    // Lets a participant add a follow-up on their own report's thread —
+    // more detail on an open ticket, or a further question — without
+    // waiting for a resolution offer to respond to (that's
+    // `participant:confirmResolution` above; this never touches `status`).
+    // Same ownership restriction as `participant:confirmResolution`, for the
+    // same reason.
+    socket.on('participant:addMessage', ({ errorId, text }: { errorId: string, text: string }) => {
+      const participantId = socket.data.participantId as string | undefined
+      if (!participantId)
+        return
+      const report = errorReportOwnedBy(errorId, participantId)
+      if (!report)
+        return
+      addParticipantMessage(errorId, text)
+      touchLastSeen(participantId)
+      broadcastStateUpdate(io)
     })
 
     // PRD §10 `participant:visibility { state }` — reported by the addon's

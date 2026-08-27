@@ -230,31 +230,64 @@ export function listStepStatus(): StepStatusEntry[] {
 }
 
 /**
- * `ErrorReport` (PRD §9, plan 028 Step 1): a participant's text and/or
- * screenshot report tied to `participantId`/`stepId`. `resolved` is a M3
- * addition on top of the PRD's literal shape — the dashboard's
- * mark-resolved action (plan 028 Step 3) needs somewhere server-side to
- * live so resolved state survives a dashboard page reload, per that step's
- * own verification note.
+ * What kind of help a report represents — the "Ask for Help" redesign's
+ * addition on top of M3's error-only shape. `'problem'` is the original
+ * report-a-problem flow (screenshot-eligible); `'question'` is the new
+ * text-only "ask a question" flow (`ErrorReportWidget.vue`'s two tabs).
+ * Both share every other field and the entire resolve/confirm state
+ * machine below — a question is answered exactly the way a problem is
+ * resolved, just tagged differently for the feed's icon/label.
+ */
+export type HelpRequestKind = 'problem' | 'question'
+
+/**
+ * The two-way follow-up redesign's state machine, replacing the old bare
+ * `resolved: boolean`:
+ *
+ * - `'open'`: freshly submitted, nothing sent back yet.
+ * - `'awaiting_confirmation'`: the presenter marked it resolved (optionally
+ *   with a message) and is waiting on the participant to say whether that
+ *   actually fixed it — see `resolveErrorReport` below.
+ * - `'resolved'`: the participant confirmed it — the end state.
+ * - `'reopened'`: the participant said "still need help" (or something
+ *   else) instead of confirming — back in the presenter's queue for
+ *   attention, same as `'open'`, but visibly distinct so the dashboard can
+ *   say *why* it's back rather than looking like a fresh report.
+ */
+export type HelpRequestStatus = 'open' | 'awaiting_confirmation' | 'resolved' | 'reopened'
+
+/**
+ * One entry in a report's back-and-forth — the "message box" redesign's
+ * actual payload. Ordered, append-only, rendered as a chat thread by both
+ * the dashboard and the widget's resolution card. Deliberately doesn't
+ * carry an id: messages are never edited or targeted individually, only
+ * ever appended and read in order.
+ */
+export interface ThreadMessage {
+  from: 'participant' | 'presenter'
+  text: string
+  ts: number
+}
+
+/**
+ * `ErrorReport` (PRD §9, plan 028 Step 1; extended by the "Ask for Help"
+ * UX redesign): a participant's text and/or screenshot report tied to
+ * `participantId`/`stepId`. `text`/`screenshotUrl` stay as the *original*
+ * submission only — everything sent after that (a presenter reply, a
+ * participant's confirm/reopen response, a follow-up question) lives in
+ * `thread`, not mixed into these two fields.
  */
 export interface ErrorReport {
   id: string
   participantId: string
   participantName: string
   stepId: string
+  kind: HelpRequestKind
   text?: string
   screenshotUrl?: string
   ts: number
-  resolved: boolean
-  /**
-   * An optional reply the instructor typed in alongside "Mark resolved"
-   * (dashboard, plan 028 Step 3 + the later engagement follow-up) — sent
-   * back to the reporting participant's own socket only (`server.ts`'s
-   * `presenter:resolveError` handler), not broadcast, and kept here too so
-   * it's visible in the dashboard's own resolved-report history after the
-   * fact, not just in the one-shot notification the participant saw.
-   */
-  resolutionMessage?: string
+  status: HelpRequestStatus
+  thread: ThreadMessage[]
 }
 
 // Append-only for the session's lifetime — no retention/cleanup policy
@@ -263,33 +296,103 @@ export interface ErrorReport {
 export const errorReports: ErrorReport[] = []
 
 /**
- * Adds a new `ErrorReport`. Callers pass everything but `resolved` — a
- * freshly-reported error always starts unresolved; nothing in this plan's
- * scope ever creates one pre-resolved.
+ * Adds a new `ErrorReport`. Callers pass everything but `status`/`thread` —
+ * a freshly-reported request always starts `'open'` with an empty thread;
+ * nothing in this codebase ever creates one pre-resolved or pre-seeded with
+ * messages.
  */
-export function addErrorReport(report: Omit<ErrorReport, 'resolved'>): ErrorReport {
-  const full: ErrorReport = { ...report, resolved: false }
+export function addErrorReport(report: Omit<ErrorReport, 'status' | 'thread'>): ErrorReport {
+  const full: ErrorReport = { ...report, status: 'open', thread: [] }
   errorReports.push(full)
   return full
 }
 
+function findReport(errorId: string): ErrorReport | undefined {
+  return errorReports.find(r => r.id === errorId)
+}
+
 /**
- * Marks a report resolved by id (the dashboard's `presenter:resolveError`
- * handler, plan 028 Step 3). Returns the updated report (so the caller can
- * read `participantId`/`stepId` to notify that participant back — see
- * `server.ts`'s handler — without a second lookup), or `undefined` if no
- * report matched — an unknown `errorId` is a no-op, not an error, mirroring
- * `setStepStatus`'s "no-op rather than a guess" precedent for a socket
- * acting on an id it doesn't recognize.
+ * The presenter's "Mark resolved" action (dashboard, plan 028 Step 3;
+ * redesigned to require confirmation rather than resolving outright). Moves
+ * the report to `'awaiting_confirmation'` — never straight to `'resolved'`
+ * — so the participant gets the final say on whether it actually fixed
+ * their problem (the whole point of the confirm/reopen redesign; see
+ * `confirmResolution` below for the other half). An optional message is
+ * appended to `thread` as a presenter message, same as a plain
+ * `addPresenterMessage` call.
+ *
+ * Returns the updated report (so the caller can read `participantId` to
+ * notify that participant back — see `server.ts`'s handler — without a
+ * second lookup), or `undefined` if no report matched — an unknown
+ * `errorId` is a no-op, not an error, mirroring `setStepStatus`'s "no-op
+ * rather than a guess" precedent for a socket acting on an id it doesn't
+ * recognize.
  */
 export function resolveErrorReport(errorId: string, message?: string): ErrorReport | undefined {
-  const report = errorReports.find(r => r.id === errorId)
+  const report = findReport(errorId)
   if (!report)
     return undefined
-  report.resolved = true
+  report.status = 'awaiting_confirmation'
   const trimmed = message?.trim()
   if (trimmed)
-    report.resolutionMessage = trimmed
+    report.thread.push({ from: 'presenter', text: trimmed, ts: Date.now() })
+  return report
+}
+
+/**
+ * Appends a presenter reply to a report's thread *without* touching its
+ * status — the "message box" redesign's plain reply, for "still looking
+ * into it" / answering a question / following up before (or instead of)
+ * ever marking it resolved. A blank/whitespace-only message is a no-op:
+ * there's nothing to append.
+ */
+export function addPresenterMessage(errorId: string, text: string): ErrorReport | undefined {
+  const report = findReport(errorId)
+  const trimmed = text.trim()
+  if (!report || !trimmed)
+    return undefined
+  report.thread.push({ from: 'presenter', text: trimmed, ts: Date.now() })
+  return report
+}
+
+/**
+ * Appends a participant's follow-up to a report's thread — asking a further
+ * question on an already-open ticket, or adding detail — without touching
+ * status. Confirming or reopening in response to a resolution offer is
+ * `confirmResolution` below, not this: that's a status transition, this
+ * never is.
+ */
+export function addParticipantMessage(errorId: string, text: string): ErrorReport | undefined {
+  const report = findReport(errorId)
+  const trimmed = text.trim()
+  if (!report || !trimmed)
+    return undefined
+  report.thread.push({ from: 'participant', text: trimmed, ts: Date.now() })
+  return report
+}
+
+/**
+ * The participant's half of the confirm/reopen redesign: their answer to
+ * "did that actually fix it?" after the presenter marked a report
+ * `'awaiting_confirmation'`. `confirmed: true` moves it to the `'resolved'`
+ * end state; `confirmed: false` moves it to `'reopened'` — back in the
+ * presenter's queue, distinguishable from a fresh `'open'` report. Not
+ * restricted to only firing from `'awaiting_confirmation'` — a participant
+ * confirming/reopening is always taken at face value regardless of the
+ * report's current status, same "trust the caller, no-op on unknown id"
+ * posture as every other mutator here; `server.ts`'s handler is what
+ * actually restricts *who* may call this (the reporting participant only).
+ * An optional message is appended as a participant thread message either
+ * way.
+ */
+export function confirmResolution(errorId: string, confirmed: boolean, message?: string): ErrorReport | undefined {
+  const report = findReport(errorId)
+  if (!report)
+    return undefined
+  report.status = confirmed ? 'resolved' : 'reopened'
+  const trimmed = message?.trim()
+  if (trimmed)
+    report.thread.push({ from: 'participant', text: trimmed, ts: Date.now() })
   return report
 }
 

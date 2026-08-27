@@ -142,11 +142,16 @@ export function createScreenshotUploadHandler(uploadsDir: string, onUploaded: (r
           return
         }
 
+        // Screenshot capture is only ever offered on the "Report a problem"
+        // tab (`ErrorReportWidget.vue` — the "Ask a question" tab is
+        // text-only), so this upload path always tags the report `'problem'`
+        // — there's no form field for `kind` to read here.
         const report = addErrorReport({
           id: randomUUID(),
           participantId: participant.id,
           participantName: participant.name,
           stepId,
+          kind: 'problem',
           text: text || undefined,
           screenshotUrl: `/uploads/${savedFile.filename}`,
           ts: Date.now(),

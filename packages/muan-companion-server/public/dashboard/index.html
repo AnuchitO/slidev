@@ -35,17 +35,31 @@
 
     /*
      * Error-reporting design tokens (Google-style / Material redesign,
-     * scoped to the "Error reports" section — see `.error-reports` below).
-     * The same small token set (radius scale, elevation shadows, semantic
-     * color roles, type stack) is applied identically in the participant
-     * widget (`ErrorReportWidget.vue`'s scoped `<style>`), which is how the
-     * two surfaces read as one design system despite being unable to share
-     * an actual stylesheet. Surface color intentionally stays `--panel`
-     * (this page's existing card background) rather than copying the
-     * widget's own surface token — this section still has to nest inside
-     * the *unchanged* rest of the dashboard (table, counts, codes panel),
-     * while the widget floats over arbitrary slide content and needed its
-     * own elevated surface.
+     * scoped to the "Help requests" section — see `.error-reports` below;
+     * the class/id names throughout this section still say "error" rather
+     * than "help-request" — they predate the "Ask for Help" kind/status
+     * redesign and renaming every one of them is a larger diff than the
+     * actual behavior change warrants, since none of them are user-visible
+     * copy). The same small token set (radius scale, elevation shadows,
+     * semantic color roles, type stack) is applied identically in the
+     * participant widget (`ErrorReportWidget.vue`'s scoped `<style>`), which
+     * is how the two surfaces read as one design system despite being
+     * unable to share an actual stylesheet. Surface color intentionally
+     * stays `--panel` (this page's existing card background) rather than
+     * copying the widget's own surface token — this section still has to
+     * nest inside the *unchanged* rest of the dashboard (table, counts,
+     * codes panel), while the widget floats over arbitrary slide content
+     * and needed its own elevated surface.
+     *
+     * `--wt-warning` is kept defined even though this file's own markup no
+     * longer references it directly (the section heading icon moved to a
+     * neutral "conversation" glyph in `--wt-primary` now that the section
+     * covers both `problem` and `question` kinds, not just warnings) — it
+     * stays part of the shared token contract with the widget described
+     * above, and status/kind colors below intentionally reuse the existing
+     * `--error`/`--wt-primary`/`--wt-success` roles rather than reaching for
+     * it, per this redesign's instruction to reuse established roles
+     * instead of inventing new ones.
      */
     --wt-primary: #8ab4f8;
     --wt-on-primary: #062e6f;
@@ -164,7 +178,7 @@
   }
 
   /*
-   * "Error reports" section only — see the `--wt-*` token comment in
+   * "Help requests" section only — see the `--wt-*` token comment in
    * `:root` above. `.error-reports` opts this section into the shared
    * Material type stack without touching the rest of the page's typography.
    */
@@ -177,7 +191,13 @@
     gap: 6px;
   }
   .error-reports h2 .wt-icon {
-    color: var(--wt-warning);
+    /* Was `--wt-warning` pre-redesign, back when this section only ever
+       held error reports. Now that a card can equally be a plain
+       `question`, a single warning-colored heading icon would misrepresent
+       half the feed as alarming when it isn't — `--wt-primary` reads as
+       neutral "here's the conversation", matching the chat-bubble glyph
+       swapped in below (see the `<h2>` markup's own comment). */
+    color: var(--wt-primary);
   }
   .wt-icon {
     width: 16px;
@@ -196,10 +216,26 @@
     align-items: flex-start;
     background: var(--panel);
     border: 1px solid var(--border);
+    /* Default left-border color is the "needs attention" red — correct for
+       both `open` and `reopened` (the two statuses that get no override
+       below), which is exactly the pairing the redesign wants: `reopened`
+       reads with the same urgency as a fresh `open` report at the
+       card-border level, distinguished instead by the status chip inside
+       (see `.status-chip.status-reopened` below) rather than by a whole
+       separate color that would compete with the red/blue/green semantic
+       roles this file otherwise reuses. */
     border-left: 3px solid var(--error);
     border-radius: var(--wt-radius-md);
     padding: 12px 14px;
     box-shadow: var(--wt-elevation-1);
+  }
+  .error-card.awaiting {
+    /* `awaiting_confirmation`: already actioned by the presenter, not yet
+       final — blue (the same `--wt-primary` role as the resolve button
+       always used) reads as "in flight" without the dimmed/muted treatment
+       `.resolved` gets below, since this isn't done yet and shouldn't look
+       like it's faded out of relevance. */
+    border-left-color: var(--wt-primary);
   }
   .error-card.resolved {
     opacity: 0.6;
@@ -229,28 +265,120 @@
     color: var(--muted);
     margin-bottom: 4px;
   }
-  .error-status-icon {
+  /*
+   * `kind-tag` (problem vs. question) is deliberately left uncolored
+   * (`--muted`, same as the rest of `.error-meta`) rather than given its own
+   * semantic color — color is reserved for `.status-chip` below, which is
+   * the thing that actually needs to grab the instructor's eye. Two colored
+   * chips side by side (kind *and* status) would fight for attention and
+   * make it harder to scan a row of cards for "which ones are red" at a
+   * glance; shape (a distinct icon) is enough to tell problem and question
+   * apart once you're already reading a given card.
+   */
+  .kind-tag {
     display: inline-flex;
+    align-items: center;
+    gap: 4px;
   }
-  .error-status-icon .wt-icon { width: 14px; height: 14px; }
-  .error-status-icon.open { color: var(--error); }
-  .error-status-icon.resolved-icon { color: var(--wt-success); }
+  .kind-tag .wt-icon { width: 13px; height: 13px; }
+  /*
+   * `status-chip`: the one colored badge per card, reusing the existing
+   * `--error`/`--wt-primary`/`--wt-success` role tokens (not new colors —
+   * per this redesign's brief) so a card's color always means the same
+   * thing it already means everywhere else on this page (red = needs you,
+   * blue = in progress, green = done). `open` and `reopened` intentionally
+   * share the red role — see `.error-card`'s own comment above for why
+   * "came back" is communicated by icon/label instead of a fourth color.
+   */
+  .status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: var(--wt-radius-full);
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .status-chip .wt-icon { width: 12px; height: 12px; }
+  .status-chip.status-open,
+  .status-chip.status-reopened {
+    background: rgba(242, 139, 130, 0.16);
+    color: var(--error);
+  }
+  .status-chip.status-awaiting {
+    background: rgba(138, 180, 248, 0.16);
+    color: var(--wt-primary);
+  }
+  .status-chip.status-resolved {
+    background: rgba(129, 201, 149, 0.16);
+    color: var(--wt-success);
+  }
   .error-meta .name { color: var(--text); font-weight: 600; }
   .error-text {
     margin: 0;
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .error-actions {
-    flex: 0 0 auto;
+  /*
+   * The back-and-forth thread (`ErrorReport.thread`), rendered as a compact
+   * chat strip below the original submission. Alignment carries the
+   * from/participant distinction (presenter messages hug the right edge,
+   * "You:"; participant messages hug the left, their name as the label) —
+   * chosen over a color-only distinction because it's legible even at this
+   * font size and matches the familiar messaging-app convention instructors
+   * already have muscle memory for, without spending another semantic color
+   * that `.status-chip` above needs to keep meaning one thing.
+   */
+  .thread {
     display: flex;
     flex-direction: column;
-    align-items: flex-end;
+    gap: 4px;
+    margin: 8px 0;
+  }
+  .thread-msg {
+    max-width: 85%;
+    padding: 5px 9px;
+    border-radius: var(--wt-radius-sm);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .thread-msg-presenter {
+    align-self: flex-end;
+    background: rgba(138, 180, 248, 0.14);
+  }
+  .thread-msg-participant {
+    align-self: flex-start;
+    background: rgba(255, 255, 255, 0.05);
+  }
+  .thread-msg-label {
+    font-weight: 600;
+    color: var(--muted);
+    margin-right: 4px;
+  }
+  /*
+   * Composer: one shared textarea per non-resolved card feeding both the
+   * plain "Send" reply and (open/reopened only) "Send & mark resolved" —
+   * see the `composer` builder in the script for the input-count tradeoff
+   * this was chosen over. Full-width under the thread rather than the old
+   * fixed-width `.resolve-message` sitting in a side column: a thread reply
+   * is often longer than the old one-line "optional message", and a
+   * multi-line `<textarea>` reads better spanning the card than squeezed
+   * into a 170px column.
+   */
+  .composer {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
     gap: 6px;
   }
-  .resolve-message {
-    width: 170px;
-    padding: 5px 8px;
+  .composer-input {
+    width: 100%;
+    min-height: 32px;
+    max-height: 140px;
+    resize: vertical;
+    padding: 6px 9px;
     border-radius: var(--wt-radius-sm);
     border: 1px solid var(--border);
     background: transparent;
@@ -258,10 +386,27 @@
     font: inherit;
     font-size: 12px;
   }
-  .resolve-message:focus {
+  .composer-input:focus {
     outline: none;
     border: 2px solid var(--wt-primary);
-    padding: 4px 7px;
+    padding: 5px 8px;
+  }
+  .composer-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  /* Sits where the resolve button would otherwise be for an
+     `awaiting_confirmation` card — there's nothing left to "mark resolved"
+     (the presenter already did; the ball is in the participant's court) —
+     `margin-right: auto` pins it to the opposite side from the remaining
+     Send button rather than leaving an empty gap. */
+  .awaiting-note {
+    font-size: 11px;
+    color: var(--muted);
+    font-style: italic;
+    margin-right: auto;
   }
   .resolve-button {
     display: inline-flex;
@@ -278,23 +423,25 @@
     font-size: 12px;
   }
   .resolve-button .wt-icon { width: 13px; height: 13px; }
-  .resolve-button:disabled {
+  .send-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    border-radius: var(--wt-radius-full);
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+    font-size: 12px;
+  }
+  .send-button .wt-icon { width: 13px; height: 13px; }
+  .resolve-button:disabled,
+  .send-button:disabled {
     cursor: default;
     opacity: 0.38;
-  }
-  .resolved-label {
-    display: inline-flex;
-    align-items: flex-start;
-    gap: 5px;
-    font-size: 12px;
-    color: var(--muted);
-    text-align: right;
-  }
-  .resolved-label .wt-icon { color: var(--wt-success); margin-top: 1px; }
-  .resolved-message {
-    display: block;
-    font-style: italic;
-    max-width: 200px;
   }
 
   .lightbox {
@@ -317,7 +464,7 @@
 </head>
 <body>
   <h1>Muan Companion — Instructor Dashboard</h1>
-  <p class="sub">Participant roster, presence, current-step status, and the error feed. Requires the presenter code (see this file's source).</p>
+  <p class="sub">Participant roster, presence, current-step status, and help requests. Requires the presenter code (see this file's source).</p>
   <p class="conn" id="conn">connecting…</p>
 
   <!--
@@ -347,7 +494,17 @@
     <div class="count"><span class="n" id="count-done">0</span><span class="l">done this step</span></div>
     <div class="count"><span class="n" id="count-slide">–</span><span class="l">current slide</span></div>
     <div class="count"><span class="n" id="count-step">–</span><span class="l">current stepId</span></div>
-    <div class="count"><span class="n" id="count-errors">0</span><span class="l">open errors</span></div>
+    <!--
+      Renamed from "open errors" (the old bare `resolved: boolean` era) to
+      "needs attention" — the redesign's four-status machine has two
+      not-yet-final-but-not-actionable-right-now states (`resolved` is
+      final; `awaiting_confirmation` is already actioned and just waiting on
+      the participant), so "not resolved" alone would wrongly count a report
+      the presenter already replied to as still needing them to do
+      something. See `renderErrors`'s `NEEDS_ATTENTION` set below for the
+      exact definition this tile mirrors.
+    -->
+    <div class="count"><span class="n" id="count-errors">0</span><span class="l">needs attention</span></div>
   </div>
 
   <table>
@@ -371,10 +528,21 @@
   -->
   <p class="empty" id="empty" hidden>No participants have joined yet.</p>
 
+  <!--
+    Renamed "Error reports" → "Help requests" (Ask for Help redesign):
+    the feed below now interleaves `kind: 'problem'` reports (the original
+    error-report flow) with `kind: 'question'` asks, and "error reports"
+    stopped describing half the cards in it. The heading icon changed to a
+    neutral chat-bubble glyph for the same reason the warning triangle no
+    longer colors it (see `.error-reports h2 .wt-icon`'s comment) — a
+    question arriving isn't an error condition. `.error-reports`/`error-feed`
+    class and id names are kept as-is (see the `:root` token comment above)
+    since they're internal, not shown to anyone.
+  -->
   <section class="error-reports">
-    <h2><svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z" /></svg>Error reports</h2>
+    <h2><svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z" /></svg>Help requests</h2>
     <div class="error-feed" id="error-feed"></div>
-    <p class="empty" id="errors-empty" hidden>No error reports yet.</p>
+    <p class="empty" id="errors-empty" hidden>No help requests yet.</p>
   </section>
 
   <script src="/socket.io/socket.io.js"></script>
@@ -396,6 +564,43 @@
     const ICON_WARNING = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>'
     const ICON_CHECK = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>'
     const ICON_SEND = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"/></svg>'
+    // Added by the "Ask for Help" redesign — `kind: 'question'` cards get
+    // their own glyph (a question mark in a circle, Material's "help"
+    // icon) rather than reusing `ICON_WARNING`, which would visually claim
+    // every card in the feed is an error/warning even when it's just a
+    // participant asking something (see the `kind-tag`/`status-chip` split
+    // in the CSS comment above for why kind and status get separate icons
+    // at all).
+    const ICON_QUESTION = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z"/></svg>'
+    // `awaiting_confirmation` status icon — a clock/hourglass reads as
+    // "waiting on someone else" at a glance, distinct from both the
+    // attention-needed triangle and the done checkmark.
+    const ICON_SCHEDULE = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm.5 5H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg>'
+    // `reopened` status icon — an "undo" arrow, so a report that bounced
+    // back after the presenter thought it was handled reads as "this came
+    // back" rather than being indistinguishable from a report that was
+    // never touched (both share the same red `status-chip` color — see its
+    // CSS comment — so the icon is what actually carries "came back" vs.
+    // "never handled").
+    const ICON_UNDO = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg>'
+
+    // One lookup per axis (kind, status) rather than inline ternary chains
+    // in the card-building loop below — both axes are closed enums fixed by
+    // the server contract (`HelpRequestKind`/`HelpRequestStatus` in
+    // session.ts), so a plain object keyed by the exact server string is
+    // simpler to read and to extend than nested conditionals, and a typo'd
+    // key just falls through to the `?? KIND_META.problem` / `?? STATUS_META.open`
+    // default below instead of throwing.
+    const KIND_META = {
+      problem: { label: 'Problem', icon: ICON_WARNING },
+      question: { label: 'Question', icon: ICON_QUESTION },
+    }
+    const STATUS_META = {
+      open: { label: 'Needs attention', cls: 'status-open', icon: ICON_WARNING },
+      reopened: { label: 'Reopened', cls: 'status-reopened', icon: ICON_UNDO },
+      awaiting_confirmation: { label: 'Awaiting confirmation', cls: 'status-awaiting', icon: ICON_SCHEDULE },
+      resolved: { label: 'Resolved', cls: 'status-resolved', icon: ICON_CHECK },
+    }
 
     // Cached so the elapsed-time ticker (below) can re-render without
     // waiting for the next server-pushed `state:update` — "how long since
@@ -533,89 +738,154 @@
         render(lastState)
     }, 5000)
 
-    // Unresolved first (newest first within each group), so the instructor
-    // sees what still needs attention without scrolling past resolved
-    // history — resolved reports stay visible (dimmed), not hidden, so a
-    // dashboard reload still shows the session's full error history (plan
-    // 028 Step 3's verification: resolved state persists server-side, not
-    // just as client-side UI state).
+    // "Needs attention" = `open` + `reopened` — the confirm/reopen
+    // redesign's two non-final statuses that still require the instructor
+    // to actually do something (see `HelpRequestStatus`'s doc comment in
+    // session.ts). Replaces the old bare `!e.resolved` check, which would
+    // now wrongly count `awaiting_confirmation` reports too — those have
+    // already been actioned by the presenter and are just waiting on the
+    // participant's confirmation, not something to notice again yet.
+    const NEEDS_ATTENTION = new Set(['open', 'reopened'])
+
+    // Sort order (extends the old two-bucket "unresolved first, resolved
+    // last" to the four-status machine): needs-attention (`open`,
+    // `reopened`) first, then `awaiting_confirmation`, then `resolved` last
+    // — so the instructor scrolls from "do something" to "already done",
+    // never the other way round. `open` and `reopened` share a rank (0)
+    // rather than one being strictly before the other — see `.error-card`'s
+    // CSS comment for why that pairing is deliberate.
+    const STATUS_RANK = { open: 0, reopened: 0, awaiting_confirmation: 1, resolved: 2 }
+
+    // Within a rank, ordered by *most recently active* rather than by
+    // original submission time — a report someone just replied on (thread
+    // has a fresh `ts`) is more useful to see near the top than a report
+    // that's been sitting quietly since early in the session, even if the
+    // quiet one's original `ts` is numerically later. Falls back to the
+    // original submission `ts` for a report with an empty thread (nothing
+    // has happened since it was filed).
+    function lastActivity(e) {
+      return e.thread.length > 0 ? e.thread[e.thread.length - 1].ts : e.ts
+    }
+
     function renderErrors(errors) {
-      const openCount = errors.filter(e => !e.resolved).length
-      document.getElementById('count-errors').textContent = openCount
+      document.getElementById('count-errors').textContent = errors.filter(e => NEEDS_ATTENTION.has(e.status)).length
 
       // `renderErrors` re-runs on *every* `state:update` — including ones
       // caused by an unrelated participant clicking Copy/Done elsewhere —
       // plus every 5s from the elapsed-time ticker. A full `innerHTML` wipe
       // would both erase whatever the instructor is mid-typing into a
-      // reply-message box *and* steal keyboard focus out of it (a brand new
-      // `<input>` element replaces the old one). Save each open input's
-      // value, and separately remember which one (if any) was actually
-      // focused plus its caret position, so both the text and the ability
-      // to keep typing survive the rebuild below.
+      // composer box *and* steal keyboard focus out of it (a brand new
+      // `<textarea>` element replaces the old one). Save each open
+      // textarea's value, and separately remember which one (if any) was
+      // actually focused plus its caret position, so both the text and the
+      // ability to keep typing survive the rebuild below.
+      //
+      // One shared `.composer-input` per card (feeding both the "Send" and
+      // "Send & mark resolved" buttons) rather than two separate fields —
+      // the pre-redesign version of this file only ever had one input to
+      // track per card, and going to *two* possible statuses-with-inputs
+      // would have meant this preservation logic tracking "which of up to
+      // two inputs on this card, if either, was focused", doubling its
+      // surface for a benefit (staging two different messages at once)
+      // nobody asked for. The tradeoff: the instructor can't compose a
+      // different "just replying" message from a "replying and resolving"
+      // one in the same pass — acceptable, since conceptually there's one
+      // thing being said either way, and the two buttons are just "say it"
+      // vs. "say it and also resolve".
       const draftMessages = {}
-      for (const input of errorFeedEl.querySelectorAll('.resolve-message'))
+      for (const input of errorFeedEl.querySelectorAll('.composer-input'))
         draftMessages[input.dataset.errorId] = input.value
       const focused = document.activeElement
-      const focusedErrorId = focused?.classList?.contains('resolve-message') ? focused.dataset.errorId : undefined
+      const focusedErrorId = focused?.classList?.contains('composer-input') ? focused.dataset.errorId : undefined
       const focusedSelection = focusedErrorId ? [focused.selectionStart, focused.selectionEnd] : undefined
 
       errorFeedEl.innerHTML = ''
       errorsEmptyEl.hidden = errors.length > 0
 
       const sorted = [...errors].sort((a, b) => {
-        if (a.resolved !== b.resolved)
-          return a.resolved ? 1 : -1
-        return b.ts - a.ts
+        const rankDiff = STATUS_RANK[a.status] - STATUS_RANK[b.status]
+        return rankDiff !== 0 ? rankDiff : lastActivity(b) - lastActivity(a)
       })
 
       for (const e of sorted) {
         const card = document.createElement('div')
-        card.className = `error-card${e.resolved ? ' resolved' : ''}`
+        // `.awaiting`/`.resolved` are the only two statuses that override
+        // the card's default (red, "needs attention") left-border color —
+        // see their own CSS comments.
+        const cardStateClass = e.status === 'resolved' ? ' resolved' : e.status === 'awaiting_confirmation' ? ' awaiting' : ''
+        card.className = `error-card${cardStateClass}`
 
         const thumb = e.screenshotUrl
           ? `<img class="error-thumb" src="${escapeHtml(e.screenshotUrl)}" alt="screenshot from ${escapeHtml(e.participantName)}" data-full="${escapeHtml(e.screenshotUrl)}" />`
           : ''
 
-        // "Mark resolved" (feature follow-up): sends an optional reply back
-        // to *this specific participant only* (`server.ts`'s
-        // `presenter:resolveError` handler) so resolving an error doesn't
-        // feel like a report vanishing into a queue — the participant sees
-        // the instructor actually responded.
-        const actions = e.resolved
-          ? `<span class="resolved-label">${ICON_CHECK}<span>Resolved${e.resolutionMessage ? `<span class="resolved-message">“${escapeHtml(e.resolutionMessage)}”</span>` : ''}</span></span>`
-          : `
-            <input
-              type="text"
-              class="resolve-message"
-              data-error-id="${escapeHtml(e.id)}"
-              placeholder="optional message back to them"
-              value="${escapeHtml(draftMessages[e.id] || '')}"
-            >
-            <button type="button" class="resolve-button" data-error-id="${escapeHtml(e.id)}">${ICON_SEND}<span>Mark resolved</span></button>
-          `
+        const kind = KIND_META[e.kind] ?? KIND_META.problem
+        const status = STATUS_META[e.status] ?? STATUS_META.open
 
-        const statusIcon = e.resolved
-          ? `<span class="error-status-icon resolved-icon">${ICON_CHECK}</span>`
-          : `<span class="error-status-icon open">${ICON_WARNING}</span>`
+        // The thread (`ErrorReport.thread`) is everything sent *after* the
+        // original submission above — never re-derived from it, just
+        // rendered in order. Per-message timestamps are deliberately
+        // omitted (the original submission's timestamp is still shown in
+        // `.error-meta` above) — a short back-and-forth reads fine without
+        // one, and adding one to every bubble was more clutter than the
+        // compact-chat-strip goal called for.
+        const threadHtml = e.thread.length === 0
+          ? ''
+          : `<div class="thread">${e.thread.map(m => `
+              <div class="thread-msg thread-msg-${m.from}">
+                <span class="thread-msg-label">${m.from === 'presenter' ? 'You' : escapeHtml(e.participantName)}:</span>
+                <span class="thread-msg-text">${escapeHtml(m.text)}</span>
+              </div>
+            `).join('')}</div>`
+
+        // No composer at all once `resolved` — that's the final state, and
+        // the read-only dimmed thread history above is all there is left to
+        // show (mirrors the pre-redesign file's "resolved cards have no
+        // input" treatment). `awaiting_confirmation` keeps the shared
+        // textarea and the plain "Send" button (a nudge/follow-up is still
+        // useful while waiting) but drops the resolve button — there's
+        // nothing left to "mark resolved": the presenter already did, and
+        // the ball is in the participant's court — replacing it with a
+        // small note so that absence reads as "waiting", not as a bug.
+        const composer = e.status === 'resolved'
+          ? ''
+          : `
+            <div class="composer">
+              <textarea
+                class="composer-input"
+                data-error-id="${escapeHtml(e.id)}"
+                rows="1"
+                placeholder="${e.kind === 'question' ? 'Answer their question…' : 'Reply…'}"
+              >${escapeHtml(draftMessages[e.id] || '')}</textarea>
+              <div class="composer-actions">
+                ${e.status === 'awaiting_confirmation'
+                  ? `<span class="awaiting-note">Waiting on ${escapeHtml(e.participantName)} to confirm…</span>`
+                  : `<button type="button" class="resolve-button" data-action="resolve" data-error-id="${escapeHtml(e.id)}">${ICON_CHECK}<span>Send &amp; mark resolved</span></button>`}
+                <button type="button" class="send-button" data-action="send" data-error-id="${escapeHtml(e.id)}">${ICON_SEND}<span>Send</span></button>
+              </div>
+            </div>
+          `
 
         card.innerHTML = `
           ${thumb}
           <div class="error-body">
             <div class="error-meta">
-              ${statusIcon}
+              <span class="kind-tag">${kind.icon}<span>${kind.label}</span></span>
+              <span class="status-chip ${status.cls}">${status.icon}<span>${status.label}</span></span>
               <span class="name">${escapeHtml(e.participantName)}</span>
               <span>step: ${escapeHtml(e.stepId)}</span>
               <span>${new Date(e.ts).toLocaleTimeString()}</span>
             </div>
             ${e.text ? `<p class="error-text">${escapeHtml(e.text)}</p>` : ''}
+            ${threadHtml}
+            ${composer}
           </div>
-          <div class="error-actions">${actions}</div>
         `
         errorFeedEl.appendChild(card)
       }
 
       if (focusedErrorId) {
-        const restored = errorFeedEl.querySelector(`.resolve-message[data-error-id="${CSS.escape(focusedErrorId)}"]`)
+        const restored = errorFeedEl.querySelector(`.composer-input[data-error-id="${CSS.escape(focusedErrorId)}"]`)
         if (restored) {
           restored.focus()
           restored.setSelectionRange(...focusedSelection)
@@ -629,13 +899,46 @@
         openLightbox(thumb.dataset.full)
         return
       }
-      const button = event.target.closest('.resolve-button')
-      if (button) {
-        const errorId = button.dataset.errorId
-        const messageInput = errorFeedEl.querySelector(`.resolve-message[data-error-id="${CSS.escape(errorId)}"]`)
+
+      // Both card actions share one shared `.composer-input` per card (see
+      // its doc comment in `renderErrors`) — `data-action` on the button
+      // clicked is what tells them apart, not which input was used.
+      const button = event.target.closest('button[data-action]')
+      if (!button)
+        return
+      const errorId = button.dataset.errorId
+      const input = errorFeedEl.querySelector(`.composer-input[data-error-id="${CSS.escape(errorId)}"]`)
+      const text = input?.value.trim() || ''
+
+      if (button.dataset.action === 'resolve') {
+        // "Send & mark resolved": `message` stays optional here, same as
+        // the pre-redesign "optional message" input — `resolveErrorReport`
+        // (session.ts) treats a blank one as nothing to append, it doesn't
+        // require one. Clear the box the same way the plain "Send" branch
+        // below does — the card survives this action (it moves to
+        // `awaiting_confirmation`, which still has a composer), so without
+        // this the just-sent text would sit there looking like an unsent
+        // draft once `draftMessages` repopulates it on the next render.
         button.disabled = true
-        socket.emit('presenter:resolveError', { errorId, presenterCode, message: messageInput?.value || undefined })
+        if (input)
+          input.value = ''
+        socket.emit('presenter:resolveError', { errorId, presenterCode, message: text || undefined })
+        return
       }
+
+      // Plain "Send": `addPresenterMessage` (session.ts) silently no-ops on
+      // a blank/whitespace-only message, so skip emitting one at all rather
+      // than firing an event that provably can't change anything. Clearing
+      // the textarea here (rather than waiting on the next `state:update`)
+      // is what makes the box read as "sent" immediately — the next
+      // `renderErrors` pass would otherwise re-populate it from
+      // `draftMessages` with the very text that was just sent.
+      if (!text)
+        return
+      button.disabled = true
+      if (input)
+        input.value = ''
+      socket.emit('presenter:sendMessage', { errorId, presenterCode, text })
     })
 
     function openLightbox(src) {

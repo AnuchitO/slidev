@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   addErrorReport,
+  addParticipantMessage,
+  addPresenterMessage,
+  confirmResolution,
   errorReports,
   joinParticipant,
   listErrorReports,
@@ -183,59 +186,124 @@ describe('error report store (M3)', () => {
     resetSessionStateForTests()
   })
 
-  it('addErrorReport pushes a new report, defaulting resolved to false', () => {
+  it('addErrorReport pushes a new report, defaulting status to open and thread to empty', () => {
     const report = addErrorReport({
       id: 'err-1',
       participantId: 'p1',
       participantName: 'Ada',
       stepId: 'install-deps',
+      kind: 'problem',
       text: 'npm install blew up',
       ts: 123,
     })
 
-    expect(report.resolved).toBe(false)
+    expect(report.status).toBe('open')
+    expect(report.thread).toEqual([])
     expect(errorReports).toContainEqual(report)
     expect(listErrorReports()).toEqual([report])
   })
 
-  it('resolveErrorReport marks a matching report resolved and returns it', () => {
-    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', ts: 1 })
+  it('resolveErrorReport moves a matching report to awaiting_confirmation and returns it', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
 
     const result = resolveErrorReport('err-1')
 
-    expect(result?.resolved).toBe(true)
+    expect(result?.status).toBe('awaiting_confirmation')
     expect(result?.id).toBe('err-1')
-    expect(listErrorReports()[0].resolved).toBe(true)
+    expect(listErrorReports()[0].status).toBe('awaiting_confirmation')
   })
 
   it('resolveErrorReport returns undefined for an unknown id and mutates nothing', () => {
-    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', ts: 1 })
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
 
     const result = resolveErrorReport('does-not-exist')
 
     expect(result).toBeUndefined()
-    expect(listErrorReports()[0].resolved).toBe(false)
+    expect(listErrorReports()[0].status).toBe('open')
   })
 
-  it('resolveErrorReport with a message trims it and stores it as resolutionMessage', () => {
-    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', ts: 1 })
+  it('resolveErrorReport with a message trims it and appends it as a presenter thread message', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
 
     const result = resolveErrorReport('err-1', '  keep going, you\'ve got this  ')
 
-    expect(result?.resolutionMessage).toBe('keep going, you\'ve got this')
-    expect(listErrorReports()[0].resolutionMessage).toBe('keep going, you\'ve got this')
+    expect(result?.thread).toEqual([{ from: 'presenter', text: 'keep going, you\'ve got this', ts: expect.any(Number) }])
+    expect(listErrorReports()[0].thread).toEqual(result?.thread)
   })
 
-  it('resolveErrorReport with no message (or a blank one) leaves resolutionMessage unset', () => {
-    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', ts: 1 })
+  it('resolveErrorReport with no message (or a blank one) leaves the thread empty', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
 
     resolveErrorReport('err-1', '   ')
 
-    expect(listErrorReports()[0].resolutionMessage).toBeUndefined()
+    expect(listErrorReports()[0].thread).toEqual([])
+  })
+
+  it('addPresenterMessage appends a thread message without changing status', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+
+    const result = addPresenterMessage('err-1', 'still looking into it')
+
+    expect(result?.status).toBe('open')
+    expect(result?.thread).toEqual([{ from: 'presenter', text: 'still looking into it', ts: expect.any(Number) }])
+  })
+
+  it('addPresenterMessage with a blank message is a no-op', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+
+    const result = addPresenterMessage('err-1', '   ')
+
+    expect(result).toBeUndefined()
+    expect(listErrorReports()[0].thread).toEqual([])
+  })
+
+  it('addParticipantMessage appends a thread message without changing status', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'question', ts: 1 })
+
+    const result = addParticipantMessage('err-1', 'any update?')
+
+    expect(result?.status).toBe('open')
+    expect(result?.thread).toEqual([{ from: 'participant', text: 'any update?', ts: expect.any(Number) }])
+  })
+
+  it('confirmResolution(true) moves a report to resolved and can append a participant message', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+    resolveErrorReport('err-1', 'try this fix')
+
+    const result = confirmResolution('err-1', true, 'yep, that did it!')
+
+    expect(result?.status).toBe('resolved')
+    expect(result?.thread).toEqual([
+      { from: 'presenter', text: 'try this fix', ts: expect.any(Number) },
+      { from: 'participant', text: 'yep, that did it!', ts: expect.any(Number) },
+    ])
+  })
+
+  it('confirmResolution(false) moves a report to reopened and can append a participant message', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+    resolveErrorReport('err-1', 'try this fix')
+
+    const result = confirmResolution('err-1', false, 'still broken, same error')
+
+    expect(result?.status).toBe('reopened')
+    expect(result?.thread.at(-1)).toEqual({ from: 'participant', text: 'still broken, same error', ts: expect.any(Number) })
+  })
+
+  it('confirmResolution with no message still transitions status, appending nothing', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+
+    const result = confirmResolution('err-1', true)
+
+    expect(result?.status).toBe('resolved')
+    expect(result?.thread).toEqual([])
+  })
+
+  it('confirmResolution returns undefined for an unknown id', () => {
+    expect(confirmResolution('does-not-exist', true)).toBeUndefined()
   })
 
   it('resetSessionStateForTests clears accumulated error reports', () => {
-    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', ts: 1 })
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
 
     resetSessionStateForTests()
 

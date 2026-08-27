@@ -28,7 +28,7 @@ describe('isSafeUploadFilename', () => {
 })
 
 describe('resolveUploadPath', () => {
-  const uploadsDir = '/tmp/muan-companion-uploads-example'
+  const uploadsDir = '/tmp/slidev-muan-companion-uploads-example'
 
   it('resolves a safe filename to a path inside the uploads dir', () => {
     const resolved = resolveUploadPath(uploadsDir, '4b2f9c3a-1e6d-4a8b-9f2a-0c1d2e3f4a5b.png')

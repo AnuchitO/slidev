@@ -194,17 +194,17 @@ function joinAsSomeoneElse() {
 </script>
 
 <template>
-  <div v-if="!isPresenter && !joined" class="muan-companion-join-screen">
-    <div v-if="resuming" class="muan-companion-join-card muan-companion-resuming">
-      <p class="muan-companion-join-hint">
+  <div v-if="!isPresenter && !joined" class="slidev-muan-companion-join-screen">
+    <div v-if="resuming" class="slidev-muan-companion-join-card slidev-muan-companion-resuming">
+      <p class="slidev-muan-companion-join-hint">
         Resuming your session…
       </p>
     </div>
-    <form v-else class="muan-companion-join-card" @submit.prevent="onSubmit">
-      <h1 class="muan-companion-join-title">
+    <form v-else class="slidev-muan-companion-join-card" @submit.prevent="onSubmit">
+      <h1 class="slidev-muan-companion-join-title">
         Join the workshop
       </h1>
-      <p class="muan-companion-join-hint">
+      <p class="slidev-muan-companion-join-hint">
         Enter your name so the instructor can see your progress.
       </p>
       <input
@@ -214,7 +214,7 @@ function joinAsSomeoneElse() {
         autofocus
         autocomplete="off"
         :disabled="submitting"
-        class="muan-companion-join-input"
+        class="slidev-muan-companion-join-input"
       >
       <input
         v-model="roomCode"
@@ -222,12 +222,12 @@ function joinAsSomeoneElse() {
         placeholder="Room code"
         autocomplete="off"
         :disabled="submitting"
-        class="muan-companion-join-input"
+        class="slidev-muan-companion-join-input"
       >
-      <p v-if="joinError" class="muan-companion-join-error">
+      <p v-if="joinError" class="slidev-muan-companion-join-error">
         {{ joinError }}
       </p>
-      <button type="submit" class="muan-companion-join-button" :disabled="submitting || !name.trim() || !roomCode.trim()">
+      <button type="submit" class="slidev-muan-companion-join-button" :disabled="submitting || !name.trim() || !roomCode.trim()">
         {{ submitting ? 'Joining…' : 'Join' }}
       </button>
     </form>
@@ -235,7 +235,7 @@ function joinAsSomeoneElse() {
   <button
     v-if="!isPresenter && joined && resumedKnownIdentity"
     type="button"
-    class="muan-companion-not-you"
+    class="slidev-muan-companion-not-you"
     @click="joinAsSomeoneElse"
   >
     Not you? Join as someone else
@@ -243,7 +243,7 @@ function joinAsSomeoneElse() {
 </template>
 
 <style scoped>
-.muan-companion-join-screen {
+.slidev-muan-companion-join-screen {
   position: fixed;
   inset: 0;
   z-index: 1000;
@@ -253,7 +253,7 @@ function joinAsSomeoneElse() {
   background: rgba(10, 10, 14, 0.75);
   backdrop-filter: blur(3px);
 }
-.muan-companion-join-card {
+.slidev-muan-companion-join-card {
   display: flex;
   flex-direction: column;
   gap: 0.75em;
@@ -264,21 +264,21 @@ function joinAsSomeoneElse() {
   color: #f0f0f2;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
-.muan-companion-join-title {
+.slidev-muan-companion-join-title {
   margin: 0;
   font-size: 1.15em;
 }
-.muan-companion-join-hint {
+.slidev-muan-companion-join-hint {
   margin: 0;
   font-size: 0.85em;
   opacity: 0.75;
 }
-.muan-companion-join-error {
+.slidev-muan-companion-join-error {
   margin: 0;
   font-size: 0.85em;
   color: #e35d5d;
 }
-.muan-companion-join-input {
+.slidev-muan-companion-join-input {
   padding: 0.5em 0.75em;
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.2);
@@ -286,7 +286,7 @@ function joinAsSomeoneElse() {
   color: inherit;
   font-size: 1em;
 }
-.muan-companion-join-button {
+.slidev-muan-companion-join-button {
   padding: 0.5em 0.75em;
   border-radius: 6px;
   border: none;
@@ -295,7 +295,7 @@ function joinAsSomeoneElse() {
   font-weight: 600;
   cursor: pointer;
 }
-.muan-companion-join-button:disabled {
+.slidev-muan-companion-join-button:disabled {
   opacity: 0.6;
   cursor: default;
 }
@@ -306,7 +306,7 @@ function joinAsSomeoneElse() {
  * draw attention away from the deck for the (much more common) same-person
  * resume it's an escape hatch from.
  */
-.muan-companion-not-you {
+.slidev-muan-companion-not-you {
   position: fixed;
   left: 16px;
   bottom: 16px;
@@ -321,7 +321,7 @@ function joinAsSomeoneElse() {
   cursor: pointer;
   transition: opacity 0.15s ease;
 }
-.muan-companion-not-you:hover {
+.slidev-muan-companion-not-you:hover {
   opacity: 1;
 }
 </style>

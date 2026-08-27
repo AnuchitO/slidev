@@ -35,7 +35,7 @@ import { onBeforeUnmount, onMounted } from 'vue'
 import { getWorkshopSocket } from '../src/client'
 import { resolveStepId } from '../src/stepId'
 
-// Kept in sync with `packages/muan-companion-server/src/presence.ts`'s
+// Kept in sync with `packages/slidev-muan-companion-server/src/presence.ts`'s
 // `HEARTBEAT_INTERVAL_MS` (5s) — see this file's own header comment on why
 // it can't just import that server-side module directly.
 const HEARTBEAT_INTERVAL_MS = 5_000

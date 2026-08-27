@@ -182,7 +182,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
   // persistence requirement" (§4 non-goals) without needing an explicit
   // cleanup job, and gives every test run (each of which creates its own
   // server) an isolated directory rather than sharing one across runs.
-  const uploadsDir = mkdtempSync(join(tmpdir(), 'muan-companion-uploads-'))
+  const uploadsDir = mkdtempSync(join(tmpdir(), 'slidev-muan-companion-uploads-'))
 
   // `GET /uploads/:filename` — served by the same `sirv` used for the
   // dashboard, from the confined `uploadsDir` above. `resolveUploadPath`
@@ -315,18 +315,18 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         // an error).
         if (outcome === 'resumed') {
           // eslint-disable-next-line no-console -- deliberate operator-facing log, not app logging.
-          console.log(`[muan-companion-server] participant resumed: ${participant.name} (${participant.id})`)
+          console.log(`[slidev-muan-companion-server] participant resumed: ${participant.name} (${participant.id})`)
         }
         else if (outcome === 'resume-fallback') {
           console.warn(
-            `[muan-companion-server] resume failed for unknown participantId "${participantId}" `
+            `[slidev-muan-companion-server] resume failed for unknown participantId "${participantId}" `
             + `(server restarted, or a stale id from a different session) — `
             + `falling back to a fresh join as ${participant.name} (${participant.id})`,
           )
         }
         else {
           // eslint-disable-next-line no-console -- deliberate operator-facing log, not app logging.
-          console.log(`[muan-companion-server] participant joined: ${participant.name} (${participant.id})`)
+          console.log(`[slidev-muan-companion-server] participant joined: ${participant.name} (${participant.id})`)
         }
         socket.data.participantId = participant.id
         ack?.({ participantId: participant.id, currentSlideIndex: session.currentSlideIndex, resumed: outcome === 'resumed' })

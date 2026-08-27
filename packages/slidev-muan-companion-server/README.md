@@ -1,4 +1,4 @@
-# muan-companion-server
+# slidev-muan-companion-server
 
 Realtime sync server for [`slidev-addon-muan-companion`](../addon-muan-companion).
 Currently implements **M1 (slide sync), M2 (participant identity + step
@@ -20,16 +20,16 @@ duration of a workshop.
 ## Usage
 
 ```bash
-MUAN_COMPANION_ROOM_CODE=<pick-one> MUAN_COMPANION_PRESENTER_CODE=<pick-another> \
-  pnpm --filter muan-companion-server dev
+SLIDEV_MUAN_COMPANION_ROOM_CODE=<pick-one> SLIDEV_MUAN_COMPANION_PRESENTER_CODE=<pick-another> \
+  pnpm --filter slidev-muan-companion-server dev
 ```
 
 Starts an HTTP + Socket.io server listening on `:3710` (override with the
-`PORT` env var). `MUAN_COMPANION_ORIGIN` sets the CORS origin allowed to
+`PORT` env var). `SLIDEV_MUAN_COMPANION_ORIGIN` sets the CORS origin allowed to
 connect (defaults to `*`). The instructor dashboard is served by the same
 process at `/dashboard` (see "Dashboard" below).
 
-`MUAN_COMPANION_ROOM_CODE` and `MUAN_COMPANION_PRESENTER_CODE` (see "Auth" below) — if
+`SLIDEV_MUAN_COMPANION_ROOM_CODE` and `SLIDEV_MUAN_COMPANION_PRESENTER_CODE` (see "Auth" below) — if
 either is unset, the server still starts (so `pnpm build`/CI don't need
 secrets configured) but logs a startup warning and **rejects every
 `participant:join`, `presenter:*` event, and dashboard connection** until
@@ -40,7 +40,7 @@ both are set. Fail closed, not open.
 Two separate, operator-chosen secrets, checked with a constant-time compare
 (`src/auth.ts`) so a wrong guess doesn't leak timing information:
 
-- **`MUAN_COMPANION_ROOM_CODE`** — low-privilege. Required in `participant:join
+- **`SLIDEV_MUAN_COMPANION_ROOM_CODE`** — low-privilege. Required in `participant:join
 { name, roomCode }` for a **fresh** join or a resume attempt whose
   `participantId` the server doesn't currently recognize; a wrong/missing
   code is rejected via the join ack (`{ error: 'invalid_room_code' }`, no
@@ -50,7 +50,7 @@ Two separate, operator-chosen secrets, checked with a constant-time compare
   room code no longer needs to be stored client-side" below) — the room code
   provides no real protection there on top of the id itself, so requiring it
   only forced the addon to persist it indefinitely for no benefit.
-- **`MUAN_COMPANION_PRESENTER_CODE`** — high-privilege. Required, as
+- **`SLIDEV_MUAN_COMPANION_PRESENTER_CODE`** — high-privilege. Required, as
   `presenterCode`, in every `presenter:setSlide`/`presenter:setStep` payload
   and in `dashboard:join { presenterCode }`. **Deliberately never derivable
   from the room code** — a participant who knows the room code still cannot
@@ -299,7 +299,7 @@ together).
 ## Testing
 
 ```bash
-pnpm --filter muan-companion-server test
+pnpm --filter slidev-muan-companion-server test
 ```
 
 `src/server.test.ts` spins up real `socket.io-client` pairs (connected over

@@ -13,7 +13,7 @@ let socket: Socket | undefined
  * reads the env var rather than each call site re-deriving it.
  */
 export function getMuanCompanionServerUrl(): string {
-  return import.meta.env.VITE_MUAN_COMPANION_SERVER_URL ?? 'http://localhost:3710'
+  return import.meta.env.VITE_SLIDEV_MUAN_COMPANION_SERVER_URL ?? 'http://localhost:3710'
 }
 
 /**

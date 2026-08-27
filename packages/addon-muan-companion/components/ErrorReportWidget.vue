@@ -40,7 +40,7 @@ Theme: reacts live to Slidev's own dark/light signal (`useDarkMode()` from
 `@slidev/client`, the same composable the deck's own toggle drives) via a
 `wt-theme-light` modifier class carrying a light token override — a small
 lift since the signal is already exported for exactly this kind of
-consumption. The dashboard side of this redesign (`muan-companion-server/
+consumption. The dashboard side of this redesign (`slidev-muan-companion-server/
 public/dashboard/index.html`) intentionally stays dark-only: it's a
 separate standalone page the instructor opens directly, not embedded in
 the deck, so there's no equivalent theme signal to react to there.
@@ -214,36 +214,36 @@ onBeforeUnmount(() => {
   <Transition name="wt-snackbar">
     <div
       v-if="!isPresenter && resolutionNotice"
-      class="muan-companion-resolution-toast"
+      class="slidev-muan-companion-resolution-toast"
       :class="{ 'wt-theme-light': !isDark }"
       role="status"
     >
       <svg class="wt-icon wt-icon-success" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" /></svg>
-      <div class="muan-companion-resolution-body">
-        <p class="muan-companion-resolution-title">
+      <div class="slidev-muan-companion-resolution-body">
+        <p class="slidev-muan-companion-resolution-title">
           The instructor marked your report resolved
         </p>
-        <p v-if="resolutionNotice.message" class="muan-companion-resolution-message">
+        <p v-if="resolutionNotice.message" class="slidev-muan-companion-resolution-message">
           “{{ resolutionNotice.message }}”
         </p>
       </div>
-      <button type="button" class="muan-companion-icon-button" aria-label="Dismiss" @click="dismissResolutionNotice">
+      <button type="button" class="slidev-muan-companion-icon-button" aria-label="Dismiss" @click="dismissResolutionNotice">
         <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
       </button>
     </div>
   </Transition>
 
-  <div v-if="!isPresenter" class="muan-companion-error-widget" :class="{ 'wt-theme-light': !isDark }">
-    <div v-if="open" class="muan-companion-error-panel">
-      <div class="muan-companion-error-panel-header">
+  <div v-if="!isPresenter" class="slidev-muan-companion-error-widget" :class="{ 'wt-theme-light': !isDark }">
+    <div v-if="open" class="slidev-muan-companion-error-panel">
+      <div class="slidev-muan-companion-error-panel-header">
         <svg class="wt-icon wt-icon-warning" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z" /></svg>
-        <span class="muan-companion-error-panel-title">Report a problem</span>
-        <button type="button" class="muan-companion-icon-button" aria-label="Close" @click="toggleOpen">
+        <span class="slidev-muan-companion-error-panel-title">Report a problem</span>
+        <button type="button" class="slidev-muan-companion-icon-button" aria-label="Close" @click="toggleOpen">
           <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
         </button>
       </div>
 
-      <p v-if="submitted" class="muan-companion-error-status">
+      <p v-if="submitted" class="slidev-muan-companion-error-status">
         <svg class="wt-icon wt-icon-success" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" /></svg>
         <span>Sent — thanks! The instructor can see this now.</span>
       </p>
@@ -251,37 +251,37 @@ onBeforeUnmount(() => {
       <template v-else>
         <textarea
           v-model="text"
-          class="muan-companion-error-textarea"
+          class="slidev-muan-companion-error-textarea"
           placeholder="What went wrong? (optional if you attach a screenshot)"
           rows="3"
         />
 
-        <div v-if="canCapture" class="muan-companion-error-capture">
+        <div v-if="canCapture" class="slidev-muan-companion-error-capture">
           <button
             type="button"
-            class="muan-companion-error-button muan-companion-error-button-outlined"
+            class="slidev-muan-companion-error-button slidev-muan-companion-error-button-outlined"
             :disabled="capturing"
             @click="captureScreen"
           >
             <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 2 7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z" /></svg>
             <span>{{ capturing ? 'Capturing…' : capturedBlob ? 'Retake screenshot' : 'Capture screen' }}</span>
           </button>
-          <span v-if="capturedBlob" class="muan-companion-error-chip">
+          <span v-if="capturedBlob" class="slidev-muan-companion-error-chip">
             <svg class="wt-icon wt-icon-success" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" /></svg>
             Screenshot attached
-            <button type="button" class="muan-companion-error-chip-remove" aria-label="Remove screenshot" @click="clearCapture">
+            <button type="button" class="slidev-muan-companion-error-chip-remove" aria-label="Remove screenshot" @click="clearCapture">
               <svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
             </button>
           </span>
         </div>
 
-        <p v-if="errorMessage" class="muan-companion-error-message">
+        <p v-if="errorMessage" class="slidev-muan-companion-error-message">
           {{ errorMessage }}
         </p>
 
         <button
           type="button"
-          class="muan-companion-error-button muan-companion-error-submit"
+          class="slidev-muan-companion-error-button slidev-muan-companion-error-submit"
           :disabled="submitting || (!text.trim() && !capturedBlob)"
           @click="submit"
         >
@@ -293,8 +293,8 @@ onBeforeUnmount(() => {
 
     <button
       type="button"
-      class="muan-companion-error-toggle"
-      :class="{ 'muan-companion-error-toggle-open': open }"
+      class="slidev-muan-companion-error-toggle"
+      :class="{ 'slidev-muan-companion-error-toggle-open': open }"
       :aria-expanded="open"
       :aria-label="open ? 'Close report a problem' : 'Report a problem'"
       @click="toggleOpen"
@@ -312,15 +312,15 @@ onBeforeUnmount(() => {
 /*
  * Design tokens (Material-inspired, "Google style" per direct participant
  * feedback): a small, deliberately-limited set applied identically here and
- * in the dashboard's error feed (`muan-companion-server/public/dashboard/
+ * in the dashboard's error feed (`slidev-muan-companion-server/public/dashboard/
  * index.html`) even though the two can't share a stylesheet — same radius
  * scale, same elevation shadows, same semantic color roles, same type
  * stack, kept in sync by eye. Dark values are the defaults (this widget's
  * historical/only look); `.wt-theme-light` overrides them when
  * `useDarkMode()` reports the deck is in light mode.
  */
-.muan-companion-error-widget,
-.muan-companion-resolution-toast {
+.slidev-muan-companion-error-widget,
+.slidev-muan-companion-resolution-toast {
   --wt-color-primary: #8ab4f8;
   --wt-color-on-primary: #062e6f;
   --wt-color-error: #f28b82;
@@ -341,8 +341,8 @@ onBeforeUnmount(() => {
   --wt-font: 'Google Sans', Roboto, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
   font-family: var(--wt-font);
 }
-.muan-companion-error-widget.wt-theme-light,
-.muan-companion-resolution-toast.wt-theme-light {
+.slidev-muan-companion-error-widget.wt-theme-light,
+.slidev-muan-companion-resolution-toast.wt-theme-light {
   --wt-color-primary: #1a73e8;
   --wt-color-on-primary: #ffffff;
   --wt-color-error: #d93025;
@@ -370,7 +370,7 @@ onBeforeUnmount(() => {
   color: var(--wt-color-success);
 }
 
-.muan-companion-error-widget {
+.slidev-muan-companion-error-widget {
   position: fixed;
   right: 16px;
   bottom: 16px;
@@ -385,7 +385,7 @@ onBeforeUnmount(() => {
 /* Closed state: an extended FAB (icon + label, pill, elevated, filled with
    the primary color) — Material's standard affordance for a persistent,
    always-available primary action floating over content. */
-.muan-companion-error-toggle {
+.slidev-muan-companion-error-toggle {
   display: flex;
   align-items: center;
   gap: 0.5em;
@@ -402,26 +402,26 @@ onBeforeUnmount(() => {
     box-shadow 0.15s ease,
     transform 0.1s ease;
 }
-.muan-companion-error-toggle:hover {
+.slidev-muan-companion-error-toggle:hover {
   box-shadow:
     var(--wt-elevation-3),
     0 0 0 8px rgba(138, 180, 248, 0.12);
 }
-.muan-companion-error-toggle:active {
+.slidev-muan-companion-error-toggle:active {
   transform: scale(0.97);
 }
 /* Open state: collapses to a small icon-only circular FAB, since the panel
    above already carries the label — avoids two redundant "close" targets
    competing for attention. */
-.muan-companion-error-toggle-open {
+.slidev-muan-companion-error-toggle-open {
   padding: 0.65em;
   border-radius: 50%;
 }
-.muan-companion-error-toggle-open .wt-icon {
+.slidev-muan-companion-error-toggle-open .wt-icon {
   color: var(--wt-color-on-primary);
 }
 
-.muan-companion-error-panel {
+.slidev-muan-companion-error-panel {
   display: flex;
   flex-direction: column;
   gap: 0.75em;
@@ -432,12 +432,12 @@ onBeforeUnmount(() => {
   color: var(--wt-color-on-surface);
   box-shadow: var(--wt-elevation-3);
 }
-.muan-companion-error-panel-header {
+.slidev-muan-companion-error-panel-header {
   display: flex;
   align-items: center;
   gap: 0.5em;
 }
-.muan-companion-error-panel-title {
+.slidev-muan-companion-error-panel-title {
   flex: 1 1 auto;
   font-weight: 500;
   font-size: 1.05em;
@@ -446,7 +446,7 @@ onBeforeUnmount(() => {
 /* Small circular icon button, used for every "dismiss/close" affordance —
    a Material "icon button": no border, a faint state-layer on hover so it
    doesn't compete with the filled/outlined buttons below it. */
-.muan-companion-icon-button {
+.slidev-muan-companion-icon-button {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -461,13 +461,13 @@ onBeforeUnmount(() => {
   cursor: pointer;
   transition: background 0.15s ease;
 }
-.muan-companion-icon-button:hover {
+.slidev-muan-companion-icon-button:hover {
   background: rgba(128, 128, 128, 0.16);
   color: var(--wt-color-on-surface);
 }
 
 /* Outlined text field, Material's default for a multi-line input. */
-.muan-companion-error-textarea {
+.slidev-muan-companion-error-textarea {
   width: 100%;
   resize: vertical;
   padding: 0.65em 0.75em;
@@ -477,16 +477,16 @@ onBeforeUnmount(() => {
   color: inherit;
   font: inherit;
 }
-.muan-companion-error-textarea:focus {
+.slidev-muan-companion-error-textarea:focus {
   outline: none;
   border: 2px solid var(--wt-color-primary);
   padding: calc(0.65em - 1px) calc(0.75em - 1px);
 }
-.muan-companion-error-textarea::placeholder {
+.slidev-muan-companion-error-textarea::placeholder {
   color: var(--wt-color-on-surface-variant);
 }
 
-.muan-companion-error-capture {
+.slidev-muan-companion-error-capture {
   display: flex;
   align-items: center;
   gap: 0.5em;
@@ -495,7 +495,7 @@ onBeforeUnmount(() => {
 
 /* Input-chip pattern for "screenshot attached": a small pill summarizing
    an attachment, with its own trailing remove control. */
-.muan-companion-error-chip {
+.slidev-muan-companion-error-chip {
   display: inline-flex;
   align-items: center;
   gap: 0.35em;
@@ -505,7 +505,7 @@ onBeforeUnmount(() => {
   font-size: 0.85em;
   color: var(--wt-color-on-surface-variant);
 }
-.muan-companion-error-chip-remove {
+.slidev-muan-companion-error-chip-remove {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -519,10 +519,10 @@ onBeforeUnmount(() => {
   color: inherit;
   cursor: pointer;
 }
-.muan-companion-error-chip-remove:hover {
+.slidev-muan-companion-error-chip-remove:hover {
   background: rgba(128, 128, 128, 0.24);
 }
-.muan-companion-error-chip-remove .wt-icon {
+.slidev-muan-companion-error-chip-remove .wt-icon {
   width: 13px;
   height: 13px;
 }
@@ -530,7 +530,7 @@ onBeforeUnmount(() => {
 /* Two button treatments give the panel a clear action hierarchy: the
    secondary action (capture) is outlined, the primary action (send) is
    filled with the primary color — standard Material button hierarchy. */
-.muan-companion-error-button {
+.slidev-muan-companion-error-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -546,29 +546,29 @@ onBeforeUnmount(() => {
     background 0.15s ease,
     box-shadow 0.15s ease;
 }
-.muan-companion-error-button-outlined {
+.slidev-muan-companion-error-button-outlined {
   background: transparent;
   color: var(--wt-color-on-surface);
   border: 1px solid var(--wt-color-outline);
 }
-.muan-companion-error-button-outlined:hover:not(:disabled) {
+.slidev-muan-companion-error-button-outlined:hover:not(:disabled) {
   background: rgba(128, 128, 128, 0.12);
 }
-.muan-companion-error-button:disabled {
+.slidev-muan-companion-error-button:disabled {
   cursor: default;
   opacity: 0.38;
 }
-.muan-companion-error-submit {
+.slidev-muan-companion-error-submit {
   width: 100%;
   background: var(--wt-color-primary);
   color: var(--wt-color-on-primary);
   box-shadow: var(--wt-elevation-2);
 }
-.muan-companion-error-submit:hover:not(:disabled) {
+.slidev-muan-companion-error-submit:hover:not(:disabled) {
   box-shadow: var(--wt-elevation-3);
 }
 
-.muan-companion-error-message {
+.slidev-muan-companion-error-message {
   display: flex;
   align-items: flex-start;
   gap: 0.4em;
@@ -576,7 +576,7 @@ onBeforeUnmount(() => {
   font-size: 0.85em;
   color: var(--wt-color-error);
 }
-.muan-companion-error-status {
+.slidev-muan-companion-error-status {
   display: flex;
   align-items: center;
   gap: 0.5em;
@@ -594,7 +594,7 @@ onBeforeUnmount(() => {
  * transient message visually pops against the page instead of blending
  * into it, which a same-color card can't do.
  */
-.muan-companion-resolution-toast {
+.slidev-muan-companion-resolution-toast {
   position: fixed;
   left: 16px;
   bottom: 16px;
@@ -610,24 +610,24 @@ onBeforeUnmount(() => {
   box-shadow: var(--wt-elevation-3);
   font-size: 14px;
 }
-.muan-companion-resolution-toast .muan-companion-icon-button {
+.slidev-muan-companion-resolution-toast .slidev-muan-companion-icon-button {
   color: var(--wt-color-inverse-on-surface);
   opacity: 0.75;
 }
-.muan-companion-resolution-toast .muan-companion-icon-button:hover {
+.slidev-muan-companion-resolution-toast .slidev-muan-companion-icon-button:hover {
   opacity: 1;
   background: rgba(128, 128, 128, 0.24);
 }
-.muan-companion-resolution-body {
+.slidev-muan-companion-resolution-body {
   flex: 1 1 auto;
   min-width: 0;
   padding-top: 0.1em;
 }
-.muan-companion-resolution-title {
+.slidev-muan-companion-resolution-title {
   margin: 0;
   font-weight: 500;
 }
-.muan-companion-resolution-message {
+.slidev-muan-companion-resolution-message {
   margin: 0.3em 0 0;
   opacity: 0.8;
   white-space: pre-wrap;
@@ -647,7 +647,7 @@ onBeforeUnmount(() => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .muan-companion-error-toggle,
+  .slidev-muan-companion-error-toggle,
   .wt-snackbar-enter-active,
   .wt-snackbar-leave-active {
     transition: none;

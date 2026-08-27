@@ -1,6 +1,6 @@
 import { defineConfig } from 'vitest/config'
 
-// See packages/muan-companion-server/vitest.config.ts for why a local
+// See packages/slidev-muan-companion-server/vitest.config.ts for why a local
 // config is needed for `pnpm --filter ... test` to resolve correctly
 // against this package's cwd, rather than the repo-root config's
 // `test.projects` glob.

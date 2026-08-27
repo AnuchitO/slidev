@@ -1,5 +1,5 @@
 /**
- * Builds the multipart body for `POST /api/screenshot` (`muan-companion-server`'s
+ * Builds the multipart body for `POST /api/screenshot` (`slidev-muan-companion-server`'s
  * upload endpoint, plan 028 Step 1). Kept as a pure function — separate from
  * `ErrorReportWidget.vue`'s `fetch` call — so the request shape is
  * unit-testable without a running server, and so it's the single place that

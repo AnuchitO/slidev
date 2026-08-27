@@ -69,13 +69,13 @@ function onDone() {
 </script>
 
 <template>
-  <div class="muan-companion-step-command">
-    <code v-if="command" class="muan-companion-step-command-code">{{ command }}</code>
-    <div class="muan-companion-step-command-actions">
+  <div class="slidev-muan-companion-step-command">
+    <code v-if="command" class="slidev-muan-companion-step-command-code">{{ command }}</code>
+    <div class="slidev-muan-companion-step-command-actions">
       <button
         v-if="command"
         type="button"
-        class="muan-companion-step-command-button"
+        class="slidev-muan-companion-step-command-button"
         :disabled="status === 'pending-copy'"
         @click="onCopy"
       >
@@ -83,7 +83,7 @@ function onDone() {
       </button>
       <button
         type="button"
-        class="muan-companion-step-command-button muan-companion-step-command-button-done"
+        class="slidev-muan-companion-step-command-button slidev-muan-companion-step-command-button-done"
         :disabled="status === 'pending-done' || status === 'done'"
         @click="onDone"
       >
@@ -94,7 +94,7 @@ function onDone() {
 </template>
 
 <style scoped>
-.muan-companion-step-command {
+.slidev-muan-companion-step-command {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -104,18 +104,18 @@ function onDone() {
   border: 1px solid rgba(128, 128, 128, 0.3);
   border-radius: 8px;
 }
-.muan-companion-step-command-code {
+.slidev-muan-companion-step-command-code {
   flex: 1 1 auto;
   min-width: 0;
   overflow-x: auto;
   white-space: pre;
 }
-.muan-companion-step-command-actions {
+.slidev-muan-companion-step-command-actions {
   display: flex;
   gap: 0.5em;
   flex: 0 0 auto;
 }
-.muan-companion-step-command-button {
+.slidev-muan-companion-step-command-button {
   padding: 0.25em 0.75em;
   border-radius: 6px;
   border: 1px solid rgba(128, 128, 128, 0.4);
@@ -124,11 +124,11 @@ function onDone() {
   cursor: pointer;
   font-size: 0.85em;
 }
-.muan-companion-step-command-button:disabled {
+.slidev-muan-companion-step-command-button:disabled {
   cursor: default;
   opacity: 0.7;
 }
-.muan-companion-step-command-button-done {
+.slidev-muan-companion-step-command-button-done {
   border-color: rgba(47, 168, 107, 0.6);
 }
 </style>

@@ -332,8 +332,8 @@ restart between workshops — see §8.
   stops working immediately, since the check is against live config, not
   a stored value. Re-share the dashboard URL with the new code.
 - **Slides aren't syncing to participants.** Check the presenter's own
-  deck URL _first_: it needs `?presenterCode=<the presenter code>`
-  appended (e.g. `.../presenter/1?presenterCode=...`). Without it, every
+  deck URL _first_: it needs `?code=<the presenter code>`
+  appended (e.g. `.../presenter/1?code=...`). Without it, every
   `presenter:setSlide`/`presenter:setStep` the addon sends is a **silent
   no-op** on the server — no error in the browser console, no error on
   the server, nothing in the UI. This is the single most common

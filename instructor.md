@@ -40,7 +40,7 @@ That's it — you don't have to pick or set anything. If you don't set the two
 code env vars, the server invents a fresh room code and presenter code for
 you on every start, and **prints every URL and code you need** right in the
 terminal: the room code, the presenter code, your dashboard URL, the exact
-`?presenterCode=` value to add to your own deck URL, and the participant
+`?code=` value to add to your own deck URL, and the participant
 join link. That's the source of truth — you don't need to memorize or write
 these down separately.
 
@@ -62,15 +62,15 @@ Two things worth knowing about the codes:
 ### Presenter URL — you, and only you. Never share this.
 
 ```
-http://localhost:3030/presenter/1?presenterCode=<presenterCode>
+http://localhost:3030/presenter/1?code=<presenterCode>
 ```
 
-**The `?presenterCode=...` part is mandatory.** Without it, moving through
+**The `?code=...` part is mandatory.** Without it, moving through
 your slides will look completely normal on your own screen but will silently
 **not** sync to any participant — no error message appears anywhere, on
 either side. This is the single most common "why isn't this working"
 problem. If participants say the slides aren't following you, the very first
-thing to check is whether your presenter URL still has `?presenterCode=`
+thing to check is whether your presenter URL still has `?code=`
 attached (it's easy to lose if you retype the URL, open a new tab from
 history, etc.).
 
@@ -216,7 +216,7 @@ out.
 ## 7. Common problems and fixes
 
 - **Slides don't sync to participants** → almost always the presenter URL
-  is missing `?presenterCode=...`. Check it's still there — it's silent
+  is missing `?code=...`. Check it's still there — it's silent
   when wrong, no error appears.
 - **Dashboard says "Presenter code required" / 401** → the `?code=` in your
   dashboard URL doesn't match whatever `SLIDEV_MUAN_COMPANION_PRESENTER_CODE`

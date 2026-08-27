@@ -62,7 +62,7 @@ httpServer.listen(PORT, () => {
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
   console.log(`[muan-companion-server] Dashboard: http://localhost:${PORT}/dashboard?code=${presenterCode}`)
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
-  console.log(`[muan-companion-server] Append ?presenterCode=${presenterCode} to your own /presenter/N deck URL.`)
+  console.log(`[muan-companion-server] Append ?code=${presenterCode} to your own /presenter/N deck URL.`)
   // Same `buildJoinUrl` the dashboard's own `dashboard:join` ack uses (see
   // `server.ts`) — computed independently here rather than read back off the
   // running server, since `createMuanCompanionServer` only returns

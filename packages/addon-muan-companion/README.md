@@ -54,8 +54,8 @@ connects to `http://localhost:3710`; override with
 `VITE_SLIDEV_MUAN_COMPANION_SERVER_URL`.
 
 **Presenter code**: load the presenter's own window with
-`?presenterCode=<the SLIDEV_MUAN_COMPANION_PRESENTER_CODE value>` appended to the URL
-(e.g. `http://localhost:3030/presenter/1?presenterCode=...`) — see "Auth"
+`?code=<the SLIDEV_MUAN_COMPANION_PRESENTER_CODE value>` appended to the URL
+(e.g. `http://localhost:3030/presenter/1?code=...`) — see "Auth"
 below for why it has to be supplied this way rather than any config file.
 **Room code**: participants type it into the join screen alongside their
 name (no URL param needed, though `JoinScreen.vue`'s stored `localStorage`
@@ -267,7 +267,7 @@ every route (`/N` and `/presenter/N` alike) — there's no separate
 "presenter bundle" to embed a secret into. Anything baked in via
 `import.meta.env` at build time would ship to every participant's browser
 too, which is exactly the failure mode plan 029's STOP condition rules out
-("naively embedded in a public bundle"). Reading `?presenterCode=` from
+("naively embedded in a public bundle"). Reading `?code=` from
 `window.location.search` instead means the value only ever exists in the
 one browser tab whose URL the instructor set it on — never in the shipped
 bundle.

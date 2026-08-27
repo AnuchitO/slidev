@@ -18,12 +18,12 @@ describe('getPresenterCodeFromUrl', () => {
     stubWindowSearch(undefined)
   })
 
-  it('reads presenterCode from the URL query string', () => {
-    stubWindowSearch('?presenterCode=letmein')
+  it('reads the code param from the URL query string', () => {
+    stubWindowSearch('?code=letmein')
     expect(getPresenterCodeFromUrl()).toBe('letmein')
   })
 
-  it('returns undefined when the query string has no presenterCode', () => {
+  it('returns undefined when the query string has no code param', () => {
     stubWindowSearch('?other=1')
     expect(getPresenterCodeFromUrl()).toBeUndefined()
   })
@@ -38,8 +38,8 @@ describe('getPresenterCodeFromUrl', () => {
     expect(getPresenterCodeFromUrl()).toBeUndefined()
   })
 
-  it('reads presenterCode alongside other query params, in either order', () => {
-    stubWindowSearch('?foo=bar&presenterCode=xyz&baz=qux')
+  it('reads the code param alongside other query params, in either order', () => {
+    stubWindowSearch('?foo=bar&code=xyz&baz=qux')
     expect(getPresenterCodeFromUrl()).toBe('xyz')
   })
 })

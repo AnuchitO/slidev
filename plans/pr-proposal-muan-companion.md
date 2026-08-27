@@ -247,7 +247,7 @@ SLIDEV_MUAN_COMPANION_PRESENTER_CODE=<pick-another> \
 pnpm --filter slidev-demo-muan-companion dev
 ```
 
-Open the presenter URL with `?presenterCode=<the presenter code>` appended,
+Open the presenter URL with `?code=<the presenter code>` appended,
 share the plain deck URL with participants (they type the room code once on
 the join screen), and open `/dashboard?code=<the presenter code>` on a second
 screen. See **`instructor.md`** at the repo root for the full instructor-

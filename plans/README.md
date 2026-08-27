@@ -149,12 +149,25 @@ updating this note.
 tracking, error reporting (text + screenshot), presence, presenter/room-code
 auth, participant reconnect/resume, and load-verified performance (50-100
 concurrent participants, both measured latencies under ~11ms against the
-PRD's ~1s target — see `packages/workshop-tracker-server/scripts/load-test-results.md`,
-re-runnable via `pnpm --filter workshop-tracker-server load-test`). Every
+PRD's ~1s target — see `packages/muan-companion-server/scripts/load-test-results.md`,
+re-runnable via `pnpm --filter muan-companion-server load-test`). Every
 PRD §15 acceptance bullet has been walked live against the full stack
 (sync server + demo deck + dashboard, run as persistent dev processes, not
 a `slidev build` export). This is the whole tracked-feature-set status, not
-just five plan files checked off.
+just five plan files checked off. (Package/env-var/CSS names were later
+renamed workshop-tracker → muan-companion — a pure text substitution, no
+behavior change; this note and the historical plan files below keep
+whichever name was current when each was written.)
+
+**Post-ship follow-ups**: a Material Design UI pass + a redesign of error
+reporting into a two-way "Ask for Help" flow (confirm/reopen, presenter↔
+participant messaging), a shareable join link + QR code on the dashboard,
+and self-generating room/presenter codes have all since landed on top of
+030 — see [`plans/pr-proposal-muan-companion.md`](./pr-proposal-muan-companion.md)
+for the full PR-ready writeup. Multi-session concurrency, an in-app
+session-setup/lobby flow, and a practice-mode slide remain proposed but
+unimplemented — see
+[`plans/031-muan-companion-session-lifecycle-proposal.md`](./031-muan-companion-session-lifecycle-proposal.md).
 
 ## Direction findings (not planned here — options for the maintainer)
 

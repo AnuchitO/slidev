@@ -125,33 +125,43 @@ runs before any addon's `setup/main.ts` executes).
   `HEARTBEAT_INTERVAL_MS` — see that component's own comment). Gated on
   `!isPresenter`, same as `<JoinScreen>`.
 
-- **`<ErrorReportWidget>`** (`components/ErrorReportWidget.vue`, plan 028) —
-  a small floating "⚠️ Report a problem" button (bottom-right, every slide)
-  that expands into a form: a text box (always available, the required
-  PRD §10/§12 fallback) and a "Capture screen" button shown only when
-  `canCaptureScreen` (`src/errorReportCapability.ts`, unit tested) is
-  true — explicit feature detection (`navigator.mediaDevices?.getDisplayMedia`
-  exists **and** the origin is `https:` or `localhost`), not
-  try/catch-and-hope, so a participant on a browser/context lacking the API
-  never sees a button that would only fail when clicked. Capture uses the
-  standard "one `<video>` frame → `<canvas>` → `Blob`" technique and stops
-  every track immediately after grabbing the frame (so the browser's
-  "sharing your screen" indicator disappears right away, not only once the
-  form is submitted). Submission is exactly one of two paths, matching the
-  server's split responsibility (see the server's README):
-  - A captured screenshot → `POST /api/screenshot` (REST, multipart body
-    built by `src/errorReportSubmission.ts`, unit tested).
-  - Text-only → the WS `participant:error { stepId, text }` event on the
-    same shared socket `<StepCommand>` uses.
+- **`<ErrorReportWidget>`** (`components/ErrorReportWidget.vue`, plan 028,
+  redesigned into "Ask for Help") — a small floating "Ask for Help" button
+  (bottom-right, every slide) that expands into a panel with two tabs:
+  **"Report a problem"** (a text box, the required PRD §10/§12 fallback,
+  plus a "Capture screen" button shown only when `canCaptureScreen`
+  (`src/errorReportCapability.ts`, unit tested) is true — explicit feature
+  detection, `navigator.mediaDevices?.getDisplayMedia` exists **and** the
+  origin is `https:`/`localhost`, not try/catch-and-hope) and **"Ask a
+  question"** (text-only, no screenshot option, `kind: 'question'` instead
+  of the default `'problem'`). Capture uses the standard "one `<video>`
+  frame → `<canvas>` → `Blob`" technique and stops every track immediately
+  after grabbing the frame. Submission is exactly one of two transport
+  paths, matching the server's split responsibility (see the server's
+  README):
+  - A captured screenshot (problem tab only) → `POST /api/screenshot`
+    (REST, multipart body built by `src/errorReportSubmission.ts`, unit
+    tested) — always `kind: 'problem'` server-side, no `kind` field sent.
+  - Text-only (either tab) → the WS `participant:error { stepId, text,
+kind }` event on the same shared socket `<StepCommand>` uses.
+
+  The redesign's other half: marking a report resolved no longer ends it
+  unilaterally. `participant:errorResolved` now means "the presenter is
+  _offering_ this as fixed," rendered as an actionable card ("Yes, that
+  fixed it" / "Still need help", with an optional follow-up note either
+  way) that persists — no auto-dismiss — until the participant responds via
+  `participant:confirmResolution { errorId, confirmed, message? }`. A
+  separate, lighter-weight, auto-dismissing notice handles
+  `participant:message` (a plain presenter reply with no resolution
+  decision attached), with an inline reply box (`participant:addMessage`).
+  See the widget's own top-of-file comment for the full reasoning on why
+  these are two visually distinct surfaces rather than one.
 
   Reads the current participant from `src/participantIdentity.ts`'s shared
   `currentParticipant` ref (a module-scope singleton, same pattern as
   `client.ts`'s shared socket) — `<JoinScreen>` sets it on a successful
-  `participant:join` ack; both components now read/write participant
-  identity through this one module instead of each keeping its own copy
-  (a small refactor `JoinScreen.vue` picked up alongside this widget, see
-  that file's own comment). Hidden on the presenter route
-  (`useNav().isPresenter`) — error reporting is a participant action.
+  `participant:join` ack. Hidden on the presenter route
+  (`useNav().isPresenter`) — asking for help is a participant action.
 
 `<JoinScreen>`, `<StepReporter>`, `<ErrorReportWidget>`, and
 `<PresenceReporter>` are all mounted via [`global-top.vue`](./global-top.vue)
@@ -259,10 +269,20 @@ The `/dashboard` route (served by `muan-companion-server`) is gated the
 same way, at the HTTP layer — see that package's own README for the full
 picture (including the honestly-scoped threat model: this is
 LAN-workshop-appropriate auth, not brute-force/rate-limit-hardened
-SaaS-grade auth). Do not point a real workshop room at this stack without
-setting both `SLIDEV_MUAN_COMPANION_ROOM_CODE` and `SLIDEV_MUAN_COMPANION_PRESENTER_CODE` on the
-server — an unset code means the server rejects every join/presenter
-action/dashboard connection outright (fail closed).
+SaaS-grade auth). The server no longer requires `SLIDEV_MUAN_COMPANION_ROOM_CODE`/
+`SLIDEV_MUAN_COMPANION_PRESENTER_CODE` to be set — it auto-generates both if
+unset (plan 031a, that package's README) — but auth itself is unaffected:
+every join/presenter action/dashboard connection is still checked against
+whichever code, generated or configured, is actually live.
+
+**`?roomCode=` URL prefill (`src/roomCode.ts`)**: a participant arriving via
+the dashboard's shareable join link/QR code (see the server README's
+"Dashboard" section) has the room code appended to the deck's own URL —
+`getRoomCodeFromUrl()` reads it (an exact structural mirror of
+`getPresenterCodeFromUrl()` above, same reasoning) and `<JoinScreen>`
+prefills the room-code field with it on mount. This is a convenience
+prefill only, never an auto-submit — the participant still types their name
+and explicitly clicks Join.
 
 ## M5: reconnect/resume (plan 030 / PRD §12)
 

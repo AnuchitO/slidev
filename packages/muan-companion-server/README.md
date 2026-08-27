@@ -1,17 +1,23 @@
 # muan-companion-server
 
 Realtime sync server for [`slidev-addon-muan-companion`](../addon-muan-companion).
-Currently implements **M1 (slide sync), M2 (participant identity + step
-tracking + a minimal dashboard), M3 (error reporting: text + screenshot
-upload), and M4 (presence tracking + presenter/dashboard auth)** of the
-workshop-tracking initiative. See
-[`plans/026-workshop-tracker-m1-slide-sync.md`](../../plans/026-workshop-tracker-m1-slide-sync.md),
-[`plans/027-workshop-tracker-m2-step-tracking.md`](../../plans/027-workshop-tracker-m2-step-tracking.md),
-[`plans/028-workshop-tracker-m3-error-reporting.md`](../../plans/028-workshop-tracker-m3-error-reporting.md),
-[`plans/029-workshop-tracker-m4-presence-auth.md`](../../plans/029-workshop-tracker-m4-presence-auth.md),
-and [`plans/prd-workshop-tracking.md`](../../plans/prd-workshop-tracking.md)
-for the full scope and roadmap (M5 — reconnect/resume hardening + load
-testing is the only milestone still ahead).
+Implements the full **M1-M5** workshop-tracking initiative (slide sync,
+participant identity + step tracking, error/help reporting, presence +
+auth, reconnect/resume + load-tested hardening), plus two post-ship
+passes: the **"Ask for Help" redesign** (two-way problem/question reports
+with a confirm/reopen loop and presenter↔participant messaging, instead of
+a one-shot "resolved") and **self-serve join** (auto-generated room/
+presenter codes when unset, plus a shareable join link + QR code on the
+dashboard). See
+[`plans/026-workshop-tracker-m1-slide-sync.md`](../../plans/026-workshop-tracker-m1-slide-sync.md)
+through
+[`plans/030-workshop-tracker-m5-hardening.md`](../../plans/030-workshop-tracker-m5-hardening.md),
+[`plans/prd-workshop-tracking.md`](../../plans/prd-workshop-tracking.md),
+and [`plans/pr-proposal-muan-companion.md`](../../plans/pr-proposal-muan-companion.md)
+(the full current-state writeup) for scope and history. Multi-session
+concurrency, an in-app session-setup/lobby flow, and a practice-mode slide
+remain proposed but unimplemented — see
+[`plans/031-muan-companion-session-lifecycle-proposal.md`](../../plans/031-muan-companion-session-lifecycle-proposal.md).
 
 This package is **private** — it's not published, it's the workshop
 operator's own backend process, run alongside the Slidev dev server for the
@@ -30,10 +36,13 @@ connect (defaults to `*`). The instructor dashboard is served by the same
 process at `/dashboard` (see "Dashboard" below).
 
 `SLIDEV_MUAN_COMPANION_ROOM_CODE` and `SLIDEV_MUAN_COMPANION_PRESENTER_CODE` (see "Auth" below) — if
-either is unset, the server still starts (so `pnpm build`/CI don't need
-secrets configured) but logs a startup warning and **rejects every
-`participant:join`, `presenter:*` event, and dashboard connection** until
-both are set. Fail closed, not open.
+either is unset, `index.ts` generates a fresh one (`src/codeGeneration.ts`,
+plan 031a) and logs it at startup rather than leaving the server
+unusable — an explicitly-set env var always overrides generation. Auth
+itself (below) is unaffected: every `participant:join`, `presenter:*`
+event, and dashboard connection is still checked against whichever code —
+generated or configured — is actually live; there's no bypass, just no
+requirement that an operator invent the value themselves.
 
 ## Auth (plan 029 / PRD §12)
 
@@ -152,11 +161,17 @@ confusing "wrong code" error the participant never actually triggered.
   frontmatter-derived _stepId_ need separate reporting mechanisms (a real,
   empirically-discovered gap in the milestone's original plan, not a
   hypothetical one).
-- `dashboard:join { presenterCode }` → `ack({ ok: boolean })` (client →
-  server) — requires a valid `presenterCode`. Joins the Socket.io
+- `dashboard:join { presenterCode }` → `ack({ ok, roomCode?, presenterCode?, deckUrl?, joinUrl?, joinQrDataUrl? })`
+  (client → server) — requires a valid `presenterCode`. Joins the Socket.io
   `dashboard` room and immediately receives one `state:update` snapshot
-  (mirrors `slide:sync`'s late-joiner pattern) only if `ok`. Participant
-  sockets never emit this.
+  (mirrors `slide:sync`'s late-joiner pattern) only if `ok`. On success also
+  echoes back both codes (safe — reaching this line already proved the
+  caller holds the higher-privilege one) plus the shareable join link/QR
+  code (`buildJoinUrl`/`QRCode.toDataURL`, `src/server.ts`) — `deckUrl` is
+  always present (it's just this server's own static config), `joinUrl`/
+  `joinQrDataUrl` are `undefined` together whenever no room code is
+  configured (there's nothing valid to share yet). Participant sockets
+  never emit this.
 - `state:update { currentSlideIndex, currentStepId, participants[], stepStatus[] }`
   (server → dashboard room only) — sent on every state-affecting event above
   plus `disconnect`/the staleness sweep. Room-scoped, not broadcast to every
@@ -186,22 +201,53 @@ confusing "wrong code" error the participant never actually triggered.
   live socket at once (`Participant.socketIds`, plural) — see "Real gap
   found: multi-tab presence" below.
 
-**M3 (error reporting)**
+**M3 (error reporting), extended by the post-ship "Ask for Help" redesign**
 
-- `participant:error { stepId, text }` (client → server) — the **text-only**
-  error-report path (PRD §10). No-ops (silently) if the socket hasn't called
-  `participant:join` yet, same rule as `participant:copy`/`done`.
-- `presenter:resolveError { errorId, presenterCode }` (client → server) —
-  requires a valid `presenterCode` (see "Auth" above; invalid/missing is a
-  silent no-op, same shape as `presenter:setSlide`/`setStep`). Marks that
-  `ErrorReport.resolved = true` and broadcasts `state:update`. Unknown
-  `errorId` (with a valid code) is a no-op, not an error.
-- `state:update` now also carries `errors: ErrorReport[]` — folded into the
-  existing event (PRD §10's literal `state:update { currentSlideIndex,
-participants[], errors[] }` shape) rather than a new event, per plan 028
-  Step 1's decision: error reports are rare compared to step-status churn,
-  so the combined payload isn't a size/frequency problem, and the dashboard
-  client needs no restructuring beyond rendering a new field.
+`ErrorReport` (`src/session.ts`) now carries a `kind: 'problem' | 'question'`
+tag, a four-state `status: 'open' | 'awaiting_confirmation' | 'resolved' |
+'reopened'` (replacing the original bare `resolved: boolean`), and an
+append-only `thread: { from: 'participant' | 'presenter', text, ts }[]` —
+the redesign's core change: **marking something resolved no longer closes
+it outright.** It only offers a resolution; the reporting participant has
+the final say via `participant:confirmResolution` below.
+
+- `participant:error { stepId, text?, kind? }` (client → server) — the
+  **text-only** report/question path (PRD §10, `kind` added by the
+  redesign). `kind` defaults to `'problem'` if omitted (only the addon's
+  "Ask a question" tab ever sends `'question'` explicitly). No-ops
+  (silently) if the socket hasn't called `participant:join` yet, same rule
+  as `participant:copy`/`done`.
+- `presenter:resolveError { errorId, presenterCode, message? }` (client →
+  server) — requires a valid `presenterCode` (invalid/missing is a silent
+  no-op, same shape as `presenter:setSlide`/`setStep`). Moves the report to
+  `'awaiting_confirmation'` (**not** a final resolved state) and, if
+  `message` is given, appends it to `thread` as a presenter message.
+  Notifies the reporting participant's own socket(s) via
+  `participant:errorResolved { errorId, stepId, status, message? }`.
+  Unknown `errorId` (with a valid code) is a no-op, not an error.
+- `presenter:sendMessage { errorId, presenterCode, text }` (client →
+  server) — a plain reply on a report's thread that does **not** change
+  `status` (e.g. "still looking into it", answering a question without
+  resolving it). Requires a valid `presenterCode`. Pushes
+  `participant:message { errorId, stepId, text }` to the reporting
+  participant's socket(s).
+- `participant:confirmResolution { errorId, confirmed, message? }` (client →
+  server) — the participant's answer to an `'awaiting_confirmation'` offer:
+  `confirmed: true` → `'resolved'` (the true end state); `confirmed: false`
+  → `'reopened'`, back in the presenter's queue but distinguishable from a
+  fresh `'open'` report. Restricted to the socket that owns the report
+  (`socket.data.participantId` must match `ErrorReport.participantId`) —
+  unlike most events here, this can't be satisfied by presenting a valid
+  code, since an `errorId` isn't a secret the way `participantId` is.
+- `participant:addMessage { errorId, text }` (client → server) — lets a
+  participant add a follow-up to their own report's thread without waiting
+  for a resolution offer. Same ownership restriction as
+  `participant:confirmResolution`.
+- `state:update` carries `errors: ErrorReport[]` (full shape above,
+  including `kind`/`status`/`thread`) — folded into the existing event
+  rather than a new one, per plan 028 Step 1's original decision: error/help
+  reports are rare compared to step-status churn, so the combined payload
+  isn't a size/frequency problem.
 - `POST /api/screenshot` (multipart: `participantId`, `stepId`, `text?`,
   `screenshot`) — the **screenshot** error-report path (PRD §10's REST
   upload). Deliberately the _only_ path that accepts a screenshot; a request
@@ -271,21 +317,29 @@ Socket.io server, so no CORS configuration is needed. Loads Socket.io's own
 client bundle (`/socket.io/socket.io.js`, served by Socket.io by default)
 and renders `state:update` payloads — no build step, no polling.
 
-Shows: live counts (joined, viewing now, done-this-step/total, current
-slide/stepId, open errors); a participant table (name, **presence** —
-viewing now / away / closed, driven by `visibility` + `connected` rather
-than `connected` alone — status for the _current_ step, joined at); and an
-**error feed**: participant name, step, timestamp, text and/or a screenshot
-thumbnail (click for a full-size lightbox — a plain image-swap overlay, no
-new dependency), and a "Mark resolved" button wired to
-`presenter:resolveError { errorId, presenterCode }`. Resolved reports stay
-visible (dimmed, sorted after open ones) rather than disappearing — the
-point is a dashboard reload still reflects resolved state, which lives in
-the server's `ErrorReport.resolved` field, not client-side UI state. PRD
-§11/§15's "never joined" presence state has no dedicated row: there's no
-roster of expected participants in this single-session model, so it's
-represented by simple absence from the table. Don't expand this into a full
-SPA without re-reading plan 027's Step 3 trade-off note.
+Shows, top to bottom: a **"Share this workshop" panel** (the join link +
+QR code from `dashboard:join`'s ack above — hidden entirely when no room
+code is configured), live counts (joined, viewing now, done-this-step/total,
+current slide/stepId, and a "needs attention" count — `open` + `reopened`
+reports, deliberately excluding `awaiting_confirmation` since those are
+already actioned and just waiting on the participant), a participant table
+(name, **presence** — viewing now / away / closed, driven by `visibility` +
+`connected` rather than `connected` alone — status for the _current_ step,
+joined at), and the **"Help requests" feed**: each card shows a `kind` tag
+(problem/question), a colored `status` chip (open/reopened share the
+"needs attention" red; `awaiting_confirmation` is blue/"in flight";
+`resolved` is green/dimmed), the original text and/or a screenshot
+thumbnail (click for a full-size lightbox), the `thread` rendered as a
+compact chat strip, and — for any non-`resolved` card — a composer with
+"Send" (`presenter:sendMessage`, no status change) and, for `open`/
+`reopened` cards only, "Send & mark resolved" (`presenter:resolveError`).
+Resolved reports stay visible (dimmed, sorted last) rather than
+disappearing — a dashboard reload still reflects full status/thread
+history, which lives server-side in `ErrorReport`, not client-side UI
+state. PRD §11/§15's "never joined" presence state has no dedicated row:
+there's no roster of expected participants in this single-session model,
+so it's represented by simple absence from the table. Don't expand this
+into a full SPA without re-reading plan 027's Step 3 trade-off note.
 
 Access to the dashboard (both the HTTP route and its `dashboard:join` socket
 call) requires the presenter code — see "Auth" above. There is no separate

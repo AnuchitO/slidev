@@ -911,11 +911,18 @@ describe('createMuanCompanionServer', () => {
       const { pendingConnections } = await pending
       const socketId = pendingConnections[0].socketId
 
-      const disconnected = waitFor(client, 'disconnect')
+      // The exact reason string matters, not just "it disconnected" — the
+      // addon's `JoinScreen.vue` distinguishes a server-initiated kick from
+      // an ordinary network drop/reconnect by this value alone (see that
+      // component's own comment on `onForciblyDisconnected`). A regression
+      // here (e.g. socket.io ever changing this string, or this handler
+      // switching to a different disconnect mechanism) would silently break
+      // that client-side behavior without any other test catching it.
+      const disconnectReason = waitFor<string>(client, 'disconnect')
       const presenter = await connectClient()
       presenter.emit('presenter:kickPendingConnection', { socketId, presenterCode: TEST_PRESENTER_CODE })
 
-      await disconnected
+      expect(await disconnectReason).toBe('io server disconnect')
     })
 
     it('presenter:kickPendingConnection without a valid presenterCode is a no-op', async () => {
@@ -950,13 +957,19 @@ describe('createMuanCompanionServer', () => {
         dashboard,
         p => !p.participants.some(x => x.id === participantId),
       )
-      const tab1Disconnected = waitFor(tab1, 'disconnect')
-      const tab2Disconnected = waitFor(tab2, 'disconnect')
+      // Same reason-string assertion as the pending-connection kick test
+      // above, for both tabs — see that test's own comment for why the
+      // exact value matters.
+      const tab1Disconnected = waitFor<string>(tab1, 'disconnect')
+      const tab2Disconnected = waitFor<string>(tab2, 'disconnect')
 
       const presenter = await connectClient()
       presenter.emit('presenter:kickParticipant', { participantId, presenterCode: TEST_PRESENTER_CODE })
 
-      await Promise.all([tab1Disconnected, tab2Disconnected, removed])
+      const [tab1Reason, tab2Reason] = await Promise.all([tab1Disconnected, tab2Disconnected])
+      await removed
+      expect(tab1Reason).toBe('io server disconnect')
+      expect(tab2Reason).toBe('io server disconnect')
       expect(participants.has(participantId)).toBe(false)
     })
 

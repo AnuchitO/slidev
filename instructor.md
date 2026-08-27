@@ -140,13 +140,16 @@ have connected but haven't finished joining yet:
   minutes. That's your cue to check in with them, even remotely.
 - Joined-at time.
 - **Remove**: a button on every row (joined or still-connecting) that
-  disconnects that person. For someone who hasn't joined, this is a clean
-  removal — they never had an identity to come back with. For an already-
-  joined participant, this fully deletes their record: if they try to
-  rejoin afterward, they start over as a brand-new participant (room code
-  required again) rather than silently resuming with their old progress
-  intact. Use it to clear out someone who shouldn't be there, or a stray
-  test connection — not as a way to permanently ban someone, since they can
+  disconnects that person. On their end, their browser is dropped straight
+  back to the "Join the workshop" screen with a note that they were
+  removed — not left staring at a frozen deck wondering what happened. For
+  someone who hadn't joined, that's it — a clean removal, they never had an
+  identity to come back with. For an already-joined participant, their
+  record is also fully deleted: if they submit the join form again
+  afterward, they start over as a brand-new participant (room code required
+  again) rather than silently resuming with their old progress intact. Use
+  it to clear out someone who shouldn't be there, or a stray test
+  connection — not as a way to permanently ban someone, since they can
   still rejoin fresh with the room code unless you also change it.
 
 **Help requests feed** — every problem report and question participants

@@ -35,7 +35,7 @@ else" button rendered after a successful resume, calling
 -->
 <script setup lang="ts">
 import { useNav } from '@slidev/client'
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { getWorkshopSocket } from '../src/client'
 import {
   clearStoredParticipant,
@@ -234,16 +234,59 @@ function joinAsSomeoneElse() {
   socket.disconnect()
   socket.connect()
 
+  resetToFreshJoin()
+  joinError.value = ''
+}
+
+// Shared by `joinAsSomeoneElse` above and `onForciblyDisconnected` below —
+// both mean "forget whoever this browser was and show the blank join form
+// again", they just differ in *why* (the participant asked to switch
+// identities vs. the presenter removed them) and in what, if anything, gets
+// shown about it — left to each caller rather than folded in here.
+function resetToFreshJoin() {
   clearStoredParticipant()
   currentParticipant.value = undefined
   pendingParticipantId.value = undefined
   resumedKnownIdentity.value = false
   name.value = ''
   roomCode.value = ''
-  joinError.value = ''
   joined.value = false
   resuming.value = false
 }
+
+// The presenter's "Remove" button (dashboard, `presenter:kickParticipant`/
+// `presenter:kickPendingConnection` — `muan-companion-server`'s README) ends
+// with the server calling `socket.disconnect()` on this participant's own
+// socket. Feature request from live use: being kicked should land the
+// participant back on this join screen, ready to rejoin, not leave them
+// staring at a frozen deck with no explanation.
+//
+// `reason === 'io server disconnect'` is Socket.io's own signal for exactly
+// this case — a disconnect the *server* initiated, as opposed to a network
+// drop, a backgrounded tab, or the page unloading (all of which the client
+// reconnects from automatically via `reconnection: true` and must NOT reset
+// an otherwise-fine session over). This server only ever calls
+// `socket.disconnect()` on a participant's socket from the two kick
+// handlers above — if that ever changes, this coupling needs re-checking,
+// since this handler would then fire for whatever new reason too.
+function onForciblyDisconnected(reason: string) {
+  if (reason !== 'io server disconnect')
+    return
+  resetToFreshJoin()
+  joinError.value = 'You were removed from this workshop by the instructor. Enter your name and the room code to join again.'
+  // Same "manual disconnect never auto-reconnects" reasoning as
+  // `joinAsSomeoneElse` above — except here the server already did the
+  // disconnecting; this side just needs to bring the socket back so a
+  // resubmitted join form has something to emit on.
+  getWorkshopSocket().connect()
+}
+
+onMounted(() => {
+  getWorkshopSocket().on('disconnect', onForciblyDisconnected)
+})
+onBeforeUnmount(() => {
+  getWorkshopSocket().off('disconnect', onForciblyDisconnected)
+})
 </script>
 
 <template>

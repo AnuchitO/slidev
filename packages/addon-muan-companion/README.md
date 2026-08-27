@@ -112,7 +112,14 @@ runs before any addon's `setup/main.ts` executes).
   participant without re-prompting. The room code is deliberately **not**
   part of what's persisted (see "Real gap found: room code no longer needs
   to be stored client-side" below) — a resume of an already-known identity
-  doesn't need it at all.
+  doesn't need it at all. Also emits `participant:connecting` on mount
+  (pre-join dashboard visibility — see the server README's "Post-ship:
+  pending connections + kick"), and listens for a server-initiated
+  `disconnect` (reason `'io server disconnect'`, only ever produced by the
+  server's kick handlers today) to reset back to this same blank form with
+  a "you were removed" message — see `onForciblyDisconnected`'s own
+  comment for why the exact reason string is what distinguishes a kick from
+  an ordinary reconnectable network drop.
 - **`<StepReporter>`** (`components/StepReporter.vue`) — renders nothing;
   reports the presenter's current `stepId` to the server (`presenter:setStep`,
   including the presenter credential — see "Auth" below). See "Real gap

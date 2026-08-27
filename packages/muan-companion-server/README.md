@@ -215,6 +215,21 @@ addon), so instead it's made visible and actionable:
   through to an ordinary fresh join (room code required again) — kicking
   someone is not the same as banning them; anyone who still has the room
   code can rejoin as a new participant.
+- **The kicked participant's own experience** (feature request from live
+  use, not just a server-side concern): both kick handlers disconnect via
+  plain `socket.disconnect()`/`.disconnect(true)`, never a custom event —
+  Socket.io's client reports a _server-initiated_ disconnect with the
+  reason string `'io server disconnect'`, distinct from every other
+  disconnect cause (network drop, tab backgrounded, page unload), all of
+  which the client's own `reconnection: true` recovers from automatically
+  and must _not_ be mistaken for a kick. The addon's `JoinScreen.vue`
+  listens for exactly that reason and, only on it, resets to a blank join
+  form with a "you were removed" message and reconnects the socket — see
+  that component's `onForciblyDisconnected` for the client-side half, and
+  its own doc comment for why this reason-string coupling needs
+  re-checking if this server ever calls `.disconnect()` on a participant's
+  socket from anywhere else. `server.test.ts` asserts the exact reason
+  string a kicked client receives, specifically to guard this coupling.
 
 **M4 (presence)**
 

@@ -85,9 +85,13 @@ const pendingParticipantId = ref<string | undefined>()
 // *different* person picks up next — this is their way out.
 const resumedKnownIdentity = ref(false)
 
-function join(joinName: string, joinRoomCode: string, participantId?: string) {
+function join(joinName: string, joinRoomCode: string | undefined, participantId?: string) {
   submitting.value = true
   joinError.value = ''
+  // Captured before the ack arrives — the branches below set `resuming` to
+  // `false` themselves, so reading it *after* the callback fires would
+  // always see the post-update value.
+  const wasAutoResuming = resuming.value
   getWorkshopSocket().emit(
     'participant:join',
     { name: joinName, participantId, roomCode: joinRoomCode },
@@ -98,6 +102,21 @@ function join(joinName: string, joinRoomCode: string, participantId?: string) {
       // correct the code and retry without reloading the page.
       if ('error' in ack) {
         resuming.value = false
+        // Follow-up fix: the auto-resume call from `onMounted` below never
+        // sends a room code at all (see `participantIdentity.ts` on why it's
+        // no longer persisted) — a server that doesn't currently recognize
+        // this `participantId` (e.g. it restarted) rejects that attempt with
+        // this same `error` ack, but the participant never typed a wrong
+        // code; they typed nothing. Showing "that code was not accepted"
+        // here would blame them for something that isn't their fault. Clear
+        // the now-confirmed-dead id and fall through to the ordinary join
+        // form (pre-filled with their name) instead — the same shape as any
+        // other fresh join, just one keystroke shorter.
+        if (wasAutoResuming) {
+          clearStoredParticipant()
+          name.value = joinName
+          return
+        }
         joinError.value = 'That room code was not accepted — check it and try again.'
         return
       }
@@ -109,16 +128,23 @@ function join(joinName: string, joinRoomCode: string, participantId?: string) {
       // (pre-filled, so the participant doesn't have to retype anything)
       // rather than assuming success — but remember the fallback's own new
       // id (see `pendingParticipantId` above) so the *next* submit resumes
-      // it instead of minting yet another one.
+      // it instead of minting yet another one. (In practice this specific
+      // branch is now rare: a resume request without a room code that the
+      // server can't honor is rejected by the `error` branch above before
+      // ever reaching `joinParticipant` server-side, so there's no fallback
+      // id to remember. It stays here as the correct handling for a resume
+      // request that *does* carry a room code — e.g. a manual retry after
+      // the branch above — and the outcome still comes back unresumed for
+      // some other reason.)
       if (resolveJoinAckOutcome(participantId, ack) === 'resume-failed') {
         pendingParticipantId.value = ack.participantId
         clearStoredParticipant()
         resuming.value = false
         name.value = joinName
-        roomCode.value = joinRoomCode
+        roomCode.value = joinRoomCode ?? ''
         return
       }
-      const participant = { participantId: ack.participantId, name: joinName, roomCode: joinRoomCode }
+      const participant = { participantId: ack.participantId, name: joinName }
       writeStoredParticipant(participant)
       currentParticipant.value = participant
       joined.value = true
@@ -132,7 +158,11 @@ onMounted(() => {
   const stored = readStoredParticipant()
   if (stored) {
     resuming.value = true
-    join(stored.name, stored.roomCode, stored.participantId)
+    // No room code sent here, deliberately — see `participantIdentity.ts`'s
+    // doc comment. A resume of an already-known identity doesn't need it
+    // (server-side gate, `server.ts`'s `participant:join` handler); if the
+    // server doesn't recognize this id, the `error` branch above handles it.
+    join(stored.name, undefined, stored.participantId)
   }
 })
 

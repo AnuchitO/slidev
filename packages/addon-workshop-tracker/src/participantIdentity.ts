@@ -5,16 +5,6 @@ export const PARTICIPANT_STORAGE_KEY = 'workshop-tracker:participant'
 export interface StoredParticipant {
   participantId: string
   name: string
-  /**
-   * Persisted alongside identity (plan 029) so a reload — same tab, or a
-   * closed-and-reopened tab (see this module's own doc comment below) — can
-   * auto-rejoin without re-prompting for the code — this is the low(er)-
-   * privilege participant room code (PRD §12), not the presenter
-   * credential, so localStorage is an acceptable place for it (unlike the
-   * presenter code — see `presenterCode.ts`'s comment on why *that* one is
-   * never persisted/embedded anywhere).
-   */
-  roomCode: string
 }
 
 /**
@@ -28,14 +18,22 @@ export interface StoredParticipant {
  * dashboard. `localStorage` is same-origin but *not* tab-scoped — it
  * persists across a closed tab, a closed browser, even a machine restart,
  * until something explicitly clears it (this module's own
- * `clearStoredParticipant`, or the browser's site-data controls). The
- * threat-model reasoning above (a low-privilege room code + an unguessable
- * server-minted id, never the presenter credential) is unaffected by the
- * storage swap — what changes is only *how long* it's retained and *what
- * physical-browser scenario* that retention now covers; see
+ * `clearStoredParticipant`, or the browser's site-data controls). See
  * `JoinScreen.vue`'s "Not you? Join as someone else" affordance for the one
- * new consequence this introduces (a shared/kiosk browser silently
- * resuming the previous person's identity).
+ * consequence that introduces (a shared/kiosk browser silently resuming the
+ * previous person's identity).
+ *
+ * Deliberately does **not** persist the room code, even though it's a low-
+ * privilege value (PRD §12) — a second follow-up fix, this time to close a
+ * different gap: indefinitely caching a workshop-scoped code in a browser's
+ * storage is unnecessary standing exposure with no real benefit, since a
+ * resume of an *already-known* identity doesn't actually need the room code
+ * at all — the unguessable `participantId` this struct carries is itself
+ * the resume credential (see `workshop-tracker-server`'s `session.ts` /
+ * `server.ts` for the server-side half of this). The room code is only ever
+ * asked for again on a genuinely *fresh* join, or the rare case where a
+ * resume attempt fails (e.g. the server restarted) — both go through
+ * `JoinScreen.vue`'s ordinary join form, never through storage.
  */
 export function readStoredParticipant(): StoredParticipant | undefined {
   try {
@@ -43,7 +41,7 @@ export function readStoredParticipant(): StoredParticipant | undefined {
     if (!raw)
       return undefined
     const parsed = JSON.parse(raw)
-    if (typeof parsed?.participantId === 'string' && typeof parsed?.name === 'string' && typeof parsed?.roomCode === 'string')
+    if (typeof parsed?.participantId === 'string' && typeof parsed?.name === 'string')
       return parsed
     return undefined
   }

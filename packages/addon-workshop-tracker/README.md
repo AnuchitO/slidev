@@ -107,9 +107,12 @@ runs before any addon's `setup/main.ts` executes).
   server acks — not an optimistic "clicked = done".
 - **`<JoinScreen>`** (`components/JoinScreen.vue`) — a full-screen name-entry
   overlay, gated on "have we received a `participant:join` ack yet", not on
-  slide rendering. Persists `{ participantId, name, roomCode }` to
-  `localStorage` so a reload — same tab, or a closed-and-reopened tab —
-  rejoins as the same participant without re-prompting for the room code.
+  slide rendering. Persists `{ participantId, name }` to `localStorage` so a
+  reload — same tab, or a closed-and-reopened tab — rejoins as the same
+  participant without re-prompting. The room code is deliberately **not**
+  part of what's persisted (see "Real gap found: room code no longer needs
+  to be stored client-side" below) — a resume of an already-known identity
+  doesn't need it at all.
 - **`<StepReporter>`** (`components/StepReporter.vue`) — renders nothing;
   reports the presenter's current `stepId` to the server (`presenter:setStep`,
   including the presenter credential — see "Auth" below). See "Real gap
@@ -238,7 +241,8 @@ verified server-side (`workshop-tracker-server`'s `src/auth.ts`); a
 participant's browser navigating to a `/presenter/:no` route without it has
 those events silently rejected, so it can no longer move/relabel everyone
 else's slide and step. `participant:join` now similarly requires a
-`roomCode`.
+`roomCode` for a fresh join — **not** for a resume of an already-known
+identity, a later follow-up fix; see "M5: reconnect/resume" below.
 
 **Why the presenter code is read from the URL (`src/presenterCode.ts`), not
 a build-time env var**: Slidev builds one JS bundle per deck, served to
@@ -274,15 +278,20 @@ authoritative signal for whether that specific resume succeeded, rather
 than the client comparing ids itself (`resolveJoinAckOutcome`,
 `src/participantIdentity.ts`, unit tested).
 
-**Resume-hijacking threat model**: a resumed identity is bound to two things
-an attacker can't cheaply obtain together — the participant room code
-(required on every `participant:join`, checked before resume is even
-considered) and the specific `participantId` itself, a 122-bit
-`crypto.randomUUID()` minted at original join time that is _never_ broadcast
-to other participant sockets (only to the presenter-code-gated dashboard
-room). That combination functions as an unguessable bearer resume token
-scoped to one browser's `localStorage`, satisfying plan 030's STOP
-condition on resume hijacking without needing a separate token scheme.
+**Resume-hijacking threat model**: a resumed identity is bound to the
+specific `participantId` itself — a 122-bit `crypto.randomUUID()` minted at
+original join time that is _never_ broadcast to other participant sockets
+(only to the presenter-code-gated dashboard room). That alone functions as
+an unguessable bearer resume token scoped to one browser's `localStorage`,
+satisfying plan 030's STOP condition on resume hijacking without needing a
+separate token scheme. (Originally the room code was _also_ required on
+every resume, "two things an attacker can't cheaply obtain together" — a
+later follow-up fix dropped that: the room code isn't participant-specific
+secret information, every participant in the session already knows it, so
+requiring it again on resume added no real protection against hijacking on
+top of the id alone, while forcing it to be persisted client-side
+indefinitely for no corresponding benefit. See "Follow-on fix: room code no
+longer stored client-side" below.)
 
 ### Follow-on fix: `sessionStorage` → `localStorage` (closed-tab resume)
 
@@ -316,9 +325,38 @@ one) is unchanged and stays exactly as fast as before this fix.
 
 **When resume fails** (the server no longer recognizes the stored id — e.g.
 it restarted mid-workshop, PRD §4/§14's accepted in-memory-reset case), the
-join form reappears, pre-filled with the same name/room code so the
-participant doesn't have to retype anything, rather than silently minting a
-"new" participant behind an unchanged UI.
+join form reappears, pre-filled with the same name so the participant
+doesn't have to retype that much, rather than silently minting a "new"
+participant behind an unchanged UI. It does _not_ pre-fill a room code
+(there isn't one stored — see below) — the participant types it once, the
+same as a first-ever join.
+
+### Follow-on fix: room code no longer stored client-side
+
+Raised in review, not a live-use bug report like the others in this section:
+persisting the room code in `localStorage` indefinitely (see the
+`sessionStorage` → `localStorage` fix above) is unnecessary standing
+exposure — it's a workshop-scoped code, not something that needs to outlive
+the session on a participant's machine, and (per the threat-model note
+above) it wasn't buying any real protection against resume hijacking either.
+
+Fix: `participantIdentity.ts`'s `StoredParticipant` no longer has a
+`roomCode` field at all, and `server.ts`'s `participant:join` handler
+exempts a resume of an already-known `participantId` from the room-code gate
+entirely (see `workshop-tracker-server`'s README for the server-side
+reasoning). The auto-resume call in `<JoinScreen>`'s `onMounted` sends no
+room code — it doesn't need one for the common case (same person, this
+session) to keep working exactly as before.
+
+The one behavior change is in the _rare_ case: if that auto-resume attempt
+gets rejected (the server doesn't recognize the id — e.g. it restarted),
+that now looks, on the wire, identical to a plain missing-room-code
+rejection. Showing "that room code was not accepted" here would be wrong —
+the participant never typed a code, right or wrong. `<JoinScreen>`'s `join()`
+tracks whether the in-flight attempt was this silent auto-resume
+(`wasAutoResuming`) and, if so, clears the dead id and falls through to the
+ordinary join form instead of the error message — the same outcome as
+before this fix, just without a room code to pre-fill.
 
 ### Real gap found during M5: a failed resume was orphaning a "ghost" participant
 

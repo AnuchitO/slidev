@@ -30,13 +30,13 @@ describe('readStoredParticipant / writeStoredParticipant / clearStoredParticipan
   })
 
   it('round-trips a written participant through localStorage', () => {
-    const participant = { participantId: 'p1', name: 'Ada', roomCode: 'ROOM1' }
+    const participant = { participantId: 'p1', name: 'Ada' }
     writeStoredParticipant(participant)
     expect(readStoredParticipant()).toEqual(participant)
   })
 
   it('persists in localStorage directly under PARTICIPANT_STORAGE_KEY, not sessionStorage', () => {
-    const participant = { participantId: 'p1', name: 'Ada', roomCode: 'ROOM1' }
+    const participant = { participantId: 'p1', name: 'Ada' }
     writeStoredParticipant(participant)
     // This is the crux of the bug fix: a value that survives in
     // `localStorage` after the write is what lets a *closed-and-reopened*
@@ -47,7 +47,7 @@ describe('readStoredParticipant / writeStoredParticipant / clearStoredParticipan
   })
 
   it('clearStoredParticipant removes the value so a later read is undefined', () => {
-    writeStoredParticipant({ participantId: 'p1', name: 'Ada', roomCode: 'ROOM1' })
+    writeStoredParticipant({ participantId: 'p1', name: 'Ada' })
     clearStoredParticipant()
     expect(readStoredParticipant()).toBeUndefined()
     expect(localStorage.getItem(PARTICIPANT_STORAGE_KEY)).toBeNull()
@@ -61,6 +61,16 @@ describe('readStoredParticipant / writeStoredParticipant / clearStoredParticipan
   it('treats a stored value missing required fields as "nothing stored"', () => {
     localStorage.setItem(PARTICIPANT_STORAGE_KEY, JSON.stringify({ participantId: 'p1' }))
     expect(readStoredParticipant()).toBeUndefined()
+  })
+
+  // Follow-up fix: the room code is deliberately *not* part of what's
+  // persisted anymore (see `readStoredParticipant`'s doc comment) — a stored
+  // value that happens to carry a leftover `roomCode` field (e.g. written by
+  // an older build of this addon, before this fix) must still read back
+  // fine; the field is just ignored, not required or rejected.
+  it('ignores a leftover roomCode field from an older stored value rather than rejecting it', () => {
+    localStorage.setItem(PARTICIPANT_STORAGE_KEY, JSON.stringify({ participantId: 'p1', name: 'Ada', roomCode: 'ROOM1' }))
+    expect(readStoredParticipant()).toEqual({ participantId: 'p1', name: 'Ada', roomCode: 'ROOM1' })
   })
 })
 

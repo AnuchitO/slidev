@@ -178,6 +178,73 @@ describe('createWorkshopTrackerServer', () => {
       expect(participants.size).toBe(0)
     })
 
+    // Follow-up fix: a resume of an already-known identity no longer needs
+    // the room code at all — the unguessable `participantId` is itself the
+    // resume credential (see `server.ts`'s comment on this exemption). This
+    // is what lets the addon stop persisting the room code in `localStorage`
+    // just to auto-resume silently.
+    describe('resuming a known identity is exempt from the room-code gate', () => {
+      it('resumes successfully with no roomCode at all, given a participantId the server already knows', async () => {
+        const original = await connectClient()
+        const { participantId } = await emitWithAck<{ participantId: string }>(
+          original,
+          'participant:join',
+          { name: 'Ada', roomCode: TEST_ROOM_CODE },
+        )
+
+        const resumer = await connectClient()
+        const ack = await emitWithAck<{ participantId: string, resumed: boolean } | { error: string }>(
+          resumer,
+          'participant:join',
+          { name: 'Ada', participantId },
+        )
+
+        expect(ack).toEqual({ participantId, currentSlideIndex: 1, resumed: true })
+        expect(participants.size).toBe(1)
+      })
+
+      it('resumes successfully even with a wrong roomCode, given a participantId the server already knows', async () => {
+        // Deliberately proves the room code is *ignored*, not just optional,
+        // for a known resume — locks in that it provides no protection here
+        // one way or the other, so nobody re-adds a check against it later
+        // expecting it to matter.
+        const original = await connectClient()
+        const { participantId } = await emitWithAck<{ participantId: string }>(
+          original,
+          'participant:join',
+          { name: 'Ada', roomCode: TEST_ROOM_CODE },
+        )
+
+        const resumer = await connectClient()
+        const ack = await emitWithAck<{ participantId: string, resumed: boolean } | { error: string }>(
+          resumer,
+          'participant:join',
+          { name: 'Ada', participantId, roomCode: 'definitely-not-the-real-code' },
+        )
+
+        expect(ack).toEqual({ participantId, currentSlideIndex: 1, resumed: true })
+      })
+
+      it('still requires a valid roomCode when the supplied participantId is unknown to the server (no free pass for a guessed id)', async () => {
+        const client = await connectClient()
+
+        const ack = await emitWithAck<{ error: string } | { participantId: string }>(
+          client,
+          'participant:join',
+          { name: 'Eve', participantId: 'guessed-or-stale-id' },
+        )
+
+        expect(ack).toEqual({ error: 'invalid_room_code' })
+        // Crucially, no participant was minted for the guessed id either —
+        // the room-code gate runs *before* `joinParticipant`, so an unknown
+        // id with no valid room code never reaches it at all (no orphaned
+        // fallback participant to clean up, unlike the pre-fix flow). An
+        // ordinary fresh join with no participantId at all is already
+        // covered by the two tests just above this describe block.
+        expect(participants.size).toBe(0)
+      })
+    })
+
     it('ignores presenter:setSlide with a wrong presenter code — no broadcast, no session mutation', async () => {
       const attacker = await connectClient()
       const bystander = await connectClient()

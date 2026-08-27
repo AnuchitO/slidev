@@ -40,11 +40,16 @@ both are set. Fail closed, not open.
 Two separate, operator-chosen secrets, checked with a constant-time compare
 (`src/auth.ts`) so a wrong guess doesn't leak timing information:
 
-- **`WORKSHOP_ROOM_CODE`** — low-privilege. Required in every
-  `participant:join { name, roomCode }`; a wrong/missing code is rejected via
-  the join ack (`{ error: 'invalid_room_code' }`, no participant created) —
-  the socket stays connected so the client can show an inline error and
-  retry rather than being force-disconnected.
+- **`WORKSHOP_ROOM_CODE`** — low-privilege. Required in `participant:join
+{ name, roomCode }` for a **fresh** join or a resume attempt whose
+  `participantId` the server doesn't currently recognize; a wrong/missing
+  code is rejected via the join ack (`{ error: 'invalid_room_code' }`, no
+  participant created) — the socket stays connected so the client can show
+  an inline error and retry rather than being force-disconnected. **Exempt**
+  for a resume of an _already-known_ `participantId` (see "Real gap found:
+  room code no longer needs to be stored client-side" below) — the room code
+  provides no real protection there on top of the id itself, so requiring it
+  only forced the addon to persist it indefinitely for no benefit.
 - **`WORKSHOP_PRESENTER_CODE`** — high-privilege. Required, as
   `presenterCode`, in every `presenter:setSlide`/`presenter:setStep` payload
   and in `dashboard:join { presenterCode }`. **Deliberately never derivable
@@ -78,6 +83,34 @@ the whole session (no rotation, no per-participant tokens). Choose codes
 with enough entropy to resist casual guessing for your session's size/
 duration; don't reuse a workshop's room code as a password anywhere else.
 
+## Real gap found: room code no longer needs to be stored client-side
+
+Raised in review, not a live-use bug report like the others in this file:
+the addon originally persisted the room code in `localStorage` alongside
+`participantId`/`name` (plan 029) so a silent resume could re-supply it
+without re-prompting. On reflection, that's unnecessary standing exposure —
+caching a workshop-scoped code indefinitely in a participant's browser, for
+a code that's handed out to an entire room and isn't participant-specific
+secret information in the first place.
+
+The actual fix is on this side, not just the addon's: `participant:join`'s
+room-code gate is now **skipped entirely for a resume of a `participantId`
+the server already has a record for** (`isKnownResume` in `src/server.ts`).
+The unguessable `participantId` (a 122-bit `crypto.randomUUID()` minted at
+original join time) is itself the resume credential — the room code adds no
+additional protection against identity hijacking on top of that, since every
+participant already knows it. A resume attempt whose `participantId` the
+server does _not_ recognize (unknown/stale — e.g. it restarted) still goes
+through the full room-code gate, exactly like a brand-new join, so this
+isn't a blanket exemption: it only ever skips the check once the identity
+has already been proven once, this session, some other way.
+
+This is what lets the addon's `participantIdentity.ts` stop persisting the
+room code at all — see that module's own doc comment for the client-side
+half, including how a silent auto-resume that the server can't honor (no
+room code to fall back on) degrades to the ordinary join form rather than a
+confusing "wrong code" error the participant never actually triggered.
+
 ## Events
 
 **M1 (slide sync)**
@@ -97,10 +130,13 @@ duration; don't reuse a workshop's room code as a password anywhere else.
 
 **M2 (participant identity + step tracking)**
 
-- `participant:join { name, roomCode, participantId? }` → `ack({ participantId, currentSlideIndex } | { error: 'invalid_room_code' })`
-  — requires a valid `roomCode` (see "Auth" above). Creates a new
-  participant, or (if `participantId` matches an existing record — see the
-  addon's `JoinScreen.vue`, which persists it to `localStorage`) reuses it
+- `participant:join { name, roomCode?, participantId? }` → `ack({ participantId, currentSlideIndex } | { error: 'invalid_room_code' })`
+  — requires a valid `roomCode` for a fresh join or a resume of an unknown
+  id; **not** for a resume of an already-known `participantId` (see "Auth"
+  above and "Real gap found: room code no longer needs to be stored
+  client-side" below). Creates a new participant, or (if `participantId`
+  matches an existing record — see the addon's `JoinScreen.vue`, which
+  persists just `{ participantId, name }` to `localStorage`) reuses it
   instead of creating a duplicate. A client-supplied `participantId` is only
   ever used to _look up_ an existing record, never trusted as the id of a
   new one.

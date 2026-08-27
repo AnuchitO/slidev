@@ -284,7 +284,24 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
         // the ack rather than a forced disconnect — lets the join screen
         // show "wrong code" and let the participant retry without having to
         // reload/reconnect the socket.
-        if (!isValidRoomCode(authConfig, roomCode)) {
+        //
+        // Follow-up fix: a resume of an *already-known* identity is exempt
+        // from this gate. The unguessable `participantId` (a 122-bit
+        // `crypto.randomUUID()` minted at original join time — see
+        // `session.ts`'s `joinParticipant` doc comment) is itself the resume
+        // credential; the room code adds no real protection against identity
+        // hijacking on top of that (every participant already knows the room
+        // code — it's not participant-specific secret information), but
+        // *requiring* it on every resume forced the addon to keep it in
+        // `localStorage` indefinitely just to auto-resume silently, which is
+        // unnecessary standing exposure for a code meant to be
+        // workshop-scoped, not permanent (reported as a real concern from
+        // review, not a hypothetical). A participant whose id the server
+        // doesn't currently recognize (unknown/stale — e.g. the server
+        // restarted) still goes through the full room-code gate below,
+        // exactly like a brand-new join.
+        const isKnownResume = participantId !== undefined && participants.has(participantId)
+        if (!isKnownResume && !isValidRoomCode(authConfig, roomCode)) {
           ack?.({ error: 'invalid_room_code' })
           return
         }

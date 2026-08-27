@@ -5,6 +5,7 @@ import {
   joinParticipant,
   listErrorReports,
   participants,
+  removeParticipantSocket,
   resetSessionStateForTests,
   resolveErrorReport,
   setStepStatus,
@@ -38,7 +39,7 @@ describe('joinParticipant (resume/reconnect, plan 030)', () => {
       lastSeen: 0,
       connected: true,
       visibility: 'visible',
-      socketId: 'socket-1',
+      socketIds: ['socket-1'],
     })
     expect(participants.size).toBe(1)
   })
@@ -59,7 +60,7 @@ describe('joinParticipant (resume/reconnect, plan 030)', () => {
     expect(stepStatus.get('p1:install-deps')).toEqual({ state: 'done', updatedAt: 0 })
   })
 
-  it('preserves joinedAt but refreshes lastSeen/socketId on resume', () => {
+  it('preserves joinedAt but refreshes lastSeen on resume, adding (not replacing) the new socketId', () => {
     joinParticipant('Ada', undefined, () => 'p1', 'socket-1')
 
     vi.setSystemTime(5_000)
@@ -67,7 +68,19 @@ describe('joinParticipant (resume/reconnect, plan 030)', () => {
 
     expect(participant.joinedAt).toBe(0)
     expect(participant.lastSeen).toBe(5_000)
-    expect(participant.socketId).toBe('socket-2')
+    // Both sockets are live at this point (a real disconnect of socket-1
+    // would remove it via `removeParticipantSocket` — see below — this
+    // pure-function call alone has no way to know socket-1 is gone unless
+    // told so).
+    expect(participant.socketIds).toEqual(['socket-1', 'socket-2'])
+  })
+
+  it('resuming on the same socketId twice does not duplicate it in socketIds', () => {
+    joinParticipant('Ada', undefined, () => 'p1', 'socket-1')
+
+    const { participant } = joinParticipant('Ada', 'p1', () => 'unused', 'socket-1')
+
+    expect(participant.socketIds).toEqual(['socket-1'])
   })
 
   it('a resumed identity keeps its original name even if a different name is supplied', () => {
@@ -88,6 +101,80 @@ describe('joinParticipant (resume/reconnect, plan 030)', () => {
     expect(result.participant.id).not.toBe('stale-id-from-before-a-restart')
     expect(participants.size).toBe(1)
     expect(participants.has('stale-id-from-before-a-restart')).toBe(false)
+  })
+})
+
+// Follow-up bug found in live use: opening a second tab for the same
+// participant (via localStorage resume), then closing that second tab, used
+// to mark the *whole participant* closed even though the first tab was
+// still open and connected — because a single `socketId` field got
+// overwritten by the second tab's join, and closing it looked
+// indistinguishable from "the only socket disconnected". These tests cover
+// `removeParticipantSocket`, the fix.
+describe('removeParticipantSocket (multi-tab presence, follow-up fix)', () => {
+  beforeEach(() => {
+    resetSessionStateForTests()
+  })
+
+  it('removing one of two live sockets leaves the participant connected and returns false (nothing to broadcast)', () => {
+    joinParticipant('Ada', undefined, () => 'p1', 'tab-1')
+    joinParticipant('Ada', 'p1', () => 'unused', 'tab-2')
+
+    const closed = removeParticipantSocket('p1', 'tab-2')
+
+    expect(closed).toBe(false)
+    const participant = participants.get('p1')!
+    expect(participant.connected).toBe(true)
+    expect(participant.visibility).not.toBe('closed')
+    expect(participant.socketIds).toEqual(['tab-1'])
+  })
+
+  it('removing the last live socket marks the participant closed and returns true', () => {
+    joinParticipant('Ada', undefined, () => 'p1', 'tab-1')
+    joinParticipant('Ada', 'p1', () => 'unused', 'tab-2')
+
+    removeParticipantSocket('p1', 'tab-1')
+    const closed = removeParticipantSocket('p1', 'tab-2')
+
+    expect(closed).toBe(true)
+    const participant = participants.get('p1')!
+    expect(participant.connected).toBe(false)
+    expect(participant.visibility).toBe('closed')
+    expect(participant.socketIds).toEqual([])
+  })
+
+  it('a single-tab participant closing its only socket is marked closed (the ordinary case still works)', () => {
+    joinParticipant('Ada', undefined, () => 'p1', 'tab-1')
+
+    const closed = removeParticipantSocket('p1', 'tab-1')
+
+    expect(closed).toBe(true)
+    expect(participants.get('p1')!.connected).toBe(false)
+  })
+
+  it('removing an unknown socketId from a known participant is a no-op', () => {
+    joinParticipant('Ada', undefined, () => 'p1', 'tab-1')
+
+    const closed = removeParticipantSocket('p1', 'never-joined')
+
+    expect(closed).toBe(false)
+    expect(participants.get('p1')!.socketIds).toEqual(['tab-1'])
+    expect(participants.get('p1')!.connected).toBe(true)
+  })
+
+  it('removing a socket from an unknown participantId is a no-op, not a throw', () => {
+    expect(() => removeParticipantSocket('does-not-exist', 'tab-1')).not.toThrow()
+    expect(removeParticipantSocket('does-not-exist', 'tab-1')).toBe(false)
+  })
+
+  it('removing the same already-gone socket twice does not re-report "closed" the second time', () => {
+    joinParticipant('Ada', undefined, () => 'p1', 'tab-1')
+
+    expect(removeParticipantSocket('p1', 'tab-1')).toBe(true)
+    // The participant is already closed — a duplicate/late disconnect event
+    // for the same socket must not report `true` again (no second broadcast
+    // for something that already happened).
+    expect(removeParticipantSocket('p1', 'tab-1')).toBe(false)
   })
 })
 

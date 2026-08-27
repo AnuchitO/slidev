@@ -330,13 +330,16 @@ server-restart verification, not a hypothetical: the client's first attempt
 was discarding the fallback's newly-minted id entirely and, on the
 participant's next click of "Join," asking the server for a **third**
 identity — orphaning the fallback's second one. That orphan can never be
-cleaned up: it shares its `socketId` with the socket that goes on to become
-the _real_ (third) participant, so `sweepStaleParticipants`'s "is this
-socket still connected" check (`workshop-tracker-server`'s `presence.ts`)
-keeps finding it alive forever, and a clean `disconnect` only updates
-whichever participant `socket.data.participantId` currently points at (the
-real one) — the dashboard would show a permanent, un-closeable duplicate row
-for the rest of the session.
+cleaned up: at the time this was found, it shared its (singular, pre-follow-
+up-fix) `socketId` with the socket that goes on to become the _real_ (third)
+participant, so `sweepStaleParticipants`'s "is this socket still connected"
+check (`workshop-tracker-server`'s `presence.ts`) kept finding it alive
+forever, and a clean `disconnect` only updated whichever participant
+`socket.data.participantId` currently pointed at (the real one) — the
+dashboard would show a permanent, un-closeable duplicate row for the rest of
+the session. (`socketId` later became `socketIds`, plural, for an unrelated
+follow-up fix — see this server's README on multi-tab presence — but the
+underlying orphaning mechanism described here is the same either way.)
 
 Fix: `JoinScreen.vue` now remembers the fallback ack's own `participantId`
 (`pendingParticipantId`) and resumes _that_ id on the next submit instead of

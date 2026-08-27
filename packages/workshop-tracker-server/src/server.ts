@@ -19,6 +19,7 @@ import {
   listErrorReports,
   listStepStatus,
   participants,
+  removeParticipantSocket,
   resolveErrorReport,
   session,
   setStepStatus,
@@ -382,16 +383,17 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
         return
       // Close the loop back to the *specific* participant who filed this
       // report — not a broadcast, and not the dashboard room (they already
-      // got it via the `state:update` above). `participant.socketId` always
-      // points at that participant's *current* socket (kept fresh by
-      // `joinParticipant` on every join, including a resume on a new
-      // socket after a refresh — plan 030), so this reaches them even if
-      // they reconnected since filing the report. If they've disconnected
-      // entirely, `io.to(...)` on a socket id with nobody listening is a
-      // harmless no-op — there's nothing to notify.
+      // got it via the `state:update` above). Targets *every* socket
+      // currently in `reporter.socketIds`, not just one: a participant can
+      // have this identity open in more than one tab (the `localStorage`
+      // resume), and `.to()` accepts an array of rooms — each socket is
+      // implicitly in a room named by its own id — so every open tab of
+      // theirs sees the notification, not just whichever tab happened to
+      // join most recently. If they've disconnected entirely, `socketIds` is
+      // empty and `io.to([])` is a harmless no-op — there's nothing to notify.
       const reporter = participants.get(report.participantId)
       if (reporter) {
-        io.to(reporter.socketId).emit('participant:errorResolved', {
+        io.to(reporter.socketIds).emit('participant:errorResolved', {
           errorId: report.id,
           stepId: report.stepId,
           message: report.resolutionMessage,
@@ -463,16 +465,19 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
       const participantId = socket.data.participantId as string | undefined
       if (!participantId)
         return
-      const participant = participants.get(participantId)
-      if (!participant)
-        return
-      // A clean Socket.io `disconnect` is a definitive, immediate signal —
-      // mark `closed` right away rather than waiting for the periodic sweep
-      // below (plan 029 Step 3: "use both signals ... since [the sweep]
-      // adds unnecessary latency for the common clean-close case").
-      participant.connected = false
-      participant.visibility = 'closed'
-      broadcastStateUpdate(io)
+      // A clean Socket.io `disconnect` is a definitive, immediate signal for
+      // *this one socket* — mark the participant `closed` right away rather
+      // than waiting for the periodic sweep below (plan 029 Step 3: "use
+      // both signals ... since [the sweep] adds unnecessary latency for the
+      // common clean-close case") — but only once every socket representing
+      // this participant is gone (see `removeParticipantSocket`'s doc
+      // comment): a second tab closing must not flip a participant offline
+      // while a first tab, still open and connected, is the reason this
+      // participant is genuinely still `viewing now`. Only broadcast when
+      // that actually happened — removing one of several live sockets
+      // changes nothing the dashboard renders.
+      if (removeParticipantSocket(participantId, socket.id))
+        broadcastStateUpdate(io)
     })
   })
 
@@ -481,9 +486,11 @@ export function createWorkshopTrackerServer(options: CreateWorkshopTrackerServer
   // checked against Socket.io's own live socket registry
   // (`io.sockets.sockets`, keyed by socket id) rather than trusting
   // `participant.connected` alone, which is exactly the signal this sweep
-  // exists to correct when it's gone stale.
+  // exists to correct when it's gone stale. A participant counts as
+  // connected here if *any* of its `socketIds` is still live — same
+  // multi-tab reasoning as the `disconnect` handler above.
   const sweepIntervalId = setInterval(() => {
-    const changed = sweepStaleParticipants(participants, participant => io.sockets.sockets.has(participant.socketId))
+    const changed = sweepStaleParticipants(participants, participant => participant.socketIds.some(id => io.sockets.sockets.has(id)))
     if (changed)
       broadcastStateUpdate(io)
   }, options.sweepIntervalMs ?? HEARTBEAT_INTERVAL_MS)

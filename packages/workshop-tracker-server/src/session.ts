@@ -44,15 +44,25 @@ export interface Participant {
   connected: boolean
   visibility: ParticipantVisibility
   /**
-   * The Socket.io socket id this participant is currently attached to.
-   * Needed by `presence.ts`'s staleness sweep to ask "is the socket this
-   * participant last spoke through still actually connected" without that
-   * module reaching into `io.sockets.sockets` itself (kept injectable/pure
-   * for testing — see `presence.test.ts`). Updated on every
-   * `participant:join` (including a rejoin on a new socket after a
-   * reconnect).
+   * Every Socket.io socket id currently representing this participant —
+   * plural, not singular. The same participant identity can legitimately be
+   * open in more than one browser tab at once (the `localStorage`-backed
+   * resume — see `participantIdentity.ts` — means a second tab on the same
+   * browser resumes the *same* participant rather than minting a new one).
+   * A single `socketId` string couldn't represent that: opening a second tab
+   * used to overwrite it, so closing that second tab's socket unconditionally
+   * marked the whole participant `closed` — and silently misdirected the
+   * `presenter:resolveError` notification (`server.ts`) at a dead socket —
+   * even though the first tab was still open, connected, and actively
+   * viewing. Reported as a real bug from live use, not a hypothetical.
+   *
+   * `connected`/`visibility` are accurate as long as this array is
+   * non-empty; a participant only becomes `closed` once every socket in it
+   * has disconnected — see `removeParticipantSocket` below, and
+   * `presence.ts`'s staleness sweep (which checks whether *any* of these are
+   * still live) for the other place that matters.
    */
-  socketId: string
+  socketIds: string[]
 }
 
 /**
@@ -125,11 +135,21 @@ export function joinParticipant(name: string, existingId: string | undefined, ge
     // *new* participant, below.
     existing.connected = true
     existing.lastSeen = now
-    // A (re)join always means the tab is frontmost/interactive again — reset
-    // visibility to 'visible' rather than leaving a stale 'hidden'/'closed'
-    // from before the reconnect, and re-point socketId at the new socket.
+    // A (re)join always means *this* tab is frontmost/interactive again —
+    // reset visibility to 'visible' rather than leaving a stale
+    // 'hidden'/'closed' from before this socket connected. This is a
+    // reasonable simplification even in the multi-tab case (the tab that
+    // just joined/resumed is the one the participant is presumably looking
+    // at right now); an existing second tab's own heartbeat/visibility
+    // reporting is unaffected and keeps correcting the picture independently.
     existing.visibility = 'visible'
-    existing.socketId = socketId
+    // Add, don't replace — see `socketIds`' own doc comment for the bug this
+    // fixes. A same-tab refresh's *old* socket disconnects on its own
+    // (Socket.io's `disconnect` event fires when a page unloads), which
+    // removes it via `removeParticipantSocket` below; there's nothing to
+    // proactively evict here.
+    if (!existing.socketIds.includes(socketId))
+      existing.socketIds.push(socketId)
     return { participant: existing, outcome: 'resumed' }
   }
 
@@ -140,10 +160,39 @@ export function joinParticipant(name: string, existingId: string | undefined, ge
     lastSeen: now,
     connected: true,
     visibility: 'visible',
-    socketId,
+    socketIds: [socketId],
   }
   participants.set(participant.id, participant)
   return { participant, outcome: existingId ? 'resume-fallback' : 'fresh' }
+}
+
+/**
+ * Removes one socket from a participant's live-socket set — called from
+ * `server.ts`'s `disconnect` handler. Only flips the participant to
+ * `connected: false, visibility: 'closed'` once *every* socket representing
+ * it is gone, not on the first one to close (see `socketIds`' doc comment
+ * for why that distinction is the actual bug fix here). Returns whether this
+ * removal was the one that fully closed the participant, so the caller knows
+ * whether there's anything user-visible to broadcast — removing one socket
+ * out of several changes nothing the dashboard renders.
+ *
+ * A stale dead socket id belonging to a participant that still has at least
+ * one other live socket is left in the array rather than proactively pruned
+ * here — harmless (a workshop-scale session never accumulates enough of
+ * these to matter) and self-corrects the next time that specific socket's
+ * own `disconnect` fires. `presence.ts`'s staleness sweep clears the whole
+ * array in one go when it determines a participant is fully gone.
+ */
+export function removeParticipantSocket(participantId: string, socketId: string): boolean {
+  const participant = participants.get(participantId)
+  if (!participant)
+    return false
+  participant.socketIds = participant.socketIds.filter(id => id !== socketId)
+  if (participant.socketIds.length > 0 || !participant.connected)
+    return false
+  participant.connected = false
+  participant.visibility = 'closed'
+  return true
 }
 
 export function setStepStatus(participantId: string, stepId: string, state: StepState): void {

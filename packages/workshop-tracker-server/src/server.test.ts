@@ -498,6 +498,94 @@ describe('createWorkshopTrackerServer', () => {
       expect(row?.visibility).toBe('closed')
     })
 
+    // Follow-up bug found in live use: open a second tab (localStorage
+    // resume — plan 030's follow-on fix — means it resumes the *same*
+    // participant, on a second socket), close that second tab, and the
+    // first tab is still open/connected — the participant must stay
+    // `viewing now`, not flip to `closed` just because one of its two
+    // sockets disconnected.
+    it('closing a second tab for the same participant does not mark them closed while the first tab is still connected', async () => {
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      await joinAsDashboard(dashboard)
+      await initialSnapshot
+
+      const tab1 = await connectClient()
+      const { participantId } = await join(tab1) as { participantId: string }
+      await waitForMatchingStateUpdate<{ participants: Array<{ id: string }> }>(
+        dashboard,
+        p => p.participants.some(x => x.id === participantId),
+      )
+
+      // Second tab, same browser: resumes by supplying the same participantId
+      // (mirrors `JoinScreen.vue`'s localStorage-backed auto-resume).
+      const tab2 = await connectClient()
+      await emitWithAck(tab2, 'participant:join', { name: 'Ada', participantId, roomCode: TEST_ROOM_CODE })
+
+      // Close only the second tab.
+      const afterTab2Close = waitForMatchingStateUpdate<{ participants: Array<{ id: string, connected: boolean }> }>(
+        dashboard,
+        p => p.participants.find(x => x.id === participantId)?.connected === false,
+      )
+      tab2.disconnect()
+      // No `state:update` marks this participant closed — removing one of
+      // two live sockets isn't a user-visible change, so `server.ts` doesn't
+      // even broadcast for it (see `removeParticipantSocket`'s return
+      // value). Race a short timeout against the (should-never-resolve)
+      // "closed" update to prove that.
+      const raced = await Promise.race([
+        afterTab2Close.then(() => 'closed (BUG)'),
+        new Promise<string>(resolve => setTimeout(resolve, 300, 'still connected (expected)')),
+      ])
+      expect(raced).toBe('still connected (expected)')
+      expect(participants.get(participantId)?.connected).toBe(true)
+      expect(participants.get(participantId)?.visibility).not.toBe('closed')
+
+      // Now close the *first* (last remaining) tab — this one really should
+      // close the participant.
+      const afterTab1Close = waitForMatchingStateUpdate<{ participants: Array<{ id: string, connected: boolean, visibility: string }> }>(
+        dashboard,
+        p => p.participants.some(x => x.id === participantId && !x.connected),
+      )
+      tab1.disconnect()
+      const finalPayload = await afterTab1Close
+      const row = finalPayload.participants.find(p => p.id === participantId)
+      expect(row?.connected).toBe(false)
+      expect(row?.visibility).toBe('closed')
+    })
+
+    it('presenter:resolveError notifies every open tab of the reporting participant, not just the most recently joined one', async () => {
+      const tab1 = await connectClient()
+      const { participantId } = await join(tab1) as { participantId: string }
+      const tab2 = await connectClient()
+      await emitWithAck(tab2, 'participant:join', { name: 'Ada', participantId, roomCode: TEST_ROOM_CODE })
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      // Report from tab1 — before the fix, this made tab2 (the more
+      // recently *joined* socket) the participant's sole `socketId`, so a
+      // resolution notification could only ever reach tab2, never tab1.
+      tab1.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      const tab1Notified = waitFor<{ errorId: string }>(tab1, 'participant:errorResolved')
+      const tab2Notified = waitFor<{ errorId: string }>(tab2, 'participant:errorResolved')
+      const presenter = await connectClient()
+      presenter.emit('presenter:resolveError', { errorId, presenterCode: TEST_PRESENTER_CODE })
+
+      const [tab1Result, tab2Result] = await Promise.all([tab1Notified, tab2Notified])
+      expect(tab1Result.errorId).toBe(errorId)
+      expect(tab2Result.errorId).toBe(errorId)
+    })
+
     it('the periodic staleness sweep closes a hung participant whose socket is gone, without a clean disconnect', async () => {
       // A short sweep interval (instead of the production 5s default) keeps
       // this an integration smoke test for the *wiring*, not a re-test of

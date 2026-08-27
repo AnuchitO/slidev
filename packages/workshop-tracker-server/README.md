@@ -139,13 +139,16 @@ duration; don't reuse a workshop's room code as a password anywhere else.
   `state:update` broadcast on its own (a bare liveness tick doesn't change
   anything the dashboard renders).
 - A participant is marked `visibility: 'closed'`, `connected: false` in two
-  ways: **immediately** on a clean Socket.io `disconnect` (`src/server.ts`),
-  or, for a _hung_ connection that never fires one (flaky workshop wifi), by
-  a periodic sweep (`sweepStaleParticipants`, `src/presence.ts`) that runs
-  every `HEARTBEAT_INTERVAL_MS` and closes a participant once its `lastSeen`
-  is stale (> `STALE_AFTER_MS`, 3x the heartbeat interval) **and** its
-  socket is no longer actually connected. Staleness alone is never enough —
-  see that function's own doc comment.
+  ways: **immediately** on a clean Socket.io `disconnect` (`src/server.ts`,
+  via `removeParticipantSocket`), or, for a _hung_ connection that never
+  fires one (flaky workshop wifi), by a periodic sweep
+  (`sweepStaleParticipants`, `src/presence.ts`) that runs every
+  `HEARTBEAT_INTERVAL_MS` and closes a participant once its `lastSeen` is
+  stale (> `STALE_AFTER_MS`, 3x the heartbeat interval) **and** none of its
+  sockets are still actually connected. Staleness alone is never enough —
+  see that function's own doc comment. A participant can have more than one
+  live socket at once (`Participant.socketIds`, plural) — see "Real gap
+  found: multi-tab presence" below.
 
 **M3 (error reporting)**
 
@@ -191,6 +194,36 @@ participants[], errors[] }` shape) rather than a new event, per plan 028
   requirement in the PRD for cross-restart persistence (§4 non-goals), so
   none was built; flagged as a 030 hardening candidate if disk usage over a
   long session turns out to matter.
+
+## Real gap found: multi-tab presence (follow-up fix)
+
+Reported from live use, not a hypothetical: a participant opens a second
+browser tab to the same deck (the `localStorage`-backed resume — see the
+addon's `participantIdentity.ts` — means the second tab resumes the _same_
+participant identity, not a new one). They close the second tab. The
+dashboard immediately shows them `closed` — even though the _first_ tab is
+still open, connected, and actively being watched — and only recovers if
+that first tab happens to refresh.
+
+Root cause: `Participant` used to carry a single `socketId: string`.
+`joinParticipant`'s resume path **overwrote** it on every join, so the
+second tab's join silently made the first tab's socket unreachable for
+presence purposes — closing the second tab's socket then looked
+indistinguishable from "the participant's only socket disconnected," and
+`presenter:resolveError`'s targeted notification (see the M3 events above)
+had the same bug for a different reason: it would only ever reach whichever
+tab most recently joined, never an earlier still-open one.
+
+Fix: `Participant.socketIds` is now an array, not a single string.
+`joinParticipant` **adds** to it on join/resume rather than replacing it;
+`removeParticipantSocket` (new, `src/session.ts`) removes just the
+disconnecting socket and only flips the participant to
+`closed`/`connected: false` once the array is empty — closing one of several
+tabs is correctly a no-op for presence (and doesn't even trigger a
+`state:update` broadcast, since nothing user-visible changed).
+`sweepStaleParticipants`'s "is this still connected" check and
+`presenter:resolveError`'s notification both now consider _every_ socket in
+the array, not just one.
 
 ## Dashboard
 
@@ -243,9 +276,15 @@ paths (wrong/missing room code, wrong/missing presenter code on each of
 `presenter:setSlide`/`presenter:setStep`/`presenter:resolveError`/
 `dashboard:join`), the presence events, and the `POST /api/screenshot` /
 `GET /uploads/:filename` contract (valid upload, unknown `participantId`,
-missing/oversized/unsupported-type file, and path-traversal rejection).
-`src/auth.test.ts` unit-tests `auth.ts`'s constant-time code comparison,
-`src/presence.test.ts` unit-tests `presence.ts`'s staleness sweep (fake
-timers, no real sleeps), and `src/session.test.ts` / `src/uploads.test.ts`
-cover the pure store/path logic directly. Left in place for 030 to extend
-rather than starting from scratch.
+missing/oversized/unsupported-type file, and path-traversal rejection). It
+also covers the multi-tab presence fix above directly: two sockets joined as
+the same participant, closing the second one leaves them `connected` (and
+doesn't even broadcast), only closing the _last_ one flips them `closed`;
+and a `presenter:resolveError` notification reaching every open tab, not
+just the most recently joined one. `src/auth.test.ts` unit-tests `auth.ts`'s
+constant-time code comparison, `src/presence.test.ts` unit-tests
+`presence.ts`'s staleness sweep including the "stale but one socket among
+several is still alive" case (fake timers, no real sleeps), and
+`src/session.test.ts` (including `removeParticipantSocket`'s own unit
+coverage) / `src/uploads.test.ts` cover the pure store/path logic directly.
+Left in place for 030 to extend rather than starting from scratch.

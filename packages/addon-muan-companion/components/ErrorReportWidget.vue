@@ -97,6 +97,7 @@ separate standalone page the instructor opens directly, not embedded in
 the deck, so there's no equivalent theme signal to react to there.
 -->
 <script setup lang="ts">
+import type { ConfirmResolutionPayload, ErrorResolvedPayload, PresenterMessagePayload } from '../src/socketEvents'
 import { useDarkMode, useNav } from '@slidev/client'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { getMuanCompanionServerUrl, getWorkshopSocket } from '../src/client'
@@ -321,7 +322,7 @@ const resolutionPhase = ref<ResolutionPhase>('prompt')
 const reopenMessage = ref('')
 let resolutionFadeTimer: ReturnType<typeof setTimeout> | undefined
 
-function onErrorResolved(payload: { errorId: string, stepId: string, status: string, message?: string }) {
+function onErrorResolved(payload: ErrorResolvedPayload) {
   // Keyed on `errorId`, not appended to any list: this can legitimately
   // fire again for the same report (reopened, then marked resolved a
   // second time) or for a different one while an earlier card is still
@@ -343,7 +344,8 @@ function confirmFixed() {
   const card = resolutionCard.value
   if (!card)
     return
-  getWorkshopSocket().emit('participant:confirmResolution', { errorId: card.errorId, confirmed: true })
+  const payload: ConfirmResolutionPayload = { errorId: card.errorId, confirmed: true }
+  getWorkshopSocket().emit('participant:confirmResolution', payload)
   resolutionPhase.value = 'confirmed'
   scheduleResolutionFade()
 }
@@ -367,7 +369,7 @@ function sendReopen() {
   if (!card)
     return
   const trimmed = reopenMessage.value.trim()
-  const payload: { errorId: string, confirmed: boolean, message?: string } = { errorId: card.errorId, confirmed: false }
+  const payload: ConfirmResolutionPayload = { errorId: card.errorId, confirmed: false }
   if (trimmed)
     payload.message = trimmed
   getWorkshopSocket().emit('participant:confirmResolution', payload)
@@ -422,7 +424,7 @@ function scheduleMessageDismiss() {
   }, 10_000)
 }
 
-function onPresenterMessage(payload: { errorId: string, stepId: string, text: string }) {
+function onPresenterMessage(payload: PresenterMessagePayload) {
   // Same "key on errorId, replace whichever is showing" posture as the
   // resolution card — a second plain reply (on this report or another)
   // while one notice is already up simply replaces it rather than queuing.

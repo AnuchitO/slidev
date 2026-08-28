@@ -88,6 +88,18 @@ export interface JoinAck {
   resumed: boolean
 }
 
+/**
+ * The other shape a `participant:join` ack can take (plan 029: the server
+ * rejects a wrong/missing room code this way rather than a forced
+ * disconnect — see `JoinScreen.vue`'s call site). Exported alongside
+ * `JoinAck` above so `JoinScreen.vue`'s ack callback can type its
+ * `JoinAck | JoinErrorAck` parameter against this single source of truth
+ * instead of redeclaring the same two object shapes inline.
+ */
+export interface JoinErrorAck {
+  error: string
+}
+
 export type JoinAckOutcome = 'joined' | 'resume-failed'
 
 /**

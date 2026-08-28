@@ -34,6 +34,7 @@ else" button rendered after a successful resume, calling
 `clearStoredParticipant()` and re-showing this join form blank.
 -->
 <script setup lang="ts">
+import type { JoinAck, JoinErrorAck } from '../src/participantIdentity'
 import { useNav } from '@slidev/client'
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { getWorkshopSocket } from '../src/client'
@@ -96,7 +97,7 @@ function join(joinName: string, joinRoomCode: string | undefined, participantId?
   getWorkshopSocket().emit(
     'participant:join',
     { name: joinName, participantId, roomCode: joinRoomCode },
-    (ack: { participantId: string, currentSlideIndex: number, resumed: boolean } | { error: string }) => {
+    (ack: JoinAck | JoinErrorAck) => {
       submitting.value = false
       // Plan 029: the server rejects a wrong/missing room code via this ack
       // rather than a forced disconnect — surface it so the participant can
@@ -156,19 +157,31 @@ function join(joinName: string, joinRoomCode: string | undefined, participantId?
 }
 
 onMounted(() => {
+  // Bug fix (found in this review): this whole callback — not just the
+  // `participant:connecting` emit below — has to be skipped on the
+  // presenter route. This component mounts on *every* route (its template's
+  // own `v-if="!isPresenter"` only hides the overlay, it doesn't stop
+  // `onMounted` from running), and the guard used to cover only the
+  // anonymous "connecting" ping just below. That left a worse hole open:
+  // `readStoredParticipant()` reads whatever this *browser* last joined as,
+  // with no awareness of route — an instructor opening `/presenter/N` in the
+  // same browser profile they'd previously used to test the participant
+  // join flow (a common local-dev pattern) would silently auto-resume that
+  // stored identity onto the *presenter's own socket*, fully joining as a
+  // participant rather than merely appearing as an anonymous pending row.
+  // Returning early here, before either side effect, keeps the presenter's
+  // socket from ever acquiring a `participantId` in the first place.
+  if (isPresenter.value)
+    return
+
   // Pre-join dashboard visibility (`server.ts`'s `participant:connecting`
   // handler): lets the presenter see "someone's here" the moment a
   // participant browser loads, before they've typed a name or clicked
-  // Join. Guarded on `!isPresenter` — this component mounts on *every*
-  // route (its template's own `v-if="!isPresenter"` only hides the overlay,
-  // it doesn't stop `onMounted` from running) — without this guard the
-  // presenter's own tab would show up as an anonymous "pending" row on
-  // their own dashboard, which would be actively confusing. Fired
-  // unconditionally otherwise (whether about to auto-resume below or show
-  // the fresh-join form) — either way this socket is "here but not joined
-  // yet" until the `participant:join` call further down actually succeeds.
-  if (!isPresenter.value)
-    getWorkshopSocket().emit('participant:connecting')
+  // Join. Fired unconditionally from here on (whether about to auto-resume
+  // below or show the fresh-join form) — either way this socket is "here
+  // but not joined yet" until the `participant:join` call further down
+  // actually succeeds.
+  getWorkshopSocket().emit('participant:connecting')
 
   const stored = readStoredParticipant()
   if (stored) {

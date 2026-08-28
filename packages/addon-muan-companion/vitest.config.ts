@@ -14,5 +14,20 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   test: {
     environment: 'jsdom',
+    coverage: {
+      provider: 'v8',
+      // Without an explicit `include`, v8's default coverage report only
+      // lists files that were actually transformed/imported by a test run —
+      // a file with zero tests (e.g. `client.ts` before this addon's
+      // coverage pass added `client.test.ts`) would silently vanish from the
+      // report instead of showing up as an honest 0%. Scoping to `src/**` —
+      // this package's pure-logic modules — deliberately excludes the
+      // `.vue` components and `setup/main.ts`: those have no dedicated test
+      // harness today (see this addon's coverage-pass notes / README), so
+      // including them here would just add permanent, misleading 0% rows
+      // rather than reflecting a real gap this config is meant to catch.
+      include: ['src/**/*.ts'],
+      exclude: ['src/**/*.test.ts'],
+    },
   },
 })

@@ -349,6 +349,15 @@ describe('error report store (M3)', () => {
     expect(result?.thread).toEqual([{ from: 'participant', text: 'any update?', ts: expect.any(Number) }])
   })
 
+  it('addParticipantMessage with a blank message is a no-op', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'question', ts: 1 })
+
+    const result = addParticipantMessage('err-1', '   ')
+
+    expect(result).toBeUndefined()
+    expect(listErrorReports()[0].thread).toEqual([])
+  })
+
   it('confirmResolution(true) moves a report to resolved and can append a participant message', () => {
     addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
     resolveErrorReport('err-1', 'try this fix')

@@ -9,6 +9,7 @@
     "build": "tsdown",
     "start": "node dist/index.mjs",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "load-test": "tsx scripts/load-test.ts"
   },
   "dependencies": {
@@ -24,6 +25,7 @@
     "@types/connect": "catalog:types",
     "@types/node": "catalog:types",
     "@types/qrcode": "^1.5.6",
+    "@vitest/coverage-v8": "4.1.10",
     "socket.io-client": "^4.8.3",
     "tsdown": "catalog:dev",
     "tsx": "catalog:dev",

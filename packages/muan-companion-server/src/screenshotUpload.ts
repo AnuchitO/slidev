@@ -160,7 +160,20 @@ export function createScreenshotUploadHandler(uploadsDir: string, onUploaded: (r
         onUploaded(report)
         res.writeHead(201, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ id: report.id, screenshotUrl: report.screenshotUrl }))
-      })()
+      })().catch(() => {
+        // Belt-and-suspenders, same reasoning as `getJoinQrDataUrl`'s own
+        // `.catch` in `server.ts`: this `connect` middleware runs outside
+        // any framework that would catch a listener's own async rejection
+        // for you, so an uncaught one here would surface as a process-level
+        // `unhandledRejection` instead of a contained HTTP failure. Nothing
+        // inside the IIFE above is expected to actually reject (every
+        // awaited call already resolves-not-rejects on its own error path —
+        // see `deleteQuietly` and the `writeStream`/`stream` `'error'`
+        // listeners upstream), so this is a backstop against an unforeseen
+        // failure, not a path this suite's tests are expected to exercise.
+        if (!res.headersSent)
+          respond(res, 500, 'internal error handling screenshot upload')
+      })
     })
 
     req.pipe(bb)

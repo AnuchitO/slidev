@@ -1,4 +1,5 @@
 import type { Server as HttpServer, IncomingMessage, ServerResponse } from 'node:http'
+import type { Socket } from 'socket.io'
 import type { WorkshopAuthConfig } from './auth'
 import type { HelpRequestKind, ParticipantVisibility, StepState } from './session'
 import { randomUUID } from 'node:crypto'
@@ -113,6 +114,73 @@ export function buildJoinUrl(deckUrl: string, roomCode: string): string | undefi
 export interface MuanCompanionServer {
   httpServer: HttpServer
   io: SocketIOServer
+}
+
+/**
+ * The one field every `presenter:*` event payload carries in common (plan
+ * 029 Step 1). Named and shared, rather than `presenterCode?: string`
+ * appearing as its own inline fragment in six different handler payload
+ * types below, so `requirePresenterCode`'s generic constraint (immediately
+ * below) has one real type to reference instead of duck-typing against a
+ * structurally-repeated-but-never-named shape.
+ */
+interface WithPresenterCode {
+  presenterCode?: string
+}
+
+/**
+ * Wraps a `presenter:*` socket handler so the shared "no-op on
+ * invalid/missing presenterCode" gate (plan 029 Step 1) lives in one place
+ * instead of being repeated as an `if (!isValidPresenterCode(...)) return`
+ * at the top of every handler below — six of them, before this existed,
+ * all with the identical rejection shape: do nothing at all, no ack, no
+ * disconnect, matching each event's pre-029 no-ack shape and the plan's own
+ * verify step ("rejected/ignored, verified via ... the fact that no other
+ * client's slide moves") rather than surfacing an error back to a
+ * stray/misconfigured client. `dashboard:join` deliberately does **not**
+ * use this wrapper — its rejection acks `{ ok: false }` instead of silently
+ * doing nothing, a genuinely different shape, not just a variant worth
+ * generalizing this helper over for a single caller.
+ */
+function requirePresenterCode<T extends WithPresenterCode>(authConfig: WorkshopAuthConfig, handler: (payload: T) => void) {
+  return (payload: T) => {
+    if (!isValidPresenterCode(authConfig, payload.presenterCode))
+      return
+    handler(payload)
+  }
+}
+
+/**
+ * The `dashboard:join` ack shape — named and exported rather than inlined
+ * at the one `ack?: (result: {...}) => void` parameter that used to declare
+ * it, both so the handler's own signature reads as one line instead of a
+ * multi-field inline type, and so `server.test.ts` (which used to keep an
+ * independent copy of this exact shape, `DashboardJoinAck`, purely for its
+ * own assertions) can import this instead — one definition, so the two can
+ * never quietly drift apart on a field name/optionality.
+ */
+export interface DashboardJoinAck {
+  ok: boolean
+  roomCode?: string
+  presenterCode?: string
+  /**
+   * The Slidev deck URL participants should open — see
+   * `CreateMuanCompanionServerOptions.deckUrl`'s own doc comment. Always
+   * present alongside `ok: true`: unlike `joinUrl`/`joinQrDataUrl` below,
+   * this doesn't depend on a room code being configured (it's just the
+   * server's own static config), so there's no "nothing valid to show
+   * yet" case for it the way there is for the other two.
+   */
+  deckUrl?: string
+  /** See `buildJoinUrl`'s doc comment — `undefined` iff no room code is configured. */
+  joinUrl?: string
+  /**
+   * A `data:image/png;base64,...` string encoding `joinUrl` (see
+   * `getJoinQrDataUrl` below) — `undefined` in lockstep with `joinUrl`
+   * (there's nothing to encode without it), never a separate failure
+   * mode of its own.
+   */
+  joinQrDataUrl?: string
 }
 
 // Sockets that have joined this room get every `state:update` broadcast —
@@ -333,16 +401,106 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       participant.lastSeen = Date.now()
   }
 
-  io.on('connection', (socket) => {
-    // Sync the newly-connected client to current state immediately — needed
-    // for M1's own acceptance bar (a participant who loads *after* the
-    // presenter has already moved past slide 1 must still land on the right
-    // slide). This event isn't in PRD §10's list; it's the minimum addition
-    // needed to make `slide:changed` (a rebroadcast-only event) useful to
-    // late joiners, and is a deliberate, documented addition — not scope
-    // creep.
-    socket.emit('slide:sync', { index: session.currentSlideIndex })
+  // A client can only ever act on behalf of the participant it joined as
+  // (`socket.data.participantId`, set on `participant:join` below) — shared
+  // by every participant-scoped handler that needs that id and treats a
+  // not-yet-joined socket as a no-op rather than a guess. Named and pulled
+  // out once a sixth call site (`participant:heartbeat`) started repeating
+  // the identical `socket.data.participantId as string | undefined` cast.
+  function getJoinedParticipantId(socket: Socket): string | undefined {
+    return socket.data.participantId as string | undefined
+  }
 
+  // Looks up the participant who filed a given error report, or does
+  // nothing — shared by every handler that needs to notify the *specific*
+  // reporting participant back (mirrors `presenter:resolveError`'s original
+  // inline version of this same lookup pair, pulled out once a second
+  // handler needed it too). Defined once here rather than freshly per
+  // connection: neither this nor `notifyReporter`/`errorReportOwnedBy`
+  // below reference `socket` at all, so redefining them inside
+  // `io.on('connection', ...)` would just allocate three new, identical
+  // closures on every single connection for no behavioral difference.
+  // Takes the report itself, not `| undefined` — both call sites below
+  // already check their own lookup's result (`if (!report) return`) before
+  // ever reaching this, so accepting `undefined` here would just be a
+  // second, unreachable defensive check duplicating the caller's own.
+  // Returning `undefined` remains a real, reachable outcome of *this*
+  // function though — the reporting participant's own record can be gone
+  // (e.g. `presenter:kickParticipant` deleted it — reports are append-only,
+  // see `removeParticipant`'s doc comment) even though their past report
+  // still exists — `notifyReporter` below is what actually no-ops on that.
+  function reporterOf(report: { participantId: string }) {
+    return participants.get(report.participantId)
+  }
+
+  // The ownership check `participant:confirmResolution` and
+  // `participant:addMessage` below both need: a report exists *and* it
+  // belongs to the calling socket's own participant. Returns the report
+  // itself (not just a boolean) so callers don't need a second lookup.
+  function errorReportOwnedBy(errorId: string, participantId: string) {
+    return listErrorReports().find(r => r.id === errorId && r.participantId === participantId)
+  }
+
+  // Targets *every* socket currently in `reporter.socketIds`, not just one:
+  // a participant can have this identity open in more than one tab (the
+  // `localStorage` resume), and `.to()` accepts an array of rooms — each
+  // socket is implicitly in a room named by its own id — so every open tab
+  // of theirs sees the notification, not just whichever tab happened to
+  // join most recently. If they've disconnected entirely, `socketIds` is
+  // empty and `io.to([])` is a harmless no-op — there's nothing to notify.
+  function notifyReporter(reporter: { socketIds: string[] } | undefined, event: string, payload: unknown) {
+    if (reporter)
+      io.to(reporter.socketIds).emit(event, payload)
+  }
+
+  /**
+   * M1's slide-sync events. Split out of the single giant `io.on('connection', ...)`
+   * body (027-030's handlers had all accumulated inline there) purely for
+   * navigability — every closure captured here (`io`, `authConfig`) is
+   * exactly what these handlers already relied on, nothing changes about
+   * when or how they fire.
+   */
+  function registerSlideHandlers(socket: Socket) {
+    socket.on('presenter:setSlide', requirePresenterCode(authConfig, ({ index }: { index: number, presenterCode?: string }) => {
+      // Plan 029 Step 1: gated on the presenter credential, distinct from
+      // the participant room code (`requirePresenterCode` above) — a
+      // stray/misconfigured client shouldn't be able to crash the server,
+      // so an invalid/missing code is a silent no-op, not a thrown error or
+      // disconnect (matches this event's pre-029 shape — no ack — and the
+      // plan's own verify step: "rejected/ignored, verified via ... the
+      // fact that no other client's slide moves").
+      session.currentSlideIndex = index
+      io.emit('slide:changed', { index })
+      broadcastStateUpdate(io)
+    }))
+
+    // Not in PRD §10's literal event list — a deliberate addition (mirroring
+    // M1's `slide:sync` precedent) so the dashboard can show a "current
+    // step" status column (plan 027 Step 3) without the server parsing deck
+    // markdown itself. Kept as its *own* event rather than folded into
+    // `presenter:setSlide` above: the addon computes `stepId` via a real
+    // mounted component reading `useNav().currentFrontmatter`
+    // (`StepReporter.vue`), which updates on its own reactive schedule,
+    // independent of when the router's `afterEach` (which drives
+    // `presenter:setSlide`) fires — see that component's own comment for
+    // why they can't share one event.
+    socket.on('presenter:setStep', requirePresenterCode(authConfig, ({ stepId }: { stepId: string, presenterCode?: string }) => {
+      session.currentStepId = stepId
+      broadcastStateUpdate(io)
+    }))
+  }
+
+  /**
+   * Participant identity: the pre-join "someone's here" signal, the actual
+   * `participant:join`/resume handshake, and the `disconnect` cleanup that
+   * closes out whichever of those two states a socket was last in. Grouped
+   * together (rather than splitting `disconnect` off into its own function)
+   * since all three exist to answer the same question over a socket's
+   * lifetime — "who is this, if anyone, and are they still here" — in a
+   * strict progression: connect → (maybe) pending → (maybe) joined →
+   * disconnect.
+   */
+  function registerParticipantLifecycleHandlers(socket: Socket) {
     // Pre-join dashboard visibility: `JoinScreen.vue` emits this once, on
     // mount, before the participant has typed a name or clicked Join —
     // *not* automatically on every connection, which is what lets this stay
@@ -355,42 +513,10 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // close that gap (nothing server-side can, short of gating the deck's
     // own static assets, well outside this addon's scope), but it makes the
     // presence visible on the dashboard instead of invisible, and pairs
-    // with `presenter:kickPendingConnection` below to let the presenter
-    // disconnect a socket they don't want around.
+    // with `presenter:kickPendingConnection` (`registerKickHandlers` below)
+    // to let the presenter disconnect a socket they don't want around.
     socket.on('participant:connecting', () => {
       addPendingConnection(socket.id)
-      broadcastStateUpdate(io)
-    })
-
-    socket.on('presenter:setSlide', ({ index, presenterCode }: { index: number, presenterCode?: string }) => {
-      // Plan 029 Step 1: gated on the presenter credential, distinct from
-      // the participant room code. Invalid/missing code is a silent no-op
-      // (matches this event's pre-029 shape — no ack — and the plan's own
-      // verify step: "rejected/ignored, verified via ... the fact that no
-      // other client's slide moves"), not a thrown error or disconnect —
-      // a stray/misconfigured client shouldn't be able to crash the server.
-      if (!isValidPresenterCode(authConfig, presenterCode))
-        return
-      session.currentSlideIndex = index
-      io.emit('slide:changed', { index })
-      broadcastStateUpdate(io)
-    })
-
-    // Not in PRD §10's literal event list — a deliberate addition (mirroring
-    // M1's `slide:sync` precedent) so the dashboard can show a "current
-    // step" status column (plan 027 Step 3) without the server parsing deck
-    // markdown itself. Kept as its *own* event rather than folded into
-    // `presenter:setSlide` above: the addon computes `stepId` via a real
-    // mounted component reading `useNav().currentFrontmatter`
-    // (`StepReporter.vue`), which updates on its own reactive schedule,
-    // independent of when the router's `afterEach` (which drives
-    // `presenter:setSlide`) fires — see that component's own comment for
-    // why they can't share one event.
-    socket.on('presenter:setStep', ({ stepId, presenterCode }: { stepId: string, presenterCode?: string }) => {
-      // Plan 029 Step 1: same gate as `presenter:setSlide` above.
-      if (!isValidPresenterCode(authConfig, presenterCode))
-        return
-      session.currentStepId = stepId
       broadcastStateUpdate(io)
     })
 
@@ -468,9 +594,40 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       },
     )
 
+    socket.on('disconnect', () => {
+      const participantId = getJoinedParticipantId(socket)
+      if (!participantId) {
+        // Never joined — if this socket had announced itself as pending
+        // (`participant:connecting` above), it needs to disappear from the
+        // dashboard too, not just linger as a "still connecting" row
+        // forever. A presenter/dashboard socket (never pending in the first
+        // place) hits `removePendingConnection`'s own no-op path here,
+        // matching this handler's pre-existing behavior for those.
+        if (removePendingConnection(socket.id))
+          broadcastStateUpdate(io)
+        return
+      }
+      // A clean Socket.io `disconnect` is a definitive, immediate signal for
+      // *this one socket* — mark the participant `closed` right away rather
+      // than waiting for the periodic sweep below (plan 029 Step 3: "use
+      // both signals ... since [the sweep] adds unnecessary latency for the
+      // common clean-close case") — but only once every socket representing
+      // this participant is gone (see `removeParticipantSocket`'s doc
+      // comment): a second tab closing must not flip a participant offline
+      // while a first tab, still open and connected, is the reason this
+      // participant is genuinely still `viewing now`. Only broadcast when
+      // that actually happened — removing one of several live sockets
+      // changes nothing the dashboard renders.
+      if (removeParticipantSocket(participantId, socket.id))
+        broadcastStateUpdate(io)
+    })
+  }
+
+  /** M2's per-step `copied`/`done` tracking. */
+  function registerStepTrackingHandlers(socket: Socket) {
     function handleStepAction(state: StepState) {
       return ({ stepId }: { stepId: string }, ack?: (payload: { stepId: string, state: StepState }) => void) => {
-        const participantId = socket.data.participantId as string | undefined
+        const participantId = getJoinedParticipantId(socket)
         // A client can only act on behalf of the participant it joined as
         // (set on `participant:join` above) — a socket that hasn't joined
         // yet has nothing to attach the status to, so this is a no-op
@@ -486,7 +643,17 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
 
     socket.on('participant:copy', handleStepAction('copied'))
     socket.on('participant:done', handleStepAction('done'))
+  }
 
+  /**
+   * M3's error/help-request reporting, extended by the "Ask for Help"
+   * redesign's two-way problem/question + confirm/reopen + presenter↔
+   * participant messaging. The largest, most repetitive cluster of handlers
+   * in this file (five events sharing the `reporterOf`/`notifyReporter`/
+   * `errorReportOwnedBy` helpers above) — the main beneficiary of splitting
+   * `io.on('connection', ...)` into named groups at all.
+   */
+  function registerHelpRequestHandlers(socket: Socket) {
     // Text-only report (PRD §10, extended by the "Ask for Help" redesign to
     // carry `kind`). The screenshot path is REST-only (`POST
     // /api/screenshot`, `screenshotUpload.ts`) — this WS event is
@@ -497,16 +664,21 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // widget's new "Ask a question" tab ever sends `'question'` explicitly.
     // No presenter/room-code check beyond having joined: same "a socket can
     // only act as the participant it joined as" rule as
-    // `participant:copy`/`done` below — the room code was already checked
+    // `participant:copy`/`done` above — the room code was already checked
     // once, at `participant:join`.
     socket.on('participant:error', ({ stepId, text, kind }: { stepId: string, text?: string, kind?: HelpRequestKind }) => {
-      const participantId = socket.data.participantId as string | undefined
+      const participantId = getJoinedParticipantId(socket)
       // Same "no-op rather than a guess" rule as `participant:copy`/`done`
       // above — a socket that hasn't joined has no participant to attach
       // the report to.
       if (!participantId)
         return
       const participant = participants.get(participantId)
+      // Defensive, not just theoretical: a presenter could in principle
+      // `presenter:kickParticipant` this exact participant in the brief
+      // window between this event being sent and being processed — the
+      // record would already be gone by the time this handler runs, while
+      // `socket.data.participantId` (set once, at join) still points at it.
       if (!participant)
         return
       addErrorReport({
@@ -524,45 +696,14 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       broadcastStateUpdate(io)
     })
 
-    // Looks up the report and the participant who filed it, or does nothing
-    // — shared by every handler below that needs to notify the *specific*
-    // reporting participant back (mirrors `presenter:resolveError`'s
-    // original inline version of this same lookup pair, pulled out once a
-    // second handler needed it too).
-    function reporterOf(report: { participantId: string } | undefined) {
-      return report ? participants.get(report.participantId) : undefined
-    }
-
-    // The ownership check `participant:confirmResolution` and
-    // `participant:addMessage` below both need: a report exists *and* it
-    // belongs to the calling socket's own participant. Returns the report
-    // itself (not just a boolean) so callers don't need a second lookup.
-    function errorReportOwnedBy(errorId: string, participantId: string) {
-      return listErrorReports().find(r => r.id === errorId && r.participantId === participantId)
-    }
-
-    // Targets *every* socket currently in `reporter.socketIds`, not just
-    // one: a participant can have this identity open in more than one tab
-    // (the `localStorage` resume), and `.to()` accepts an array of rooms —
-    // each socket is implicitly in a room named by its own id — so every
-    // open tab of theirs sees the notification, not just whichever tab
-    // happened to join most recently. If they've disconnected entirely,
-    // `socketIds` is empty and `io.to([])` is a harmless no-op — there's
-    // nothing to notify.
-    function notifyReporter(reporter: { socketIds: string[] } | undefined, event: string, payload: unknown) {
-      if (reporter)
-        io.to(reporter.socketIds).emit(event, payload)
-    }
-
-    socket.on('presenter:resolveError', ({ errorId, presenterCode, message }: { errorId: string, presenterCode?: string, message?: string }) => {
+    socket.on('presenter:resolveError', requirePresenterCode(authConfig, ({ errorId, message }: { errorId: string, message?: string, presenterCode?: string }) => {
       // Plan 029 Step 1: same presenter-credential gate as `presenter:setSlide`
-      // / `presenter:setStep` above — resolving a report is exactly as
-      // privileged as moving everyone's slide. (This handler was added by
-      // plan 028, developed concurrently with 029's auth work in a separate
-      // worktree; gating it is this merge's responsibility per plan 029's own
-      // documented merge-order caveat.)
-      if (!isValidPresenterCode(authConfig, presenterCode))
-        return
+      // / `presenter:setStep` (`registerSlideHandlers` above) — resolving a
+      // report is exactly as privileged as moving everyone's slide. (This
+      // handler was added by plan 028, developed concurrently with 029's
+      // auth work in a separate worktree; gating it is this merge's
+      // responsibility per plan 029's own documented merge-order caveat.)
+      //
       // Redesign: this no longer resolves outright — `resolveErrorReport`
       // moves the report to `'awaiting_confirmation'`, the participant gets
       // the final word via `participant:confirmResolution` below. Close the
@@ -570,9 +711,13 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // a broadcast, and not the dashboard room (they already got it via
       // the `state:update` below).
       const report = resolveErrorReport(errorId, message)
-      broadcastStateUpdate(io)
+      // Only broadcast once something actually changed — an unknown
+      // `errorId` (with an otherwise-valid presenter code) is a no-op, same
+      // "nothing to tell the dashboard" posture as every other handler here
+      // that checks its lookup's result before broadcasting.
       if (!report)
         return
+      broadcastStateUpdate(io)
       notifyReporter(reporterOf(report), 'participant:errorResolved', {
         errorId: report.id,
         stepId: report.stepId,
@@ -582,7 +727,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         // not the raw, possibly-untrimmed input.
         message: message?.trim() || undefined,
       })
-    })
+    }))
 
     // The "message box" redesign: lets the presenter reply on a report's
     // thread — "still looking into it", answering a question — without
@@ -591,9 +736,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // sees the new thread entry via the `state:update` broadcast below, and
     // the reporting participant is pushed the same message live so they
     // don't have to reopen the widget to notice it.
-    socket.on('presenter:sendMessage', ({ errorId, presenterCode, text }: { errorId: string, presenterCode?: string, text: string }) => {
-      if (!isValidPresenterCode(authConfig, presenterCode))
-        return
+    socket.on('presenter:sendMessage', requirePresenterCode(authConfig, ({ errorId, text }: { errorId: string, text: string, presenterCode?: string }) => {
       const report = addPresenterMessage(errorId, text)
       if (!report)
         return
@@ -603,7 +746,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         stepId: report.stepId,
         text: report.thread.at(-1)!.text,
       })
-    })
+    }))
 
     // The other half of the confirm/reopen redesign: the participant's
     // answer to "did that actually fix it?" after `presenter:resolveError`
@@ -616,7 +759,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // what actually stops one participant from confirming/reopening
     // another's report, not just a UI nicety.
     socket.on('participant:confirmResolution', ({ errorId, confirmed, message }: { errorId: string, confirmed: boolean, message?: string }) => {
-      const participantId = socket.data.participantId as string | undefined
+      const participantId = getJoinedParticipantId(socket)
       if (!participantId)
         return
       const report = errorReportOwnedBy(errorId, participantId)
@@ -634,7 +777,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // Same ownership restriction as `participant:confirmResolution`, for the
     // same reason.
     socket.on('participant:addMessage', ({ errorId, text }: { errorId: string, text: string }) => {
-      const participantId = socket.data.participantId as string | undefined
+      const participantId = getJoinedParticipantId(socket)
       if (!participantId)
         return
       const report = errorReportOwnedBy(errorId, participantId)
@@ -644,7 +787,10 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       touchLastSeen(participantId)
       broadcastStateUpdate(io)
     })
+  }
 
+  /** M4's presence signals: visibility changes and the liveness heartbeat. */
+  function registerPresenceHandlers(socket: Socket) {
     // PRD §10 `participant:visibility { state }` — reported by the addon's
     // `PresenceReporter.vue` on the Page Visibility API's `visibilitychange`
     // (plan 029 Step 2). `'closed'` is never sent by a client (see
@@ -653,10 +799,14 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // ignored rather than trusted verbatim, so a client can't self-report
     // `'closed'` and short-circuit the server's own disconnect/sweep signals.
     socket.on('participant:visibility', ({ state }: { state: ParticipantVisibility }) => {
-      const participantId = socket.data.participantId as string | undefined
+      const participantId = getJoinedParticipantId(socket)
       if (!participantId || (state !== 'visible' && state !== 'hidden'))
         return
       const participant = participants.get(participantId)
+      // Defensive, not just theoretical — same kick-race reasoning as
+      // `participant:error`'s identical check (`registerHelpRequestHandlers`
+      // above): the record can vanish between this socket's last join and
+      // this event actually being processed.
       if (!participant)
         return
       participant.visibility = state
@@ -674,30 +824,35 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // own — a bare liveness tick doesn't change anything the dashboard
     // renders (presence state, roster, step status), so broadcasting here
     // would just be periodic noise on every connected participant's tab.
+    // `touchLastSeen` itself no-ops on an unjoined socket, so there's no
+    // extra guard needed here the way the other handlers above need one.
     socket.on('participant:heartbeat', () => {
-      touchLastSeen(socket.data.participantId as string | undefined)
+      touchLastSeen(getJoinedParticipantId(socket))
     })
+  }
 
-    // Participant management from the dashboard: the presenter's way of
-    // removing someone from the live roster, for either of the two rows the
-    // dashboard now shows — a joined participant, or a still-anonymous
-    // pending connection (see `participant:connecting` above). Two separate
-    // events rather than one overloaded one, since the two cases look up
-    // and disconnect by different keys (`participantId` vs. a raw
-    // `socket.id`) with no shared logic worth factoring out.
-    //
+  /**
+   * Post-ship participant management: the presenter's "Remove" button for
+   * either roster row the dashboard shows — a joined participant, or a
+   * still-anonymous pending connection (`participant:connecting` above).
+   * Two separate events rather than one overloaded one, since the two cases
+   * look up and disconnect by different keys (`participantId` vs. a raw
+   * `socket.id`) with no shared logic worth factoring out beyond the
+   * `requirePresenterCode` gate both already share with every other
+   * `presenter:*` handler.
+   */
+  function registerKickHandlers(socket: Socket) {
     // `io.sockets.sockets.get(id)?.disconnect(true)` is the same "force a
     // real disconnect" mechanism `JoinScreen.vue`'s "Join as someone else"
     // fix relies on client-side (see that component's own comment) — it
-    // triggers this same server's `disconnect` handler below for real,
-    // reusing its already-correct cleanup rather than duplicating it here.
-    // The `true` argument closes the underlying transport immediately
-    // (not just the Socket.io-level session), matching what a presenter
-    // clicking "kick" actually wants: this browser stops working *now*, not
-    // "on its next reconnect attempt".
-    socket.on('presenter:kickParticipant', ({ participantId, presenterCode }: { participantId: string, presenterCode?: string }) => {
-      if (!isValidPresenterCode(authConfig, presenterCode))
-        return
+    // triggers this same server's `disconnect` handler
+    // (`registerParticipantLifecycleHandlers` above) for real, reusing its
+    // already-correct cleanup rather than duplicating it here. The `true`
+    // argument closes the underlying transport immediately (not just the
+    // Socket.io-level session), matching what a presenter clicking "kick"
+    // actually wants: this browser stops working *now*, not "on its next
+    // reconnect attempt".
+    socket.on('presenter:kickParticipant', requirePresenterCode(authConfig, ({ participantId }: { participantId: string, presenterCode?: string }) => {
       // `removeParticipant` (session.ts) is the hard delete — see its own
       // doc comment for why a mere disconnect isn't enough to actually kick
       // someone (they could just silently auto-resume). Disconnect every
@@ -712,54 +867,40 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       for (const socketId of removed.socketIds)
         io.sockets.sockets.get(socketId)?.disconnect(true)
       broadcastStateUpdate(io)
-    })
+    }))
 
     // The pending-connection equivalent — there's no `Participant` record to
     // delete (they never joined), just a socket to disconnect and a pending
     // entry to clear. `removePendingConnection` also runs from that
-    // socket's own `disconnect` handler above once it actually disconnects,
-    // so this could arguably skip calling it here — but doing it eagerly
-    // means the dashboard's row disappears immediately on the presenter's
-    // own broadcast rather than waiting on a second round-trip for the
+    // socket's own `disconnect` handler once it actually disconnects, so
+    // this could arguably skip calling it here — but doing it eagerly means
+    // the dashboard's row disappears immediately on the presenter's own
+    // broadcast rather than waiting on a second round-trip for the
     // disconnect event to come back through.
-    socket.on('presenter:kickPendingConnection', ({ socketId, presenterCode }: { socketId: string, presenterCode?: string }) => {
-      if (!isValidPresenterCode(authConfig, presenterCode))
-        return
+    socket.on('presenter:kickPendingConnection', requirePresenterCode(authConfig, ({ socketId }: { socketId: string, presenterCode?: string }) => {
       if (!removePendingConnection(socketId))
         return
       io.sockets.sockets.get(socketId)?.disconnect(true)
       broadcastStateUpdate(io)
-    })
+    }))
+  }
 
-    // The dashboard (plan 027 Step 3) opts into the room-scoped broadcast
-    // explicitly, rather than every connected socket being auto-joined —
-    // participant sockets never emit this. Sends one immediate snapshot to
-    // the joining socket only, mirroring `slide:sync`'s late-joiner pattern
-    // above, so a freshly-opened dashboard tab doesn't have to wait for the
-    // next mutation to render anything.
-    socket.on('dashboard:join', async ({ presenterCode }: { presenterCode?: string } = {}, ack?: (result: {
-      ok: boolean
-      roomCode?: string
-      presenterCode?: string
-      /**
-       * The Slidev deck URL participants should open — see
-       * `CreateMuanCompanionServerOptions.deckUrl`'s own doc comment. Always
-       * present alongside `ok: true`: unlike `joinUrl`/`joinQrDataUrl` below,
-       * this doesn't depend on a room code being configured (it's just the
-       * server's own static config), so there's no "nothing valid to show
-       * yet" case for it the way there is for the other two.
-       */
-      deckUrl?: string
-      /** See `buildJoinUrl`'s doc comment — `undefined` iff no room code is configured. */
-      joinUrl?: string
-      /**
-       * A `data:image/png;base64,...` string encoding `joinUrl` (see
-       * `getJoinQrDataUrl` above) — `undefined` in lockstep with `joinUrl`
-       * (there's nothing to encode without it), never a separate failure
-       * mode of its own.
-       */
-      joinQrDataUrl?: string
-    }) => void) => {
+  /**
+   * The dashboard's own Socket.io entry point (plan 027 Step 3). Kept
+   * separate from `registerKickHandlers`/`registerHelpRequestHandlers`
+   * above even though it's also presenter-gated: unlike every other
+   * `presenter:*` handler, its rejection acks `{ ok: false }` instead of
+   * silently doing nothing, so it deliberately does *not* go through
+   * `requirePresenterCode`.
+   */
+  function registerDashboardHandler(socket: Socket) {
+    // Opts into the room-scoped broadcast explicitly, rather than every
+    // connected socket being auto-joined — participant sockets never emit
+    // this. Sends one immediate snapshot to the joining socket only,
+    // mirroring `slide:sync`'s late-joiner pattern, so a freshly-opened
+    // dashboard tab doesn't have to wait for the next mutation to render
+    // anything.
+    socket.on('dashboard:join', async ({ presenterCode }: { presenterCode?: string } = {}, ack?: (result: DashboardJoinAck) => void) => {
       // Plan 029 Step 1: same presenter credential as `presenter:*` above —
       // opening the dashboard is exactly as privileged as moving everyone's
       // slide, so it shares the same gate rather than a weaker one.
@@ -791,34 +932,25 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         joinQrDataUrl: await getJoinQrDataUrl(),
       })
     })
+  }
 
-    socket.on('disconnect', () => {
-      const participantId = socket.data.participantId as string | undefined
-      if (!participantId) {
-        // Never joined — if this socket had announced itself as pending
-        // (`participant:connecting` above), it needs to disappear from the
-        // dashboard too, not just linger as a "still connecting" row
-        // forever. A presenter/dashboard socket (never pending in the first
-        // place) hits `removePendingConnection`'s own no-op path here,
-        // matching this handler's pre-existing behavior for those.
-        if (removePendingConnection(socket.id))
-          broadcastStateUpdate(io)
-        return
-      }
-      // A clean Socket.io `disconnect` is a definitive, immediate signal for
-      // *this one socket* — mark the participant `closed` right away rather
-      // than waiting for the periodic sweep below (plan 029 Step 3: "use
-      // both signals ... since [the sweep] adds unnecessary latency for the
-      // common clean-close case") — but only once every socket representing
-      // this participant is gone (see `removeParticipantSocket`'s doc
-      // comment): a second tab closing must not flip a participant offline
-      // while a first tab, still open and connected, is the reason this
-      // participant is genuinely still `viewing now`. Only broadcast when
-      // that actually happened — removing one of several live sockets
-      // changes nothing the dashboard renders.
-      if (removeParticipantSocket(participantId, socket.id))
-        broadcastStateUpdate(io)
-    })
+  io.on('connection', (socket) => {
+    // Sync the newly-connected client to current state immediately — needed
+    // for M1's own acceptance bar (a participant who loads *after* the
+    // presenter has already moved past slide 1 must still land on the right
+    // slide). This event isn't in PRD §10's list; it's the minimum addition
+    // needed to make `slide:changed` (a rebroadcast-only event) useful to
+    // late joiners, and is a deliberate, documented addition — not scope
+    // creep.
+    socket.emit('slide:sync', { index: session.currentSlideIndex })
+
+    registerSlideHandlers(socket)
+    registerParticipantLifecycleHandlers(socket)
+    registerStepTrackingHandlers(socket)
+    registerHelpRequestHandlers(socket)
+    registerPresenceHandlers(socket)
+    registerKickHandlers(socket)
+    registerDashboardHandler(socket)
   })
 
   // Backstop for a *hung* connection that never fires a clean `disconnect`

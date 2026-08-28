@@ -1,24 +1,18 @@
 import type { AddressInfo } from 'node:net'
 import type { Socket as ClientSocket } from 'socket.io-client'
-import type { MuanCompanionServer } from './server'
+import type { DashboardJoinAck, MuanCompanionServer } from './server'
 import { Buffer } from 'node:buffer'
+import { connect as netConnect } from 'node:net'
 import { io as ioClient } from 'socket.io-client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMuanCompanionServer, DEFAULT_DECK_URL } from './server'
-import { errorReports, participants, resetSessionStateForTests, session, stepStatus } from './session'
+import { errorReports, participants, removeParticipant, resetSessionStateForTests, session, stepStatus } from './session'
 
-// The full `dashboard:join` ack shape (M4's two codes, plus the join-link/QR
-// fields added for the shareable-join-link feature) — declared once here
-// rather than inlined at every call site below, several of which only care
-// about a subset of these fields.
-interface DashboardJoinAck {
-  ok: boolean
-  roomCode?: string
-  presenterCode?: string
-  deckUrl?: string
-  joinUrl?: string
-  joinQrDataUrl?: string
-}
+// `DashboardJoinAck` (M4's two codes, plus the join-link/QR fields added for
+// the shareable-join-link feature) is imported from `server.ts` itself now
+// rather than re-declared here — this file used to keep an independent copy
+// of the exact same shape purely for its own assertions, which could
+// quietly drift from the real ack payload without either side noticing.
 
 // A minimal, valid 1x1 PNG (the smallest real PNG that decodes) — used as
 // the multipart `screenshot` file in the upload tests below so they exercise
@@ -393,6 +387,26 @@ describe('createMuanCompanionServer', () => {
         expect(ack.joinQrDataUrl!.length).toBeGreaterThan(100)
       })
 
+      // `getJoinQrDataUrl` (`server.ts`) caches the *promise* from the first
+      // encode and reuses it for every later call, rather than re-encoding
+      // identical PNG bytes for every dashboard tab that opens against the
+      // same server instance — see that function's own doc comment for why
+      // it's the promise, not just the resolved string, that's cached (safe
+      // against two `dashboard:join` calls racing before the first encode
+      // finishes). A second dashboard socket joining the same running server
+      // is what actually exercises that reuse path rather than always
+      // taking the "generate fresh" branch.
+      it('a second dashboard:join on the same server reuses the same cached QR code', async () => {
+        const first = await connectClient()
+        const firstAck = await emitWithAck<DashboardJoinAck>(first, 'dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+
+        const second = await connectClient()
+        const secondAck = await emitWithAck<DashboardJoinAck>(second, 'dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+
+        expect(secondAck.joinQrDataUrl).toMatch(/^data:image\/png;base64,/)
+        expect(secondAck.joinQrDataUrl).toBe(firstAck.joinQrDataUrl)
+      })
+
       it('omits joinUrl and joinQrDataUrl entirely when no room code is configured (fail closed, nothing to show)', async () => {
         // A separate server instance with no `roomCode` at all — mirrors how
         // the `cors`/staleness-sweep tests above construct a server with
@@ -422,6 +436,34 @@ describe('createMuanCompanionServer', () => {
         expect(ack.joinUrl).toBeUndefined()
         expect(ack.joinQrDataUrl).toBeUndefined()
       })
+    })
+  })
+
+  // `requireDashboardCode` (`server.ts`) gates the HTTP GET for `/dashboard`
+  // itself, separately from (and *before*) the `dashboard:join` socket gate
+  // exercised above — a plain `fetch()` never reaches Socket.io at all, so
+  // this needs its own HTTP-level coverage.
+  describe('dashboard HTTP route (auth)', () => {
+    it('a GET /dashboard with no ?code= is rejected with 401, not served', async () => {
+      const response = await fetch(`${url}/dashboard`)
+
+      expect(response.status).toBe(401)
+      const body = await response.text()
+      expect(body).toContain('Presenter code required')
+    })
+
+    it('a GET /dashboard with the wrong ?code= is rejected with 401', async () => {
+      const response = await fetch(`${url}/dashboard?code=wrong-code`)
+
+      expect(response.status).toBe(401)
+    })
+
+    it('a GET /dashboard with the correct ?code= is served', async () => {
+      const response = await fetch(`${url}/dashboard?code=${TEST_PRESENTER_CODE}`)
+
+      expect(response.status).toBe(200)
+      const body = await response.text()
+      expect(body).toContain('<title>')
     })
   })
 
@@ -601,6 +643,20 @@ describe('createMuanCompanionServer', () => {
       expect(participants.get(participantId)?.visibility).toBe('visible')
     })
 
+    // Same kick-race reasoning as `participant:error`'s equivalent guard
+    // (`error reports (M3)` describe block above): `socket.data.participantId`
+    // can still point at a record that's already been deleted.
+    it('participant:visibility from a socket whose participant record was removed mid-flight is a no-op', async () => {
+      const client = await connectClient()
+      const { participantId } = await join(client) as { participantId: string }
+      removeParticipant(participantId)
+
+      expect(() => client.emit('participant:visibility', { state: 'hidden' })).not.toThrow()
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(participants.has(participantId)).toBe(false)
+    })
+
     it('participant:heartbeat updates lastSeen without erroring for a joined participant', async () => {
       const client = await connectClient()
       const { participantId } = await join(client) as { participantId: string }
@@ -611,6 +667,18 @@ describe('createMuanCompanionServer', () => {
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
       expect(participants.get(participantId)!.lastSeen).toBeGreaterThan(before)
+    })
+
+    it('participant:heartbeat from a socket that has not joined yet is a harmless no-op', async () => {
+      const client = await connectClient()
+
+      // No `participant:join` at all — `socket.data.participantId` is
+      // undefined, so `touchLastSeen` (server.ts) hits its own early-return
+      // rather than looking anything up.
+      expect(() => client.emit('participant:heartbeat', { stepId: 'install-deps' })).not.toThrow()
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(participants.size).toBe(0)
     })
 
     it('a clean disconnect immediately marks the participant closed and broadcasts state:update', async () => {
@@ -809,14 +877,26 @@ describe('createMuanCompanionServer', () => {
         p => p.participants.some(x => x.id === participantId),
       )
 
-      // Simulate a hung connection: the socket is force-closed at the
-      // transport level (`io.engine` close, not a graceful client
-      // `disconnect()`/server-side `socket.disconnect()`) so no clean
-      // `disconnect` event fires, and back-date `lastSeen` past
-      // `STALE_AFTER_MS` so the very next sweep tick sees it as stale.
+      // Simulate a genuinely *hung* connection — not just a fast one.
+      // `serverSocket.conn.close()` was tried here first and looked
+      // plausible, but it's actually indistinguishable from an ordinary
+      // clean disconnect: closing the engine.io transport server-side still
+      // fires Socket.io's own `disconnect` event (reason `'transport
+      // close'`), which the `disconnect` handler above already handles on
+      // its own, immediately — meaning that version of this test coincidentally
+      // passed via the *ordinary* disconnect path, without the sweep's own
+      // closing logic ever running at all. A real hang (dead wifi) never
+      // fires any close event on either side; the only thing that's
+      // actually true in that state is what `isSocketConnected`
+      // (`server.ts`) checks — `io.sockets.sockets.has(id)` — so this
+      // deletes the live socket from Socket.io's own registry directly,
+      // with no disconnect event involved, then back-dates `lastSeen` past
+      // `STALE_AFTER_MS` so the very next sweep tick sees it as both stale
+      // and no-longer-registered.
       const serverSocket = [...server.io.sockets.sockets.values()].find(s => s.id === participant.id) ?? [...server.io.sockets.sockets.values()][0]
       participants.get(participantId)!.lastSeen = 0
-      serverSocket?.conn.close()
+      if (serverSocket)
+        server.io.sockets.sockets.delete(serverSocket.id)
 
       const closedUpdate = waitForMatchingStateUpdate<{ participants: Array<{ id: string, connected: boolean, visibility: string }> }>(
         dashboard,
@@ -940,6 +1020,22 @@ describe('createMuanCompanionServer', () => {
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
       expect(disconnected).toBe(false)
+    })
+
+    it('presenter:kickPendingConnection with a valid presenterCode but an unknown socketId is a no-op (no crash)', async () => {
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      await joinAsDashboard(dashboard)
+      await initialSnapshot
+
+      const presenter = await connectClient()
+      presenter.emit('presenter:kickPendingConnection', { socketId: 'not-a-real-socket-id', presenterCode: TEST_PRESENTER_CODE })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      // Reaching here without throwing/hanging is the assertion — there was
+      // never a pending connection under this socketId to clear, and
+      // nothing else on the dashboard changed either.
+      expect(participants.size).toBe(0)
     })
 
     it('presenter:kickParticipant disconnects every one of the participant\'s sockets and removes them from the dashboard', async () => {
@@ -1208,11 +1304,79 @@ describe('createMuanCompanionServer', () => {
       dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
       await initialSnapshot
 
+      // "no broadcast storm" is an actual assertion, not just a comment: an
+      // unknown `errorId` must not even trigger a wasted `state:update` —
+      // nothing changed, so there's nothing for the dashboard room to be
+      // told about, matching every other unknown-id handler in this file.
+      let sawUpdate = false
+      dashboard.on('state:update', () => {
+        sawUpdate = true
+      })
+
       const presenter = await connectClient()
       presenter.emit('presenter:resolveError', { errorId: 'does-not-exist', presenterCode: TEST_PRESENTER_CODE })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
       expect(errorReports).toHaveLength(0)
+      expect(sawUpdate).toBe(false)
+    })
+
+    it('presenter:resolveError with a wrong presenterCode is a no-op, even for a real report', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      const attacker = await connectClient()
+      attacker.emit('presenter:resolveError', { errorId, presenterCode: 'wrong-code' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(errorReports.find(e => e.id === errorId)?.status).toBe('open')
+    })
+
+    // Reports are append-only and outlive the participant record that filed
+    // them (`removeParticipant`'s doc comment, `session.ts`) — a presenter
+    // can still act on one after kicking its reporter. `notifyReporter`
+    // (`server.ts`) is what has to no-op gracefully here: `reporterOf`
+    // returns `undefined` once the participant record is gone, and there's
+    // no live socket left to notify anyway.
+    it('presenter:resolveError on a report whose reporting participant was already kicked does not crash', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      removeParticipant(participantId)
+
+      const presenter = await connectClient()
+      presenter.emit('presenter:resolveError', { errorId, presenterCode: TEST_PRESENTER_CODE, message: 'fixed on our end' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      // The report itself still transitions normally — only the
+      // now-pointless notification is skipped.
+      expect(errorReports.find(e => e.id === errorId)?.status).toBe('awaiting_confirmation')
     })
 
     // Follow-up after initial manual testing: "Mark resolved" should close
@@ -1335,6 +1499,65 @@ describe('createMuanCompanionServer', () => {
       expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([])
     })
 
+    it('presenter:sendMessage with a valid presenterCode but an unknown errorId is a no-op (no crash)', async () => {
+      const presenter = await connectClient()
+
+      presenter.emit('presenter:sendMessage', { errorId: 'does-not-exist', presenterCode: TEST_PRESENTER_CODE, text: 'hello?' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      // Reaching here without throwing/hanging is the assertion — there's no
+      // report to have received the message in the first place.
+      expect(errorReports).toHaveLength(0)
+    })
+
+    it('participant:confirmResolution from a socket that has not joined yet is a no-op', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+      const errorId = errorReports.find(e => e.participantId === participantId)!.id
+
+      // A socket with no `socket.data.participantId` at all (never called
+      // `participant:join`) — distinct from `errorReportOwnedBy`'s ownership
+      // rejection (already covered by the "does not own the report" test
+      // above), this exercises the earlier "hasn't joined at all" guard.
+      const neverJoined = await connectClient()
+      neverJoined.emit('participant:confirmResolution', { errorId, confirmed: true })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(errorReports.find(e => e.id === errorId)?.status).toBe('open')
+    })
+
+    it('participant:addMessage from a socket that has not joined yet is a no-op', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+      const errorId = errorReports.find(e => e.participantId === participantId)!.id
+
+      const neverJoined = await connectClient()
+      neverJoined.emit('participant:addMessage', { errorId, text: 'can I help?' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([])
+    })
+
+    // Defensive, not just theoretical: a presenter could in principle kick a
+    // participant in the brief window between an event they sent being
+    // received and being processed — `socket.data.participantId` still
+    // points at a now-deleted record. `participant:error`'s handler guards
+    // against exactly this (`registerHelpRequestHandlers` in `server.ts`).
+    it('participant:error from a socket whose participant record was removed mid-flight is a no-op', async () => {
+      const client = await connectClient()
+      const { participantId } = await join(client) as { participantId: string }
+      removeParticipant(participantId)
+
+      client.emit('participant:error', { stepId: 'install-deps', text: 'ghost report' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(errorReports).toHaveLength(0)
+    })
+
     it('participant:confirmResolution(true) resolves the report and updates the dashboard', async () => {
       const reporter = await connectClient()
       const { participantId } = await join(reporter) as { participantId: string }
@@ -1454,6 +1677,31 @@ describe('createMuanCompanionServer', () => {
         { from: 'participant', text: 'also, does this affect step 2?', ts: expect.any(Number) },
       ])
     })
+
+    it('participant:addMessage from a socket that does not own the report is a no-op', async () => {
+      const reporter = await connectClient()
+      const { participantId } = await join(reporter) as { participantId: string }
+      const bystander = await connectClient()
+      await join(bystander, 'Bob')
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const created = waitForMatchingStateUpdate<{ errors: Array<{ id: string, participantId: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      const { errors } = await created
+      const errorId = errors[0].id
+
+      bystander.emit('participant:addMessage', { errorId, text: 'not my report but let me add to it' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([])
+    })
   })
 
   describe('post /api/screenshot (M3)', () => {
@@ -1501,6 +1749,21 @@ describe('createMuanCompanionServer', () => {
     it('rejects an unknown participantId with 400 and does not create an ErrorReport', async () => {
       const form = new FormData()
       form.set('participantId', 'not-a-real-participant')
+      form.set('stepId', 'install-deps')
+      form.set('screenshot', new Blob([ONE_PIXEL_PNG], { type: 'image/png' }), 'shot.png')
+
+      const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
+
+      expect(response.status).toBe(400)
+      expect(errorReports).toHaveLength(0)
+    })
+
+    it('rejects a request with no participantId field at all with 400', async () => {
+      // Distinct from the "unknown participantId" case above (a truthy but
+      // unrecognized value) — this omits the field entirely, exercising the
+      // short-circuit in `screenshotUpload.ts` that skips the registry
+      // lookup rather than calling `participants.get(undefined)`.
+      const form = new FormData()
       form.set('stepId', 'install-deps')
       form.set('screenshot', new Blob([ONE_PIXEL_PNG], { type: 'image/png' }), 'shot.png')
 
@@ -1578,6 +1841,81 @@ describe('createMuanCompanionServer', () => {
 
       const response2 = await fetch(`${url}/uploads/not-a-real-uuid.png`)
       expect(response2.status).not.toBe(200)
+    })
+
+    it('rejects a request against /uploads with malformed percent-encoding with 400', async () => {
+      // `decodeURIComponent` throws on a truncated/invalid escape sequence
+      // (e.g. a lone `%` not followed by two hex digits) — `server.ts`'s
+      // `/uploads` middleware catches that explicitly rather than letting it
+      // escape as an unhandled error. `fetch()` itself won't send a raw `%`
+      // in a URL without complaint (Node normalizes/rejects some malformed
+      // URLs client-side), so the invalid escape is written directly onto
+      // the raw HTTP request line instead of going through `fetch`'s own URL
+      // parsing.
+      const { port } = server.httpServer.address() as AddressInfo
+      const status = await new Promise<number>((resolve, reject) => {
+        const socket = netConnect(port, 'localhost', () => {
+          socket.write('GET /uploads/%E0%A4%A HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+        })
+        let data = ''
+        socket.on('data', (chunk) => {
+          data += chunk.toString()
+        })
+        socket.on('end', () => resolve(Number(data.split('\r\n')[0].split(' ')[1])))
+        socket.on('error', reject)
+      })
+
+      expect(status).toBe(400)
+    })
+
+    it('a request to an unrelated path/method falls through the screenshot handler untouched (plain 404)', async () => {
+      // Exercises `createScreenshotUploadHandler`'s own early `next()` for
+      // anything that isn't `POST /api/screenshot` — every other request in
+      // this suite that reaches this middleware is fully handled by an
+      // earlier one (`sirv` for `/dashboard`/`/uploads`), so this is the
+      // only way to observe this fallthrough actually firing and the
+      // request reaching connect's own default 404 with nothing left to
+      // handle it.
+      const response = await fetch(`${url}/not-a-real-route`)
+
+      expect(response.status).toBe(404)
+    })
+
+    it('rejects a POST /api/screenshot with a non-multipart Content-Type with 400', async () => {
+      // Busboy's constructor throws synchronously for a missing/invalid
+      // Content-Type rather than emitting an async error event
+      // (`screenshotUpload.ts`'s own comment on this) — a JSON body is a
+      // convenient way to trigger that from a real HTTP request.
+      const response = await fetch(`${url}/api/screenshot`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      })
+
+      expect(response.status).toBe(400)
+      const body = await response.text()
+      expect(body).toContain('multipart/form-data')
+      expect(errorReports).toHaveLength(0)
+    })
+
+    it('rejects a multipart upload missing stepId with 400 and cleans up the saved file', async () => {
+      const client = await connectClient()
+      const { participantId } = await emitWithAck<{ participantId: string }>(
+        client,
+        'participant:join',
+        { name: 'Ada', roomCode: TEST_ROOM_CODE },
+      )
+
+      const form = new FormData()
+      form.set('participantId', participantId)
+      form.set('screenshot', new Blob([ONE_PIXEL_PNG], { type: 'image/png' }), 'shot.png')
+
+      const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
+
+      expect(response.status).toBe(400)
+      const body = await response.text()
+      expect(body).toContain('stepId is required')
+      expect(errorReports).toHaveLength(0)
     })
   })
 

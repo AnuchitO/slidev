@@ -474,8 +474,16 @@ export function confirmResolution(errorId: string, confirmed: boolean, message?:
   return report
 }
 
+// Copies the array, same as `listPendingConnections`/`listStepStatus` above
+// — returning the live `errorReports` array itself would let a caller
+// mutate the master list by e.g. `.push()`-ing onto the returned value
+// directly, bypassing `addErrorReport`. The `ErrorReport` objects *inside*
+// the copy are still the real, shared, in-place-mutated records (finding
+// one and pushing onto its own `thread` is exactly how every mutator above
+// works) — only the array's own identity is protected here, matching the
+// existing "trust the caller with the records themselves" posture.
 export function listErrorReports(): ErrorReport[] {
-  return errorReports
+  return [...errorReports]
 }
 
 /**

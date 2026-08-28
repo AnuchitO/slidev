@@ -686,9 +686,21 @@
     const errorFeedEl = document.getElementById('error-feed')
     const errorsEmptyEl = document.getElementById('errors-empty')
     const codesPanelEl = document.getElementById('codes-panel')
+    const codeRoomEl = document.getElementById('code-room')
+    const codePresenterEl = document.getElementById('code-presenter')
     const sharePanelEl = document.getElementById('share-panel')
     const shareLinkEl = document.getElementById('share-link')
     const shareQrEl = document.getElementById('share-qr')
+    // The five `.count` tiles — looked up once here (same reasoning as
+    // every other cached element above) rather than re-querying the DOM by
+    // id on every single `render()` call, which used to happen on every
+    // `state:update` plus every 5s elapsed-time tick.
+    const countSlideEl = document.getElementById('count-slide')
+    const countStepEl = document.getElementById('count-step')
+    const countJoinedEl = document.getElementById('count-joined')
+    const countViewingEl = document.getElementById('count-viewing')
+    const countDoneEl = document.getElementById('count-done')
+    const countErrorsEl = document.getElementById('count-errors')
 
     // Inline Material-style icons (see the token/icon comment in `:root`
     // above) — the same glyphs `ErrorReportWidget.vue` uses, kept as plain
@@ -752,8 +764,8 @@
         connEl.textContent = 'live'
         connEl.classList.add('live')
         if (result && result.roomCode) {
-          document.getElementById('code-room').textContent = result.roomCode
-          document.getElementById('code-presenter').textContent = result.presenterCode
+          codeRoomEl.textContent = result.roomCode
+          codePresenterEl.textContent = result.presenterCode
           codesPanelEl.hidden = false
         }
         // The shareable join link + QR code (see `#share-panel`'s own HTML
@@ -843,21 +855,60 @@
       return { label: 'viewing now', cls: 'presence-visible' }
     }
 
-    function render(state) {
-      lastState = state
-      const { currentSlideIndex, currentStepId, participants, pendingConnections, stepStatus, errors } = state
-
-      document.getElementById('count-slide').textContent = currentSlideIndex
-      document.getElementById('count-step').textContent = currentStepId
-      document.getElementById('count-joined').textContent = participants.length
-      document.getElementById('count-viewing').textContent = participants.filter(
+    // The five `.count` tiles at the top of the page — split out of
+    // `render` below purely for readability (it was doing "update the
+    // tiles" and "rebuild the roster table" in one long function body); the
+    // data these tiles summarize (`presenceFor`/`statusFor` over the same
+    // `participants`/`stepStatus` arrays `render` already has) is otherwise
+    // unrelated to how a roster row's markup gets built.
+    function renderCounts({ currentSlideIndex, currentStepId, participants, stepStatus }) {
+      countSlideEl.textContent = currentSlideIndex
+      countStepEl.textContent = currentStepId
+      countJoinedEl.textContent = participants.length
+      countViewingEl.textContent = participants.filter(
         p => presenceFor(p).label === 'viewing now',
       ).length
 
       const doneCount = participants.filter(
         p => statusFor(stepStatus, p.id, currentStepId).state === 'done',
       ).length
-      document.getElementById('count-done').textContent = `${doneCount}/${participants.length}`
+      countDoneEl.textContent = `${doneCount}/${participants.length}`
+    }
+
+    // One of the two roster-row shapes `render` interleaves below — a
+    // still-anonymous pending connection (`participant:connecting` fired,
+    // no `participant:join` yet). Returns markup, not a live `<tr>`, so
+    // `render` stays the one place actually touching the DOM tree.
+    function pendingRowHtml(c) {
+      return `
+        <td class="pending-name">Someone joining…</td>
+        <td><span class="badge pending">connecting</span></td>
+        <td>—</td>
+        <td>${new Date(c.connectedAt).toLocaleTimeString()}</td>
+        <td><button type="button" class="kick-button" data-action="kick-pending" data-socket-id="${escapeHtml(c.socketId)}">Remove</button></td>
+      `
+    }
+
+    // The other roster-row shape — a real, joined participant.
+    function participantRowHtml(p, stepStatus, currentStepId) {
+      const statusCell = p.connected
+        ? renderStatusCell(statusFor(stepStatus, p.id, currentStepId))
+        : `<span class="badge offline">offline</span>`
+      const presence = presenceFor(p)
+      return `
+        <td>${escapeHtml(p.name)}</td>
+        <td><span class="badge ${presence.cls}">${presence.label}</span></td>
+        <td>${statusCell}</td>
+        <td>${new Date(p.joinedAt).toLocaleTimeString()}</td>
+        <td><button type="button" class="kick-button" data-action="kick-participant" data-participant-id="${escapeHtml(p.id)}">Remove</button></td>
+      `
+    }
+
+    function render(state) {
+      lastState = state
+      const { currentStepId, participants, pendingConnections, stepStatus, errors } = state
+
+      renderCounts(state)
 
       rowsEl.innerHTML = ''
       emptyEl.hidden = participants.length > 0 || (pendingConnections || []).length > 0
@@ -878,30 +929,9 @@
 
       for (const row of rows) {
         const tr = document.createElement('tr')
-        if (row.kind === 'pending') {
-          const c = row.data
-          tr.innerHTML = `
-            <td class="pending-name">Someone joining…</td>
-            <td><span class="badge pending">connecting</span></td>
-            <td>—</td>
-            <td>${new Date(c.connectedAt).toLocaleTimeString()}</td>
-            <td><button type="button" class="kick-button" data-action="kick-pending" data-socket-id="${escapeHtml(c.socketId)}">Remove</button></td>
-          `
-        }
-        else {
-          const p = row.data
-          const statusCell = p.connected
-            ? renderStatusCell(statusFor(stepStatus, p.id, currentStepId))
-            : `<span class="badge offline">offline</span>`
-          const presence = presenceFor(p)
-          tr.innerHTML = `
-            <td>${escapeHtml(p.name)}</td>
-            <td><span class="badge ${presence.cls}">${presence.label}</span></td>
-            <td>${statusCell}</td>
-            <td>${new Date(p.joinedAt).toLocaleTimeString()}</td>
-            <td><button type="button" class="kick-button" data-action="kick-participant" data-participant-id="${escapeHtml(p.id)}">Remove</button></td>
-          `
-        }
+        tr.innerHTML = row.kind === 'pending'
+          ? pendingRowHtml(row.data)
+          : participantRowHtml(row.data, stepStatus, currentStepId)
         rowsEl.appendChild(tr)
       }
 
@@ -966,8 +996,97 @@
       return e.thread.length > 0 ? e.thread[e.thread.length - 1].ts : e.ts
     }
 
+    // The `.awaiting`/`.resolved` card-border override — see `.error-card`'s
+    // own CSS comments for why exactly these two statuses (and no others)
+    // get one.
+    function errorCardClassName(e) {
+      if (e.status === 'resolved')
+        return 'error-card resolved'
+      if (e.status === 'awaiting_confirmation')
+        return 'error-card awaiting'
+      return 'error-card'
+    }
+
+    // The thread (`ErrorReport.thread`) is everything sent *after* the
+    // original submission — never re-derived from it, just rendered in
+    // order. Per-message timestamps are deliberately omitted (the original
+    // submission's timestamp is still shown in `.error-meta`) — a short
+    // back-and-forth reads fine without one, and adding one to every bubble
+    // was more clutter than the compact-chat-strip goal called for.
+    function threadHtml(e) {
+      if (e.thread.length === 0)
+        return ''
+      return `<div class="thread">${e.thread.map(m => `
+        <div class="thread-msg thread-msg-${m.from}">
+          <span class="thread-msg-label">${m.from === 'presenter' ? 'You' : escapeHtml(e.participantName)}:</span>
+          <span class="thread-msg-text">${escapeHtml(m.text)}</span>
+        </div>
+      `).join('')}</div>`
+    }
+
+    // No composer at all once `resolved` — that's the final state, and the
+    // read-only dimmed thread history above is all there is left to show
+    // (mirrors the pre-redesign file's "resolved cards have no input"
+    // treatment). `awaiting_confirmation` keeps the shared textarea and the
+    // plain "Send" button (a nudge/follow-up is still useful while waiting)
+    // but drops the resolve button — there's nothing left to "mark
+    // resolved": the presenter already did, and the ball is in the
+    // participant's court — replacing it with a small note so that absence
+    // reads as "waiting", not as a bug. `draftValue` is this one card's own
+    // saved textarea value (see `renderErrors`'s own comment on why it has
+    // to survive the wholesale rebuild every card goes through).
+    function composerHtml(e, draftValue) {
+      if (e.status === 'resolved')
+        return ''
+      const resolveOrWaitingHtml = e.status === 'awaiting_confirmation'
+        ? `<span class="awaiting-note">Waiting on ${escapeHtml(e.participantName)} to confirm…</span>`
+        : `<button type="button" class="resolve-button" data-action="resolve" data-error-id="${escapeHtml(e.id)}">${ICON_CHECK}<span>Send &amp; mark resolved</span></button>`
+      return `
+        <div class="composer">
+          <textarea
+            class="composer-input"
+            data-error-id="${escapeHtml(e.id)}"
+            rows="1"
+            placeholder="${e.kind === 'question' ? 'Answer their question…' : 'Reply…'}"
+          >${escapeHtml(draftValue || '')}</textarea>
+          <div class="composer-actions">
+            ${resolveOrWaitingHtml}
+            <button type="button" class="send-button" data-action="send" data-error-id="${escapeHtml(e.id)}">${ICON_SEND}<span>Send</span></button>
+          </div>
+        </div>
+      `
+    }
+
+    // One help-request card's full innerHTML — pulled out of `renderErrors`'s
+    // loop so that function reads as "preserve composer state, sort, build
+    // each card, restore composer state" rather than that plus every
+    // individual card field inline.
+    function errorCardHtml(e, draftValue) {
+      const thumb = e.screenshotUrl
+        ? `<img class="error-thumb" src="${escapeHtml(e.screenshotUrl)}" alt="screenshot from ${escapeHtml(e.participantName)}" data-full="${escapeHtml(e.screenshotUrl)}" />`
+        : ''
+      const kind = KIND_META[e.kind] ?? KIND_META.problem
+      const status = STATUS_META[e.status] ?? STATUS_META.open
+
+      return `
+        ${thumb}
+        <div class="error-body">
+          <div class="error-meta">
+            <span class="kind-tag">${kind.icon}<span>${kind.label}</span></span>
+            <span class="status-chip ${status.cls}">${status.icon}<span>${status.label}</span></span>
+            <span class="name">${escapeHtml(e.participantName)}</span>
+            <span>step: ${escapeHtml(e.stepId)}</span>
+            <span>${new Date(e.ts).toLocaleTimeString()}</span>
+          </div>
+          ${e.text ? `<p class="error-text">${escapeHtml(e.text)}</p>` : ''}
+          ${threadHtml(e)}
+          ${composerHtml(e, draftValue)}
+        </div>
+      `
+    }
+
     function renderErrors(errors) {
-      document.getElementById('count-errors').textContent = errors.filter(e => NEEDS_ATTENTION.has(e.status)).length
+      countErrorsEl.textContent = errors.filter(e => NEEDS_ATTENTION.has(e.status)).length
 
       // `renderErrors` re-runs on *every* `state:update` — including ones
       // caused by an unrelated participant clicking Copy/Done elsewhere —
@@ -1008,78 +1127,8 @@
 
       for (const e of sorted) {
         const card = document.createElement('div')
-        // `.awaiting`/`.resolved` are the only two statuses that override
-        // the card's default (red, "needs attention") left-border color —
-        // see their own CSS comments.
-        const cardStateClass = e.status === 'resolved' ? ' resolved' : e.status === 'awaiting_confirmation' ? ' awaiting' : ''
-        card.className = `error-card${cardStateClass}`
-
-        const thumb = e.screenshotUrl
-          ? `<img class="error-thumb" src="${escapeHtml(e.screenshotUrl)}" alt="screenshot from ${escapeHtml(e.participantName)}" data-full="${escapeHtml(e.screenshotUrl)}" />`
-          : ''
-
-        const kind = KIND_META[e.kind] ?? KIND_META.problem
-        const status = STATUS_META[e.status] ?? STATUS_META.open
-
-        // The thread (`ErrorReport.thread`) is everything sent *after* the
-        // original submission above — never re-derived from it, just
-        // rendered in order. Per-message timestamps are deliberately
-        // omitted (the original submission's timestamp is still shown in
-        // `.error-meta` above) — a short back-and-forth reads fine without
-        // one, and adding one to every bubble was more clutter than the
-        // compact-chat-strip goal called for.
-        const threadHtml = e.thread.length === 0
-          ? ''
-          : `<div class="thread">${e.thread.map(m => `
-              <div class="thread-msg thread-msg-${m.from}">
-                <span class="thread-msg-label">${m.from === 'presenter' ? 'You' : escapeHtml(e.participantName)}:</span>
-                <span class="thread-msg-text">${escapeHtml(m.text)}</span>
-              </div>
-            `).join('')}</div>`
-
-        // No composer at all once `resolved` — that's the final state, and
-        // the read-only dimmed thread history above is all there is left to
-        // show (mirrors the pre-redesign file's "resolved cards have no
-        // input" treatment). `awaiting_confirmation` keeps the shared
-        // textarea and the plain "Send" button (a nudge/follow-up is still
-        // useful while waiting) but drops the resolve button — there's
-        // nothing left to "mark resolved": the presenter already did, and
-        // the ball is in the participant's court — replacing it with a
-        // small note so that absence reads as "waiting", not as a bug.
-        const composer = e.status === 'resolved'
-          ? ''
-          : `
-            <div class="composer">
-              <textarea
-                class="composer-input"
-                data-error-id="${escapeHtml(e.id)}"
-                rows="1"
-                placeholder="${e.kind === 'question' ? 'Answer their question…' : 'Reply…'}"
-              >${escapeHtml(draftMessages[e.id] || '')}</textarea>
-              <div class="composer-actions">
-                ${e.status === 'awaiting_confirmation'
-                  ? `<span class="awaiting-note">Waiting on ${escapeHtml(e.participantName)} to confirm…</span>`
-                  : `<button type="button" class="resolve-button" data-action="resolve" data-error-id="${escapeHtml(e.id)}">${ICON_CHECK}<span>Send &amp; mark resolved</span></button>`}
-                <button type="button" class="send-button" data-action="send" data-error-id="${escapeHtml(e.id)}">${ICON_SEND}<span>Send</span></button>
-              </div>
-            </div>
-          `
-
-        card.innerHTML = `
-          ${thumb}
-          <div class="error-body">
-            <div class="error-meta">
-              <span class="kind-tag">${kind.icon}<span>${kind.label}</span></span>
-              <span class="status-chip ${status.cls}">${status.icon}<span>${status.label}</span></span>
-              <span class="name">${escapeHtml(e.participantName)}</span>
-              <span>step: ${escapeHtml(e.stepId)}</span>
-              <span>${new Date(e.ts).toLocaleTimeString()}</span>
-            </div>
-            ${e.text ? `<p class="error-text">${escapeHtml(e.text)}</p>` : ''}
-            ${threadHtml}
-            ${composer}
-          </div>
-        `
+        card.className = errorCardClassName(e)
+        card.innerHTML = errorCardHtml(e, draftMessages[e.id])
         errorFeedEl.appendChild(card)
       }
 

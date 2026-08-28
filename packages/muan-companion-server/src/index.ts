@@ -19,9 +19,18 @@ const PORT = Number(process.env.PORT ?? 3710)
 // Presenter code is longer than the room code: it's the higher-privilege of
 // the two secrets (see `auth.ts`'s own comment on why they're never
 // derivable from one another), so it gets more entropy for the same
-// "readable/typeable" alphabet.
-const ROOM_CODE_LENGTH = 6
-const PRESENTER_CODE_LENGTH = 8
+// "readable/typeable" alphabet. Lengths bumped from the original 6/8 after a
+// security review flagged the room code specifically as thin relative to
+// the README's own "choose codes with enough entropy to resist casual
+// guessing" goal, given this package's explicit no-rate-limiting posture: 6
+// chars from `codeGeneration.ts`'s 31-character alphabet is only ~30 bits
+// (≈887M combinations) — plausible to exhaust via scripted join attempts
+// over a multi-day event, even though a successful guess only grants
+// join-as-a-fake-participant, never presenter/dashboard access. 8/10 chars
+// raise that to ~40/~50 bits (≈8.5×10¹¹ / ≈8.2×10¹⁴ combinations) while
+// keeping the same "resist mishearing when read aloud" alphabet.
+const ROOM_CODE_LENGTH = 8
+const PRESENTER_CODE_LENGTH = 10
 
 const roomCodeFromEnv = process.env.SLIDEV_MUAN_COMPANION_ROOM_CODE
 const presenterCodeFromEnv = process.env.SLIDEV_MUAN_COMPANION_PRESENTER_CODE

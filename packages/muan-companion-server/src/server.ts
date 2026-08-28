@@ -238,6 +238,62 @@ function broadcastStateUpdate(io: SocketIOServer) {
  * presenter credential to access" done-criterion for the route itself, not
  * just the Socket.io data feed layered on top of it.
  */
+/**
+ * A `Content-Security-Policy` for `/dashboard` specifically (not applied
+ * globally — `/uploads` serves participant-supplied image bytes and
+ * `/api/screenshot` returns plain JSON, neither of which executes script or
+ * benefits from a policy scoped to *this* page's own known-safe resource
+ * list). `public/dashboard/index.html` inlines its own `<style>`/`<script>`
+ * (no build step — see this package's README) and loads exactly one
+ * same-origin script, Socket.io's own client bundle
+ * (`/socket.io/socket.io.js`, served by Socket.io itself, not sirv) — this
+ * policy is written to permit precisely that and nothing else external:
+ *
+ * - `'unsafe-inline'` on `script-src`/`style-src` is required for the page's
+ *   existing inline `<script>`/`<style>` to keep running at all (there's no
+ *   nonce/hash plumbing here, and adding one is a larger change than this
+ *   pass's "hardening without breaking the page" scope) — this does **not**
+ *   defeat the point of the policy: what it still blocks is any *external*
+ *   script/style/connection a future XSS gap might try to pull in (a
+ *   `<script src="https://evil">`, an `img`/`fetch` to an attacker's own
+ *   host to exfiltrate data), which is exactly the realistic exploitation
+ *   step for a reflected/stored XSS bug on this page (none is known to
+ *   exist today — `escapeHtml()` covers every dynamic value rendered here —
+ *   this is defense-in-depth for a future regression, not a response to a
+ *   found bug).
+ * - `img-src 'self' data:` — `data:` is required for the QR code image
+ *   (`dashboard:join`'s `joinQrDataUrl`, set directly as an `<img>` `src`);
+ *   `'self'` covers the screenshot thumbnails/lightbox, which point at this
+ *   same server's `/uploads/:filename`.
+ * - `connect-src 'self'` — Socket.io's handshake (`ws:`/`wss:` and the
+ *   polling fallback) is same-origin; nothing on this page ever calls out to
+ *   another host.
+ * - `frame-ancestors 'none'` — see the global `X-Frame-Options` comment
+ *   above; this is the CSP-native, more expressive equivalent for browsers
+ *   that honor it.
+ * - `object-src 'none'`/`base-uri 'none'`/`form-action 'self'` — this page
+ *   has no plugin content and no `<base>`/form use; locking these down is
+ *   free hardening with no functional cost.
+ */
+function dashboardContentSecurityPolicy() {
+  const directives = [
+    'default-src \'self\'',
+    'script-src \'self\' \'unsafe-inline\'',
+    'style-src \'self\' \'unsafe-inline\'',
+    'img-src \'self\' data:',
+    'connect-src \'self\'',
+    'font-src \'self\'',
+    'frame-ancestors \'none\'',
+    'base-uri \'none\'',
+    'object-src \'none\'',
+    'form-action \'self\'',
+  ]
+  return (_req: IncomingMessage, res: ServerResponse, next: () => void) => {
+    res.setHeader('Content-Security-Policy', directives.join('; '))
+    next()
+  }
+}
+
 function requireDashboardCode(authConfig: WorkshopAuthConfig) {
   return (req: IncomingMessage, res: ServerResponse, next: () => void) => {
     const url = new URL(req.url ?? '/', 'http://internal')
@@ -341,6 +397,24 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     res.setHeader('Access-Control-Allow-Origin', options.origin ?? '*')
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    // Baseline hardening applied to every response this process serves
+    // (`/dashboard`, `/uploads`, `/api/screenshot`), not just the dashboard
+    // below — cheap, standard, and has no legitimate functionality relying
+    // on their *absence* anywhere in this app:
+    // - `nosniff` stops a browser from MIME-sniffing a response into
+    //   executing as something other than its declared `content-type` — most
+    //   relevant for `/uploads`, where the content type comes from what the
+    //   uploader claimed (`uploads.ts`'s `ALLOWED_SCREENSHOT_MIME_TYPES`),
+    //   not sniffed content, and for `/dashboard`'s static HTML/JS/CSS files
+    //   sirv already serves with correct types.
+    // - `X-Frame-Options: DENY` — nothing this server serves is meant to be
+    //   embedded in a frame; a workshop dashboard shown in one isn't a
+    //   feature, it's a clickjacking surface. Superseded by the more
+    //   expressive `frame-ancestors 'none'` in `/dashboard`'s own CSP below
+    //   for browsers that honor it, kept here too as the older/simpler
+    //   fallback for the routes that don't set a CSP.
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('X-Frame-Options', 'DENY')
     if (req.method === 'OPTIONS') {
       res.writeHead(204).end()
       return
@@ -348,6 +422,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     next()
   })
 
+  app.use('/dashboard', dashboardContentSecurityPolicy())
   app.use('/dashboard', requireDashboardCode(authConfig))
   app.use('/dashboard', sirv(DASHBOARD_PUBLIC_DIR, { single: true, dev: true, etag: true }))
 
@@ -722,10 +797,15 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         errorId: report.id,
         stepId: report.stepId,
         status: report.status,
-        // Trimmed the same way `resolveErrorReport` trims before storing —
-        // echo back what was actually kept (undefined for blank/whitespace),
-        // not the raw, possibly-untrimmed input.
-        message: message?.trim() || undefined,
+        // Read back off the report's own thread, not recomputed from the raw
+        // `message` input — `resolveErrorReport` trims *and* length-caps
+        // before storing (`session.ts`'s `MAX_TEXT_LENGTH`), so a naive
+        // `message?.trim()` here could echo back more text than was actually
+        // kept. `.at(-1)` is safe: a non-blank `message` is exactly what
+        // causes `resolveErrorReport` to push one more thread entry, so it's
+        // guaranteed to be the one just pushed, same reasoning as
+        // `presenter:sendMessage` below.
+        message: message?.trim() ? report.thread.at(-1)?.text : undefined,
       })
     }))
 

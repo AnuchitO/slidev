@@ -264,6 +264,20 @@ the redesign's core change: **marking something resolved no longer closes
 it outright.** It only offers a resolution; the reporting participant has
 the final say via `participant:confirmResolution` below.
 
+Every free-text field accepted below — an `ErrorReport`'s `text`
+(`participant:error`, `POST /api/screenshot`'s `text` field) and any
+`thread` message (`presenter:resolveError`/`sendMessage`'s `message`/`text`,
+`participant:confirmResolution`/`addMessage`'s `message`/`text`) — is
+truncated server-side at `MAX_TEXT_LENGTH` (4000 characters, `src/session.ts`)
+before being stored. A holder of a valid room/presenter code is still only
+authenticated, not trusted with unbounded input: nothing stops a scripted
+client from bypassing the addon's own textareas (which impose no
+`maxlength` of their own) and pushing an arbitrarily large string straight
+into this process's unbounded, in-memory, append-only `errorReports` array,
+with no eviction. Truncation, not rejection, so an oversized submission is
+still recorded (just cut off) rather than silently dropped on a path with
+no ack to report an error back through.
+
 - `participant:error { stepId, text?, kind? }` (client → server) — the
   **text-only** report/question path (PRD §10, `kind` added by the
   redesign). `kind` defaults to `'problem'` if omitted (only the addon's
@@ -409,6 +423,20 @@ plan 028's addition, into the same presenter-credential gate as every other
 `presenter:*`/dashboard-facing handler — see `src/server.ts`'s comment on
 that handler for why it needed fixing up as part of merging M3 and M4
 together).
+
+Every response this process serves carries `X-Content-Type-Options: nosniff`
+and `X-Frame-Options: DENY` (`src/server.ts`'s global CORS/headers
+middleware) — nothing here is meant to be embedded in a frame, and nothing
+should be interpreted as anything other than its declared content type.
+`/dashboard` additionally gets a `Content-Security-Policy`
+(`dashboardContentSecurityPolicy`) scoped to exactly what its own inline
+`<style>`/`<script>` and same-origin Socket.io client bundle + QR code
+`data:` image need — permitting the inline execution this no-build-step page
+already relies on (`'unsafe-inline'` on `script-src`/`style-src`) while still
+blocking any _external_ script/style/connection a future XSS gap on this
+page might try to pull in. Defense-in-depth, not a response to a found bug —
+this page has no known XSS gap today; every dynamic value it renders already
+goes through `escapeHtml()`.
 
 ## Testing
 

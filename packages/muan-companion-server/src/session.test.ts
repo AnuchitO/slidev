@@ -9,6 +9,7 @@ import {
   joinParticipant,
   listErrorReports,
   listPendingConnections,
+  MAX_TEXT_LENGTH,
   participants,
   removeParticipant,
   removeParticipantSocket,
@@ -400,5 +401,90 @@ describe('error report store (M3)', () => {
     resetSessionStateForTests()
 
     expect(listErrorReports()).toEqual([])
+  })
+})
+
+// Second-pass security fix: none of these mutators capped free-text input,
+// so a socket that already holds a valid room/presenter code (nothing here
+// is a *content* check, only an identity one) could otherwise push an
+// arbitrarily large string, indefinitely, into this process's unbounded,
+// in-memory `errorReports` array. `MAX_TEXT_LENGTH` bounds every free-text
+// field this store accepts; these tests pin down the exact boundary
+// (exactly at the limit is untouched, one over is truncated) rather than
+// just "very long input doesn't crash".
+describe('free-text length cap (MAX_TEXT_LENGTH)', () => {
+  beforeEach(() => {
+    resetSessionStateForTests()
+  })
+
+  it('addErrorReport leaves text at exactly MAX_TEXT_LENGTH untouched', () => {
+    const text = 'a'.repeat(MAX_TEXT_LENGTH)
+
+    const report = addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', text, ts: 1 })
+
+    expect(report.text).toHaveLength(MAX_TEXT_LENGTH)
+    expect(report.text).toBe(text)
+  })
+
+  it('addErrorReport truncates text longer than MAX_TEXT_LENGTH to the cap', () => {
+    const text = 'a'.repeat(MAX_TEXT_LENGTH + 500)
+
+    const report = addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', text, ts: 1 })
+
+    expect(report.text).toHaveLength(MAX_TEXT_LENGTH)
+    expect(report.text).toBe('a'.repeat(MAX_TEXT_LENGTH))
+  })
+
+  it('addErrorReport with no text at all is unaffected by the cap', () => {
+    const report = addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+
+    expect(report.text).toBeUndefined()
+  })
+
+  it('addPresenterMessage truncates an oversized message before appending it to the thread', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+    const overlong = `x${'y'.repeat(MAX_TEXT_LENGTH + 10)}`
+
+    const result = addPresenterMessage('err-1', overlong)
+
+    expect(result?.thread[0].text).toHaveLength(MAX_TEXT_LENGTH)
+    expect(result?.thread[0].text).toBe(overlong.slice(0, MAX_TEXT_LENGTH))
+  })
+
+  it('addParticipantMessage truncates an oversized message before appending it to the thread', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'question', ts: 1 })
+    const overlong = 'z'.repeat(MAX_TEXT_LENGTH + 10)
+
+    const result = addParticipantMessage('err-1', overlong)
+
+    expect(result?.thread[0].text).toHaveLength(MAX_TEXT_LENGTH)
+  })
+
+  it('resolveErrorReport truncates an oversized message before appending it to the thread', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+    const overlong = 'm'.repeat(MAX_TEXT_LENGTH + 10)
+
+    const result = resolveErrorReport('err-1', overlong)
+
+    expect(result?.thread[0].text).toHaveLength(MAX_TEXT_LENGTH)
+  })
+
+  it('confirmResolution truncates an oversized message before appending it to the thread', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+    const overlong = 'w'.repeat(MAX_TEXT_LENGTH + 10)
+
+    const result = confirmResolution('err-1', true, overlong)
+
+    expect(result?.thread[0].text).toHaveLength(MAX_TEXT_LENGTH)
+  })
+
+  it('a message that is only oversized after trimming is still capped, and trimming happens first', () => {
+    addErrorReport({ id: 'err-1', participantId: 'p1', participantName: 'Ada', stepId: 's1', kind: 'problem', ts: 1 })
+    // Leading whitespace shouldn't count toward the cap — trim, then cap.
+    const padded = `   ${'q'.repeat(MAX_TEXT_LENGTH)}   `
+
+    const result = addPresenterMessage('err-1', padded)
+
+    expect(result?.thread[0].text).toBe('q'.repeat(MAX_TEXT_LENGTH))
   })
 })

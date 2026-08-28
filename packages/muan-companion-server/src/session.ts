@@ -374,13 +374,64 @@ export interface ErrorReport {
 export const errorReports: ErrorReport[] = []
 
 /**
+ * Cap (in UTF-16 code units) for any free-text field a socket can push into
+ * this process's unbounded, in-memory, append-only state: an `ErrorReport`'s
+ * `text`, or a `thread` entry's `text` (`resolveErrorReport`'s/
+ * `confirmResolution`'s optional `message`, `addPresenterMessage`/
+ * `addParticipantMessage`'s `text`). Flagged as informational in a prior
+ * review and left unfixed — closed here: a participant or presenter who
+ * already holds a valid code (nothing here is behind a *content* check, only
+ * an identity one) could otherwise `socket.emit` an arbitrarily large string
+ * indefinitely, with no eviction, straight into memory. 4000 characters is
+ * comfortably more than any real error description or chat reply typed into
+ * this UI's own textareas (`ErrorReportWidget.vue`'s `rows="2"`/`rows="3"`
+ * boxes, which impose no client-side `maxlength` of their own — and
+ * wouldn't be a security boundary even if they did, since nothing stops a
+ * scripted `socket.emit` from bypassing the addon's UI entirely) while still
+ * bounding the worst case per message.
+ */
+export const MAX_TEXT_LENGTH = 4000
+
+/**
+ * Truncates (never throws/rejects) a piece of free text to `MAX_TEXT_LENGTH`
+ * — used for `ErrorReport.text`, the *original* report submission, which
+ * (unlike thread messages) is never trimmed, so this only ever caps length,
+ * nothing else.
+ */
+function capText(text: string): string {
+  return text.length > MAX_TEXT_LENGTH ? text.slice(0, MAX_TEXT_LENGTH) : text
+}
+
+/**
+ * Trims and caps an optional message before it's considered for appending to
+ * a `thread` — the shared "is there anything real here, and if so, how much
+ * of it do we keep" check every thread-appending mutator below uses
+ * (`resolveErrorReport`, `addPresenterMessage`, `addParticipantMessage`,
+ * `confirmResolution`). Returns `undefined` for a blank/whitespace-only
+ * input, same as each mutator's own pre-existing `trimmed` check — this just
+ * adds the length cap on top without changing that behavior.
+ */
+function sanitizeMessage(text: string | undefined): string | undefined {
+  const trimmed = text?.trim()
+  if (!trimmed)
+    return undefined
+  return capText(trimmed)
+}
+
+/**
  * Adds a new `ErrorReport`. Callers pass everything but `status`/`thread` —
  * a freshly-reported request always starts `'open'` with an empty thread;
  * nothing in this codebase ever creates one pre-resolved or pre-seeded with
- * messages.
+ * messages. `text`, if present, is capped at `MAX_TEXT_LENGTH` — see that
+ * constant's own doc comment.
  */
 export function addErrorReport(report: Omit<ErrorReport, 'status' | 'thread'>): ErrorReport {
-  const full: ErrorReport = { ...report, status: 'open', thread: [] }
+  const full: ErrorReport = {
+    ...report,
+    text: report.text !== undefined ? capText(report.text) : report.text,
+    status: 'open',
+    thread: [],
+  }
   errorReports.push(full)
   return full
 }
@@ -411,9 +462,9 @@ export function resolveErrorReport(errorId: string, message?: string): ErrorRepo
   if (!report)
     return undefined
   report.status = 'awaiting_confirmation'
-  const trimmed = message?.trim()
-  if (trimmed)
-    report.thread.push({ from: 'presenter', text: trimmed, ts: Date.now() })
+  const sanitized = sanitizeMessage(message)
+  if (sanitized)
+    report.thread.push({ from: 'presenter', text: sanitized, ts: Date.now() })
   return report
 }
 
@@ -426,10 +477,10 @@ export function resolveErrorReport(errorId: string, message?: string): ErrorRepo
  */
 export function addPresenterMessage(errorId: string, text: string): ErrorReport | undefined {
   const report = findReport(errorId)
-  const trimmed = text.trim()
-  if (!report || !trimmed)
+  const sanitized = sanitizeMessage(text)
+  if (!report || !sanitized)
     return undefined
-  report.thread.push({ from: 'presenter', text: trimmed, ts: Date.now() })
+  report.thread.push({ from: 'presenter', text: sanitized, ts: Date.now() })
   return report
 }
 
@@ -442,10 +493,10 @@ export function addPresenterMessage(errorId: string, text: string): ErrorReport 
  */
 export function addParticipantMessage(errorId: string, text: string): ErrorReport | undefined {
   const report = findReport(errorId)
-  const trimmed = text.trim()
-  if (!report || !trimmed)
+  const sanitized = sanitizeMessage(text)
+  if (!report || !sanitized)
     return undefined
-  report.thread.push({ from: 'participant', text: trimmed, ts: Date.now() })
+  report.thread.push({ from: 'participant', text: sanitized, ts: Date.now() })
   return report
 }
 
@@ -468,9 +519,9 @@ export function confirmResolution(errorId: string, confirmed: boolean, message?:
   if (!report)
     return undefined
   report.status = confirmed ? 'resolved' : 'reopened'
-  const trimmed = message?.trim()
-  if (trimmed)
-    report.thread.push({ from: 'participant', text: trimmed, ts: Date.now() })
+  const sanitized = sanitizeMessage(message)
+  if (sanitized)
+    report.thread.push({ from: 'participant', text: sanitized, ts: Date.now() })
   return report
 }
 

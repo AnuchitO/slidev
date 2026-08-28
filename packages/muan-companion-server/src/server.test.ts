@@ -6,7 +6,7 @@ import { connect as netConnect } from 'node:net'
 import { io as ioClient } from 'socket.io-client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMuanCompanionServer, DEFAULT_DECK_URL } from './server'
-import { errorReports, participants, removeParticipant, resetSessionStateForTests, session, stepStatus } from './session'
+import { errorReports, MAX_TEXT_LENGTH, participants, removeParticipant, resetSessionStateForTests, session, stepStatus } from './session'
 
 // `DashboardJoinAck` (M4's two codes, plus the join-link/QR fields added for
 // the shareable-join-link feature) is imported from `server.ts` itself now
@@ -464,6 +464,63 @@ describe('createMuanCompanionServer', () => {
       expect(response.status).toBe(200)
       const body = await response.text()
       expect(body).toContain('<title>')
+    })
+  })
+
+  // Second-pass security hardening: `X-Content-Type-Options`/
+  // `X-Frame-Options` are applied to every response this process serves,
+  // and `/dashboard` additionally gets a `Content-Security-Policy` scoped to
+  // exactly what its own inline script/style + same-origin Socket.io client
+  // + QR code `data:` image need (`dashboardContentSecurityPolicy` in
+  // `server.ts`) — asserted here as a contract, not just eyeballed once via
+  // curl, so a future change to this middleware chain that accidentally
+  // drops a header fails a test instead of only showing up in a browser's
+  // devtools during a real workshop.
+  describe('http security headers', () => {
+    it('every response carries X-Content-Type-Options and X-Frame-Options', async () => {
+      const dashboardResponse = await fetch(`${url}/dashboard?code=${TEST_PRESENTER_CODE}`)
+      expect(dashboardResponse.headers.get('x-content-type-options')).toBe('nosniff')
+      expect(dashboardResponse.headers.get('x-frame-options')).toBe('DENY')
+
+      // Also present on a 401 (rejected before reaching sirv) and on an
+      // unrelated route — this is applied once, globally, not re-derived
+      // per route.
+      const unauthorizedResponse = await fetch(`${url}/dashboard`)
+      expect(unauthorizedResponse.headers.get('x-content-type-options')).toBe('nosniff')
+
+      const optionsResponse = await fetch(`${url}/api/screenshot`, { method: 'OPTIONS' })
+      expect(optionsResponse.headers.get('x-content-type-options')).toBe('nosniff')
+      expect(optionsResponse.headers.get('x-frame-options')).toBe('DENY')
+    })
+
+    it('/dashboard carries a Content-Security-Policy permitting only same-origin script/style/img/connect', async () => {
+      const response = await fetch(`${url}/dashboard?code=${TEST_PRESENTER_CODE}`)
+
+      const csp = response.headers.get('content-security-policy')
+      expect(csp).toBeTruthy()
+      expect(csp).toContain('default-src \'self\'')
+      // Inline <script>/<style> (this page has no build step — see the
+      // package README) still needs to run, so 'unsafe-inline' is present —
+      // but nothing external is permitted for either.
+      expect(csp).toContain('script-src \'self\' \'unsafe-inline\'')
+      expect(csp).toContain('style-src \'self\' \'unsafe-inline\'')
+      // `data:` is required for the QR code <img> (dashboard:join's
+      // joinQrDataUrl); 'self' covers screenshot thumbnails from /uploads.
+      expect(csp).toContain('img-src \'self\' data:')
+      expect(csp).toContain('frame-ancestors \'none\'')
+    })
+
+    it('the CSP is present even on a rejected (401) /dashboard request', async () => {
+      const response = await fetch(`${url}/dashboard`)
+
+      expect(response.status).toBe(401)
+      expect(response.headers.get('content-security-policy')).toContain('frame-ancestors \'none\'')
+    })
+
+    it('a route other than /dashboard does not carry the dashboard-scoped CSP', async () => {
+      const response = await fetch(`${url}/api/screenshot`, { method: 'OPTIONS' })
+
+      expect(response.headers.get('content-security-policy')).toBeNull()
     })
   })
 
@@ -1241,6 +1298,35 @@ describe('createMuanCompanionServer', () => {
       expect(errorReports).toHaveLength(1)
     })
 
+    // Second-pass security fix: `text` had no length cap, so a socket that
+    // already completed `participant:join` (an identity check, not a
+    // content one) could spam arbitrarily large payloads into this
+    // process's unbounded, in-memory `errorReports` array. Exercised here
+    // end-to-end (the real WS handler, not just `session.ts`'s pure
+    // `addErrorReport` — see `session.test.ts` for that unit coverage) to
+    // confirm the cap is actually wired up on the path a real client uses.
+    it('participant:error with oversized text is capped, not rejected outright', async () => {
+      const client = await connectClient()
+      const { participantId } = await join(client) as { participantId: string }
+
+      const dashboard = await connectClient()
+      const initialSnapshot = waitFor(dashboard, 'state:update')
+      dashboard.emit('dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+      await initialSnapshot
+
+      const update = waitForMatchingStateUpdate<{ errors: Array<{ participantId: string, text?: string }> }>(
+        dashboard,
+        payload => payload.errors.some(e => e.participantId === participantId),
+      )
+      const overlong = 'x'.repeat(10_000)
+      client.emit('participant:error', { stepId: 'install-deps', text: overlong })
+      const payload = await update
+
+      const report = payload.errors.find(e => e.participantId === participantId)!
+      expect(report.text).toHaveLength(MAX_TEXT_LENGTH)
+      expect(report.text).toBe(overlong.slice(0, MAX_TEXT_LENGTH))
+    })
+
     it('participant:error with kind: "question" creates a question-kind report', async () => {
       const client = await connectClient()
       const { participantId } = await join(client) as { participantId: string }
@@ -1916,6 +2002,31 @@ describe('createMuanCompanionServer', () => {
       const body = await response.text()
       expect(body).toContain('stepId is required')
       expect(errorReports).toHaveLength(0)
+    })
+
+    // Second-pass security fix: the multipart `text` field went straight
+    // into `addErrorReport` uncapped, same gap as the WS `participant:error`
+    // path above — a screenshot upload's accompanying description is just
+    // as unbounded a text field as any other.
+    it('caps an oversized multipart text field rather than storing it unbounded', async () => {
+      const client = await connectClient()
+      const { participantId } = await emitWithAck<{ participantId: string }>(
+        client,
+        'participant:join',
+        { name: 'Ada', roomCode: TEST_ROOM_CODE },
+      )
+
+      const form = new FormData()
+      form.set('participantId', participantId)
+      form.set('stepId', 'install-deps')
+      form.set('text', 'x'.repeat(10_000))
+      form.set('screenshot', new Blob([ONE_PIXEL_PNG], { type: 'image/png' }), 'shot.png')
+
+      const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
+
+      expect(response.status).toBe(201)
+      const report = errorReports.find(e => e.participantId === participantId)
+      expect(report?.text).toHaveLength(MAX_TEXT_LENGTH)
     })
   })
 

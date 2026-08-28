@@ -52,8 +52,14 @@ const { httpServer } = createMuanCompanionServer({
 })
 
 httpServer.listen(PORT, () => {
+  // Prefixed with `[muan-companion-server]`, same as every other
+  // operator-facing log line below (and in `server.ts`'s join/resume
+  // logging) — this line used to be the one holdout without it, which
+  // mattered once real workshop operators started running this alongside
+  // other processes and grepping/eyeballing mixed stdout for this server's
+  // own lines specifically.
   // eslint-disable-next-line no-console -- deliberate startup log for a CLI-run server process, not app logging.
-  console.log(`muan-companion-server listening on :${PORT}`)
+  console.log(`[muan-companion-server] listening on :${PORT}`)
   // Answers "how does the presenter find out the codes to hand out" — every
   // code is now guaranteed to exist (generated above if not configured), so
   // this always has something real to print, unlike the old "only if both

@@ -106,6 +106,44 @@ startup and prints them — an explicit env var still overrides generation
 for a fixed/repeatable setup. This directly narrows one of this PR's
 originally-listed limitations (see "Known limitations" below).
 
+**Post-ship: participant management (pending-connection visibility + kick).**
+The join screen is a client-side UI prompt, not a content lock — someone
+technical enough to delete it via devtools can watch the deck without ever
+calling `participant:join`. That gap can't be closed server-side, so it's
+made *visible* instead: the dashboard now shows an anonymous "someone's
+here" row the instant a participant's browser loads, before they've typed a
+name, which updates in place to their real name once they join rather than
+appearing as a separate row. Every roster row (joined or still-anonymous)
+gets a **Remove** button: for an anonymous connection it's a clean
+disconnect; for an already-joined participant it's a **hard delete** of
+their record, not just a disconnect — a mere disconnect would let them
+silently auto-resume right back in via their saved browser identity, which
+wouldn't really be "removing" anyone. A removed participant's browser is
+dropped back to the join screen with a "you were removed" message, not left
+staring at a frozen deck. One thing worth a reviewer's attention: this is
+a *removal from the current roster*, not a ban — their past `ErrorReport`s
+are left in place under a now-dangling `participantId` (append-only, no
+retention policy, matching this codebase's existing posture everywhere
+else), and anyone who still has the room code can rejoin as a brand-new
+participant afterward.
+
+**Post-ship: hardening pass (security + architecture review).** Two
+dedicated review passes (one general code-quality, one adversarial
+security + architecture) were run against both packages before this PR.
+Fixes landed from them: free-text fields (`ErrorReport.text`, thread
+messages) are now capped at 4000 characters server-side, closing an
+unbounded-memory-growth vector open to anyone who already holds a valid
+room/presenter code; the dashboard now sends `X-Content-Type-Options`,
+`X-Frame-Options`, and a `Content-Security-Policy` scoped to `/dashboard`
+itself; a `pnpm audit` pass found zero advisories reachable from this
+feature's three added dependencies (`socket.io`, `qrcode`, `busboy`); and a
+real bug was found and fixed in the addon (`JoinScreen.vue`'s auto-resume
+wasn't guarded against the presenter's own route — an instructor testing
+locally could accidentally auto-join their presenter tab as a stray
+participant). Both packages now sit at 99%/100% statement coverage
+(174 + 50 = 224 tests total). Full details in each package's own README
+and git history.
+
 **On the rename:** partway through this work the project was renamed from
 "workshop-tracker" to "muan-companion" (packages, env vars, localStorage keys,
 CSS class prefixes, and a follow-up pass that also dropped a redundant
@@ -148,6 +186,18 @@ diagram the PRD proposes in §7 — addon + extended sync server + dashboard,
 all behind one persistent Node process rather than a `slidev build` static
 export.
 
+**Dependencies added for this feature** (beyond `connect`/`pathe`/`sirv`,
+which are pre-existing shared risk — the rest of Slidev already depends on
+them via the workspace catalog): `socket.io`/`socket.io-client` (the
+realtime transport itself — large, actively maintained), `qrcode` (the
+dashboard's join-QR code — small, stable, low release cadence), and
+`busboy` (the `POST /api/screenshot` multipart parser — mature and
+narrowly scoped, notable mainly because it's the one dependency parsing
+attacker-controlled binary input directly). `pnpm audit --prod` found zero
+advisories reachable from any of the three as of this writing. Called out
+here as one itemized decision for a reviewer to weigh, rather than
+something to discover piecemeal in a lockfile diff.
+
 ## Testing
 
 Run just now against this branch:
@@ -155,17 +205,23 @@ Run just now against this branch:
 ```
 $ pnpm --filter muan-companion-server test -- --run
  Test Files  7 passed (7)
-      Tests  123 passed (123)
+      Tests  174 passed (174)
 
 $ pnpm --filter slidev-addon-muan-companion test -- --run
- Test Files  7 passed (7)
-      Tests  41 passed (41)
+ Test Files  9 passed (9)
+      Tests  50 passed (50)
 
 $ pnpm eslint packages/muan-companion-server packages/addon-muan-companion
 (no output — clean)
+
+$ pnpm verify   # build + typecheck + lint + test, run at the repo root
+(all green — 465/465 tests across the entire monorepo, confirming no
+conflict with existing Slidev functionality, not just this branch's own)
 ```
 
-164 tests pass across both packages, no lint findings.
+224 tests pass across both packages (99.0%/100% statement coverage
+respectively), no lint findings, zero regressions against Slidev's own
+core test suite.
 
 `packages/muan-companion-server/src/server.test.ts` spins up real
 `socket.io-client` connections and real multipart `fetch()` requests against
@@ -232,6 +288,12 @@ are added.
   This is a documented, deliberate scope boundary, not an oversight — see
   `packages/muan-companion-server/README.md`'s "Auth" section for the full
   threat model.
+- **Kicking a participant isn't banning them.** "Remove" deletes their
+  roster record (so a mere reconnect can't silently resume them), but
+  anyone who still holds the room code can rejoin as a brand-new
+  participant afterward — there's no denylist. Their prior help-request
+  history also stays visible in the dashboard's feed, now attributed to a
+  `participantId` no longer on the live roster.
 
 ## How to try it
 

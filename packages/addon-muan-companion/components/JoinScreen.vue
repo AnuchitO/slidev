@@ -34,9 +34,9 @@ else" button rendered after a successful resume, calling
 `clearStoredParticipant()` and re-showing this join form blank.
 -->
 <script setup lang="ts">
-import type { JoinAck, JoinErrorAck } from '../src/participantIdentity'
+import type { JoinAck, JoinErrorAck } from '../src/socketEvents'
 import { useNav } from '@slidev/client'
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { getWorkshopSocket } from '../src/client'
 import {
   clearStoredParticipant,
@@ -47,6 +47,7 @@ import {
   writeStoredParticipant,
 } from '../src/participantIdentity'
 import { getRoomCodeFromUrl } from '../src/roomCode'
+import { useSocketListeners } from '../src/useSocketListeners'
 
 const { isPresenter } = useNav()
 
@@ -298,12 +299,19 @@ function onForciblyDisconnected(reason: string) {
   getWorkshopSocket().connect()
 }
 
-onMounted(() => {
-  getWorkshopSocket().on('disconnect', onForciblyDisconnected)
-})
-onBeforeUnmount(() => {
-  getWorkshopSocket().off('disconnect', onForciblyDisconnected)
-})
+// Bug fix (found in this review): this used to register unconditionally,
+// on every route, unlike everything else this component does — the join
+// flow's own `onMounted` above early-returns on `isPresenter`, but this
+// separate listener didn't. Harmless in practice today (the server only
+// ever force-disconnects a *participant* socket, never the presenter's —
+// see `onForciblyDisconnected`'s own comment), but it's needless: the
+// presenter's own socket has no `participantId` to lose and nothing here
+// should ever fire for it. `useSocketListeners` (`../src/useSocketListeners`)
+// is the shared "register in onMounted, clean up in onBeforeUnmount, skip
+// entirely when this is the presenter's own socket" pattern now factored out
+// once `ErrorReportWidget.vue` needed the identical shape for its own two
+// listeners.
+useSocketListeners(getWorkshopSocket(), { disconnect: onForciblyDisconnected }, { enabled: () => !isPresenter.value })
 </script>
 
 <template>

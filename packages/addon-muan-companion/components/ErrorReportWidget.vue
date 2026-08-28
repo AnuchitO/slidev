@@ -99,12 +99,13 @@ the deck, so there's no equivalent theme signal to react to there.
 <script setup lang="ts">
 import type { ConfirmResolutionPayload, ErrorResolvedPayload, PresenterMessagePayload } from '../src/socketEvents'
 import { useDarkMode, useNav } from '@slidev/client'
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { getMuanCompanionServerUrl, getWorkshopSocket } from '../src/client'
 import { canCaptureScreen } from '../src/errorReportCapability'
 import { buildScreenshotFormData } from '../src/errorReportSubmission'
 import { currentParticipant } from '../src/participantIdentity'
 import { resolveStepId } from '../src/stepId'
+import { useSocketListeners } from '../src/useSocketListeners'
 
 const { isPresenter, currentFrontmatter, currentSlideNo } = useNav()
 const { isDark } = useDarkMode()
@@ -469,13 +470,19 @@ function sendReply() {
   scheduleMessageDismiss()
 }
 
-onMounted(() => {
-  getWorkshopSocket().on('participant:errorResolved', onErrorResolved)
-  getWorkshopSocket().on('participant:message', onPresenterMessage)
-})
+// `useSocketListeners` (`../src/useSocketListeners`) is the shared
+// "register in onMounted, clean up in onBeforeUnmount, skip entirely on the
+// presenter's own socket" pattern, factored out once `JoinScreen.vue`'s
+// `disconnect` listener needed the identical shape — see that composable's
+// own comment for why the `enabled` guard matters even though nothing here
+// is a security hole today (the presenter never has an error report to be
+// notified about).
+useSocketListeners(getWorkshopSocket(), {
+  'participant:errorResolved': onErrorResolved,
+  'participant:message': onPresenterMessage,
+}, { enabled: () => !isPresenter.value })
+
 onBeforeUnmount(() => {
-  getWorkshopSocket().off('participant:errorResolved', onErrorResolved)
-  getWorkshopSocket().off('participant:message', onPresenterMessage)
   clearTimeout(resolutionFadeTimer)
   clearTimeout(messageDismissTimer)
 })

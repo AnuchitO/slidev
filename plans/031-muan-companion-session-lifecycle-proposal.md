@@ -128,6 +128,28 @@ already satisfies "not painful" — nothing has to be undone to build Option
 B later; the singletons don't leak into any external contract participants
 or the addon depend on).
 
+**Addendum (post-review, found by a later architecture pass — not present
+when this section was first written)**: two things have landed on top of
+the singleton inventory above since this plan was drafted, both small,
+neither invalidating the estimate, but both need folding into whoever
+actually scopes Option B:
+- `pendingConnections` (`Map<socketId, PendingConnection>`, the "someone's
+  here but hasn't joined yet" dashboard-visibility feature) is keyed by raw
+  socket id, populated by a `participant:connecting` event that carries
+  **no room information at all** — there's nothing to key it by yet, since
+  the whole point is "before any identity/room membership exists." Multi-room
+  would need that event (or the initial handshake) to carry a room hint up
+  front, which is a small wire-contract addition this plan didn't need to
+  consider before this feature existed — worth deciding explicitly (a query
+  param at connection time? a field on `participant:connecting` itself?)
+  rather than rediscovering it mid-implementation.
+- The join-URL/QR-code cache (`server.ts`'s `getJoinQrDataUrl`) is one
+  `Promise` closed over one process-wide `roomCode`. Multi-room needs one
+  cached promise per room, not per process — the same shape of fix already
+  called out above for `uploadsDir`'s `mkdtempSync` ("a small extension of
+  the same pattern, not a redesign"), just a second instance of it that
+  didn't exist when this section was written.
+
 ### Q3 (the user's "5"): a waiting room / lobby before "Start Presenting", participants can still join later
 
 This turns out to be **more independent of Q1/Q2 than it first looks** —

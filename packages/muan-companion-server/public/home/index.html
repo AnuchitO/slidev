@@ -113,9 +113,9 @@
   }
   .action-button:hover:not(:disabled) { background: rgba(138, 180, 248, 0.12); }
   /*
-   * Disabled affordances on this page are *honestly* disabled — the
-   * "Present" button (032c) and the "Connect a deck" button when
-   * `/api/connect-key` isn't deployed. They are styled to read as
+   * Disabled affordances on this page are *honestly* disabled — a button
+   * mid-request ("Starting…", "Stopping…"), or the "Connect a deck" button
+   * when `/api/connect-key` isn't deployed. They are styled to read as
    * unavailable at a glance rather than as ordinary buttons that happen not
    * to respond, because a button that looks live and silently does nothing
    * is the single most confusing state a half-built UI can be in.
@@ -125,6 +125,27 @@
     color: var(--muted);
     cursor: not-allowed;
   }
+  /*
+   * "Stop" is the one destructive action on this page — it ends a live
+   * workshop, and for a server-launched deck it kills a running process. It
+   * gets the error token's color rather than the primary one so it never
+   * reads as the obvious thing to click next to "Open dashboard".
+   */
+  .action-button.danger { border-color: var(--error); color: var(--error); }
+  .action-button.danger:hover:not(:disabled) { background: rgba(242, 139, 130, 0.12); }
+  /*
+   * Where a launch's outcome lands, per row. `pre-wrap` because a failed
+   * launch renders the tail of the deck's own output, which is multi-line
+   * text that would otherwise collapse into one unreadable line.
+   */
+  .launch-result {
+    color: var(--muted);
+    font-size: 12px;
+    white-space: pre-wrap;
+    max-width: 520px;
+  }
+  .launch-result.error { color: var(--error); }
+  .launch-result a { color: var(--wt-primary); }
   .note {
     color: var(--muted);
     font-size: 12px;
@@ -163,11 +184,6 @@
     <tbody id="presentation-rows"></tbody>
   </table>
   <p class="empty" id="presentations-empty" hidden></p>
-  <p class="note">
-    Launching a deck from here is not wired up yet — it arrives in plan 032c.
-    Until then this list is read-only: start decks the usual way
-    (<code>slidev dev</code>) and they show up under Live sessions below.
-  </p>
 
   <h2>Live sessions</h2>
   <table>
@@ -252,6 +268,7 @@
           <td>${escapeHtml(String(session.currentSlideIndex))}</td>
           <td class="row-actions">
             <button type="button" class="action-button" data-action="open-dashboard" data-room-code="${escapeHtml(session.roomCode)}">Open dashboard</button>
+            <button type="button" class="action-button danger" data-action="stop-session" data-room-code="${escapeHtml(session.roomCode)}">Stop</button>
           </td>
         </tr>
       `).join('')
@@ -297,22 +314,20 @@
       })
     })
 
-    // The "Present" affordance is rendered **disabled**, and says so in its
-    // own label, because plan 032b deliberately spawns nothing — a button
-    // that looks live and silently does nothing would be worse than no
-    // button at all.
+    // Plan 032c wired this up. The markup is exactly the contract 032b left
+    // behind (`data-action="present"`, `data-presentation-id`,
+    // `id="present-<id>"`); what changed is that the button is live and the
+    // "coming soon" title and the note paragraph under the table are gone.
     //
-    // Contract for 032c, so this markup doesn't have to be redone: each row's
-    // button carries `data-action="present"` and
-    // `data-presentation-id="<id>"`, and has `id="present-<presentation id>"`.
-    // Wiring it up means: drop the `disabled` attribute and the `title`,
-    // change the label to "Present", delete the `.note` paragraph under the
-    // presentations table, and add a delegated click handler keyed off
-    // `button[data-action="present"]` (the same pattern the "Open dashboard"
-    // handler above already uses), reading the id from
-    // `button.dataset.presentationId`. That id is the *only* thing that
-    // should ever be sent to the server — the deck's path is resolved
-    // server-side by `resolvePresentationDir` and never crosses the wire.
+    // The presentation **id** is the only thing ever sent to the server. The
+    // deck's path is resolved server-side by `resolvePresentationDir` and
+    // never crosses the wire in either direction — this page has no way to
+    // name a directory even if it wanted to.
+    //
+    // The per-row `<span class="launch-result">` is where a launch's outcome
+    // lands: the returned URLs on success, the server's error on failure. A
+    // sibling of the button rather than a shared banner so two launches in
+    // flight at once can't overwrite each other's result.
     function renderPresentations(presentations) {
       presentationRowsEl.innerHTML = presentations.map(presentation => `
         <tr>
@@ -325,13 +340,125 @@
               id="present-${escapeHtml(presentation.id)}"
               data-action="present"
               data-presentation-id="${escapeHtml(presentation.id)}"
-              disabled
-              title="Launching a deck from the server arrives in plan 032c"
-            >Present (coming soon)</button>
+            >Present</button>
+            <span class="launch-result" id="launch-result-${escapeHtml(presentation.id)}"></span>
           </td>
         </tr>
       `).join('')
       presentationsEmptyEl.hidden = presentations.length > 0
+    }
+
+    // "Present" — the Flow A action. Delegated off `document` in the same
+    // shape as "Open dashboard" above, because both act on rows that are
+    // re-rendered wholesale and a per-row listener would be lost on the next
+    // render.
+    //
+    // The in-flight state is real and matters here in a way it doesn't for
+    // "Open dashboard": a cold `slidev` start runs Vite's dependency
+    // optimizer and can genuinely take tens of seconds (see
+    // `READINESS_TIMEOUT_MS`), so the button says "Starting…" and stays
+    // disabled for the whole wait rather than looking idle while a process
+    // boots. Disabling it is also what stops an impatient double-click from
+    // spending two of the server's four concurrency slots on the same deck.
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-action="present"]')
+      if (!button)
+        return
+      const presentationId = button.dataset.presentationId
+      const resultEl = document.getElementById(`launch-result-${presentationId}`)
+      button.disabled = true
+      button.textContent = 'Starting…'
+      resultEl.textContent = ''
+      resultEl.classList.remove('error')
+      postJson('/api/launch', { presentationId })
+        .then((body) => {
+          // The new session arrives in the Live sessions table on its own —
+          // `createSession` broadcasts `home:update`, which this page is
+          // already subscribed to — so there is nothing to render there. What
+          // this shows is the two things the broadcast deliberately does not
+          // carry: the presenter and participant URLs for the deck that was
+          // just started. Rendered rather than navigated to, because the
+          // operator who clicked Present is usually not the person who will
+          // present: they need to *hand these over*, and a navigation would
+          // take the URLs away from them.
+          resultEl.innerHTML = `
+            room <code>${escapeHtml(body.roomCode)}</code> ·
+            <a href="${escapeHtml(body.presenterUrl)}" target="_blank" rel="noopener">presenter</a> ·
+            <a href="${escapeHtml(body.participantUrl || '')}" target="_blank" rel="noopener">participants</a>
+          `
+        })
+        .catch((error) => {
+          // The server's own message, verbatim — for a deck that failed to
+          // start it carries the tail of the child's output, which is the
+          // whole point of capturing it (see `OUTPUT_TAIL_BYTES`). An
+          // operator debugging their own deck needs the real error, not
+          // "launch failed".
+          resultEl.textContent = error.message
+          resultEl.classList.add('error')
+        })
+        .finally(() => {
+          button.disabled = false
+          button.textContent = 'Present'
+        })
+    })
+
+    // "Stop" — ends a session, and kills its deck process if this server
+    // started one. For a Flow-B session (a deck that registered itself) there
+    // is no process of ours to kill and the operator's own `slidev` keeps
+    // running; the session simply goes away. The server tells us which of the
+    // two happened via `hadProcess`, and the confirmation below says so,
+    // because "did I just kill the presenter's dev server?" is a genuinely
+    // important thing for an operator to be sure about.
+    //
+    // No confirmation prompt: the row is re-rendered from the authoritative
+    // `home:update` either way, and a `confirm()` on a page this small would
+    // be the only modal in the product.
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-action="stop-session"]')
+      if (!button)
+        return
+      const roomCode = button.dataset.roomCode
+      button.disabled = true
+      button.textContent = 'Stopping…'
+      postJson('/api/stop', { roomCode })
+        .then((body) => {
+          // The row disappears with the next `home:update`, which the destroy
+          // has already triggered. Nothing to do but say what happened, for
+          // the fraction of a second before this button stops existing.
+          button.textContent = body.hadProcess ? 'Stopped' : 'Session ended'
+        })
+        .catch(() => {
+          // Most likely the session was already gone (another tab, or the
+          // deck crashed) — the next `home:update` drops the row regardless.
+          button.disabled = false
+          button.textContent = 'unavailable'
+        })
+    })
+
+    // The two `/api/*` POSTs this page makes, in one place.
+    //
+    // The admin code goes in the `x-muan-companion-admin-code` header rather
+    // than the query string (both are accepted — see `apiHttp.ts`): a query
+    // param lands in access logs and `Referer` headers, and unlike the page
+    // URL itself, these requests have somewhere better to put it.
+    //
+    // A non-2xx is turned into a rejected promise carrying the server's own
+    // `error` string, so both callers above can render the real reason
+    // instead of a generic failure.
+    function postJson(path, payload) {
+      return fetch(path, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-muan-companion-admin-code': adminCode || '',
+        },
+        body: JSON.stringify(payload),
+      }).then(async (response) => {
+        const body = await response.json().catch(() => ({}))
+        if (!response.ok)
+          throw new Error(body.error || `HTTP ${response.status}`)
+        return body
+      })
     }
 
     // Presentations are fetched once at load rather than pushed over the
@@ -375,10 +502,17 @@
     // displayed rather than discarded — minting one is idempotent from the
     // operator's point of view (they get a key, single-use, short TTL) and
     // throwing it away would be the more surprising behavior.
+    // The admin code travels in the header 032d's route actually reads
+    // (`apiHttp.ts`'s `ADMIN_CODE_HEADER`), not as a body field. 032b wrote
+    // this page against an endpoint that did not exist yet and guessed
+    // `{ adminCode }` in the body; 032d settled on header-or-`?code=`, and
+    // the two never met until 032c wired up the rest of this page's POSTs.
+    // Left as an explicit `fetch` rather than routed through `postJson`
+    // below because this call deliberately treats a 404/405 as a *success*
+    // (the route isn't deployed), which `postJson` would turn into a throw.
     fetch('/api/connect-key', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ adminCode }),
+      headers: { 'Content-Type': 'application/json', 'x-muan-companion-admin-code': adminCode || '' },
     })
       .then(async (response) => {
         if (response.status === 404 || response.status === 405) {
@@ -400,12 +534,7 @@
 
     connectButtonEl.addEventListener('click', () => {
       connectButtonEl.disabled = true
-      fetch('/api/connect-key', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ adminCode }),
-      })
-        .then(response => response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`)))
+      postJson('/api/connect-key', undefined)
         .then(showConnectKey)
         .catch(() => {
           connectResultEl.textContent = 'Could not generate a connect key.'

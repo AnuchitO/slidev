@@ -1,4 +1,19 @@
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'pathe'
+import { generateCode } from './codeGeneration'
+
 export interface WorkshopSession {
+  /**
+   * The room code this session is keyed by. Plan 032a (031 Q2 Option B)
+   * deliberately reuses the **room code itself** as the map key rather than
+   * minting a separate internal `roomId`: the room code is already unique per
+   * session by construction (`createSession` below refuses a duplicate, and
+   * generates a fresh one when the caller doesn't supply one), and a second
+   * parallel identifier would only add translation overhead at every call
+   * site that already has one of the two in hand. Was the literal string
+   * `'default'` back when this was a process-wide singleton.
+   */
   id: string
   currentSlideIndex: number
   createdAt: number
@@ -14,14 +29,6 @@ export interface WorkshopSession {
    * `src/stepId.ts`) and trusted as-is here.
    */
   currentStepId: string
-}
-
-// Singleton in-memory session (multi-session is out of scope — PRD §14/§4).
-export const session: WorkshopSession = {
-  id: 'default',
-  currentSlideIndex: 1,
-  createdAt: Date.now(),
-  currentStepId: '1',
 }
 
 export type StepState = 'idle' | 'copied' | 'done'
@@ -76,9 +83,6 @@ export interface StepStatusValue {
   updatedAt: number
 }
 
-export const stepStatus = new Map<string, StepStatusValue>()
-export const participants = new Map<string, Participant>()
-
 /**
  * A socket that has connected but not yet completed `participant:join` —
  * the "someone's here but hasn't told us their name yet" visibility the
@@ -97,16 +101,329 @@ export const participants = new Map<string, Participant>()
  * `participant:connecting` (`server.ts`) — the presenter's own route and
  * the dashboard's own socket never emit that event, so neither shows up
  * here despite both being ordinary Socket.io connections too.
+ *
+ * Plan 032a: this map now lives on a `RoomState` rather than at module
+ * scope, so "which room's dashboard should see this anonymous socket" has an
+ * answer. See `server.ts`'s `roomOf` for the room hint that makes that
+ * possible at a point in a socket's life where no identity exists yet.
  */
 export interface PendingConnection {
   socketId: string
   connectedAt: number
 }
 
-export const pendingConnections = new Map<string, PendingConnection>()
+/**
+ * `ErrorReport` (PRD §9, plan 028 Step 1; extended by the "Ask for Help"
+ * UX redesign): a participant's text and/or screenshot report tied to
+ * `participantId`/`stepId`. `text`/`screenshotUrl` stay as the *original*
+ * submission only — everything sent after that (a presenter reply, a
+ * participant's confirm/reopen response, a follow-up question) lives in
+ * `thread`, not mixed into these two fields.
+ */
+export interface ErrorReport {
+  id: string
+  participantId: string
+  participantName: string
+  stepId: string
+  kind: HelpRequestKind
+  text?: string
+  screenshotUrl?: string
+  ts: number
+  status: HelpRequestStatus
+  thread: ThreadMessage[]
+}
 
-export function addPendingConnection(socketId: string, now: number = Date.now()): void {
-  pendingConnections.set(socketId, { socketId, connectedAt: now })
+/**
+ * Everything one live workshop session owns — plan 032a's whole point.
+ * Before this, each of these fields was its own module-level singleton
+ * (`session`, `participants`, `stepStatus`, `errorReports`,
+ * `pendingConnections`), which is what limited the process to exactly one
+ * workshop at a time (031 Q2 Option A: "run a second process instead").
+ * Bundling them into one record keyed by room code means a handler resolves
+ * "which room" **once** (`server.ts`'s `roomOf`) and then every piece of
+ * state it needs is reachable from that one object — rather than five
+ * independent lookups that could each silently land in a different room.
+ *
+ * Deliberately a plain mutable record, not a class: every mutator in this
+ * file already operated by in-place mutation on the singletons, and keeping
+ * that posture makes this refactor a re-keying rather than a rewrite of the
+ * state model itself.
+ */
+export interface RoomState {
+  /** Also this room's key in `rooms` — see `WorkshopSession.id`. */
+  roomCode: string
+  /**
+   * The high-privilege secret for *this room specifically*. Per-room, not
+   * per-process: two concurrent sessions must not be interchangeable, so a
+   * presenter code that opens room A's dashboard must be worthless against
+   * room B. `auth.ts`'s constant-time check is unchanged; what changed is
+   * that the `WorkshopAuthConfig` it checks against is now read off the
+   * resolved room instead of one process-wide config object.
+   */
+  presenterCode: string
+  /** See `CreateMuanCompanionServerOptions.deckUrl` (`server.ts`). Per-room so 032b/032d can launch different decks side by side. */
+  deckUrl: string
+  session: WorkshopSession
+  participants: Map<string, Participant>
+  stepStatus: Map<string, StepStatusValue>
+  errorReports: ErrorReport[]
+  pendingConnections: Map<string, PendingConnection>
+  /**
+   * Absolute path to this room's own `mkdtemp`-ed screenshot directory.
+   * Plan 028 Step 1 created one such directory per *process*; 031 Q2 called
+   * this out as "a small extension of the same pattern, not a redesign" for
+   * multi-room, and this is that extension — one per room, so room A's
+   * presenter can never be handed a path that resolves into room B's
+   * uploads.
+   */
+  uploadsDir: string
+  /**
+   * The last path segment of `uploadsDir` — the segment that appears in a
+   * report's `screenshotUrl` (`/uploads/${uploadsDirName}/${filename}`) and
+   * that `server.ts`'s `/uploads` route uses to pick which room's directory
+   * to serve from. Deliberately the **server-generated `mkdtemp` suffix**,
+   * never the room code: the room code can come from an operator's env var
+   * (arbitrary bytes, `../` included), and a URL path segment derived from
+   * it would be attacker-influenced path input. This one is chosen entirely
+   * by `mkdtempSync`, so there is no user-controlled component in the served
+   * path at all — the same "constrain the shape rather than blocklist"
+   * discipline `uploads.ts`'s filename regex already applies one level down.
+   */
+  uploadsDirName: string
+  /**
+   * Cached `Promise` for this room's join-link QR PNG — see `server.ts`'s
+   * `getJoinQrDataUrl`. One per room, not one per process (031 Q2's
+   * Addendum): the encoded payload is derived from the room code, so a
+   * process-wide cache would hand room B's dashboard room A's QR code.
+   * Stored here rather than in a closure precisely so it's keyed the same
+   * way everything else about the room is.
+   */
+  joinQrDataUrlPromise?: Promise<string | undefined>
+}
+
+/**
+ * Every live session in this process, keyed by room code. Replaces the
+ * module-level `session`/`participants`/`stepStatus`/`errorReports`/
+ * `pendingConnections` singletons (plan 032a / 031 Q2 Option B).
+ *
+ * Still module-level rather than owned by a `createMuanCompanionServer`
+ * instance, matching this package's existing posture (`screenshotUpload.ts`
+ * reaches into this module directly, and the whole package is written as
+ * module singletons) — what changed is the *arity*, from one implicit
+ * session to N explicit ones, not where they live.
+ */
+export const rooms = new Map<string, RoomState>()
+
+export function getRoom(roomCode: string | undefined): RoomState | undefined {
+  return roomCode === undefined ? undefined : rooms.get(roomCode)
+}
+
+export function listRooms(): RoomState[] {
+  return [...rooms.values()]
+}
+
+/**
+ * Code lengths for a session whose codes weren't supplied by the caller.
+ * Moved here from `index.ts` as part of plan 032a: `createSession` is now the
+ * single place a session — and therefore a session's codes — comes into
+ * existence, so the lengths belong next to it rather than at one particular
+ * caller. `index.ts` still decides whether to *supply* codes (from env vars);
+ * it just no longer owns how they're invented when it doesn't.
+ *
+ * Presenter code is longer than the room code: it's the higher-privilege of
+ * the two secrets (see `auth.ts`'s own comment on why they're never
+ * derivable from one another), so it gets more entropy for the same
+ * "readable/typeable" alphabet. Lengths bumped from the original 6/8 after a
+ * security review flagged the room code specifically as thin relative to
+ * the README's own "choose codes with enough entropy to resist casual
+ * guessing" goal, given this package's explicit no-rate-limiting posture: 6
+ * chars from `codeGeneration.ts`'s 31-character alphabet is only ~30 bits
+ * (≈887M combinations) — plausible to exhaust via scripted join attempts
+ * over a multi-day event, even though a successful guess only grants
+ * join-as-a-fake-participant, never presenter/dashboard access. 8/10 chars
+ * raise that to ~40/~50 bits (≈8.5×10¹¹ / ≈8.2×10¹⁴ combinations) while
+ * keeping the same "resist mishearing when read aloud" alphabet.
+ */
+export const ROOM_CODE_LENGTH = 8
+export const PRESENTER_CODE_LENGTH = 10
+
+/**
+ * How many times `createSession` re-rolls a generated room code that happens
+ * to collide with a live session's. At 8 characters from a 31-character
+ * alphabet a collision is already vanishingly unlikely at workshop scale
+ * (dozens of concurrent rooms at the absolute most), so this is a
+ * correctness backstop, not a hot path — but silently handing a caller a
+ * room code that's already in use would quietly merge two workshops into
+ * one, which is exactly the failure this whole plan exists to prevent.
+ */
+const MAX_CODE_GENERATION_ATTEMPTS = 10
+
+/**
+ * The process-wide parent directory every room's own uploads directory is
+ * created inside. One `mkdtemp` at module level for the parent (so the OS
+ * temp dir doesn't accumulate one loose directory per room at its top
+ * level), then one `mkdtemp` *per room* underneath it (`createSession`
+ * below). Making the per-room directories siblings under a single root is
+ * what lets `server.ts` keep serving `/uploads` from one `sirv` mount:
+ * `/uploads/${uploadsDirName}/${filename}` maps directly onto this tree, so
+ * no per-room mount or URL rewriting is needed.
+ *
+ * Lazy (created on the first `createSession`, not at import time) so merely
+ * importing this module — which `session.test.ts`, `presence.ts`'s type
+ * import, and the addon's type-only imports all do — never touches the
+ * filesystem.
+ */
+let uploadsRootDir: string | undefined
+
+export function getUploadsRootDir(): string {
+  if (!uploadsRootDir)
+    uploadsRootDir = mkdtempSync(join(tmpdir(), 'slidev-muan-companion-uploads-'))
+  return uploadsRootDir
+}
+
+export interface CreateSessionOptions {
+  /**
+   * Where participants should open the deck itself — see
+   * `CreateMuanCompanionServerOptions.deckUrl` (`server.ts`). Defaults to
+   * the empty string rather than to `DEFAULT_DECK_URL`: this module has no
+   * business knowing Slidev's default dev port, and every real caller
+   * (`index.ts` via `createMuanCompanionServer`) already resolves it.
+   */
+  deckUrl?: string
+  /**
+   * The participant-facing room code. **`undefined` means "generate one"**
+   * (031a's posture, now applied to every session rather than only the one
+   * `index.ts` boots); any supplied string is used verbatim, including the
+   * empty string — see the note in `createSession`'s own doc comment on why
+   * `''` is deliberately allowed rather than rejected.
+   */
+  roomCode?: string
+  /** The presenter code. `undefined` means "generate one", exactly as `roomCode` above. */
+  presenterCode?: string
+  /**
+   * Injectable code generator, defaulting to `codeGeneration.ts`'s
+   * crypto-backed one — same rationale as `generateCode`'s own `random`
+   * parameter: tests can assert exact codes without mocking the crypto
+   * module.
+   */
+  generate?: (length: number) => string
+}
+
+export interface CreateSessionResult {
+  roomCode: string
+  presenterCode: string
+  room: RoomState
+}
+
+/**
+ * Creates one fresh, isolated workshop session and registers it in `rooms`.
+ *
+ * Plan 032a makes this **the only way a session comes into existence** —
+ * including `createMuanCompanionServer`'s own boot-time session, which used
+ * to be special-cased module-level initialization. 032b (the presentation
+ * launcher UI) and 032d call this same function to spin up further sessions
+ * at runtime; there is deliberately no second path, so anything true of a
+ * session (it has both codes, it has its own uploads directory, it's
+ * discoverable in `rooms`, it shows up in the `dashboard:home` feed) is true
+ * of *every* session without a caller having to remember to do it.
+ *
+ * Throws on a duplicate room code rather than replacing or silently reusing
+ * the existing room. Replacing would let a second `createSession` wipe a
+ * live workshop's roster out from under it; reusing would quietly merge two
+ * workshops into one session sharing a participant list. Both are worse than
+ * a loud failure the caller has to handle — and for the generated-code case
+ * the caller never sees this at all, since collisions are re-rolled below.
+ *
+ * An empty-string `roomCode` is deliberately *allowed*, not rejected: it's
+ * how `createMuanCompanionServer` represents "no room code was configured"
+ * (its own `roomCode` option is optional), and `auth.ts`'s `isValidCode`
+ * refuses every credential against an empty configured code — so such a room
+ * exists but is permanently unreachable: no `participant:join`, no
+ * `presenter:*`, no dashboard. That is exactly the fail-closed state this
+ * package has always had for an unconfigured server, now expressed as a room
+ * nobody can enter rather than as a singleton nobody can use.
+ */
+export function createSession(options: CreateSessionOptions = {}): CreateSessionResult {
+  const generate = options.generate ?? (length => generateCode(length))
+
+  let roomCode: string
+  if (options.roomCode !== undefined) {
+    if (rooms.has(options.roomCode))
+      throw new Error(`[muan-companion-server] a session already exists for room code "${options.roomCode}"`)
+    roomCode = options.roomCode
+  }
+  else {
+    roomCode = generateUnusedRoomCode(generate)
+  }
+
+  const presenterCode = options.presenterCode ?? generate(PRESENTER_CODE_LENGTH)
+
+  // One `mkdtemp` per room inside the shared root — see `RoomState.uploadsDir`
+  // / `getUploadsRootDir` for why the per-room directory's *name* (not the
+  // room code) is what ends up in a `screenshotUrl`.
+  const uploadsDir = mkdtempSync(join(getUploadsRootDir(), 'room-'))
+  const uploadsDirName = uploadsDir.slice(getUploadsRootDir().length + 1)
+
+  const now = Date.now()
+  const room: RoomState = {
+    roomCode,
+    presenterCode,
+    deckUrl: options.deckUrl ?? '',
+    session: {
+      id: roomCode,
+      currentSlideIndex: 1,
+      createdAt: now,
+      currentStepId: '1',
+    },
+    participants: new Map(),
+    stepStatus: new Map(),
+    errorReports: [],
+    pendingConnections: new Map(),
+    uploadsDir,
+    uploadsDirName,
+  }
+  rooms.set(roomCode, room)
+  return { roomCode, presenterCode, room }
+}
+
+function generateUnusedRoomCode(generate: (length: number) => string): string {
+  for (let attempt = 0; attempt < MAX_CODE_GENERATION_ATTEMPTS; attempt++) {
+    const candidate = generate(ROOM_CODE_LENGTH)
+    if (!rooms.has(candidate))
+      return candidate
+  }
+  // Only reachable with a degenerate injected `generate` (a test stub that
+  // always returns the same string) — real generation would have to lose a
+  // ~40-bit lottery ten times running. Fail loudly rather than return a
+  // colliding code, for the same reason `createSession` throws on an
+  // explicit duplicate.
+  throw new Error('[muan-companion-server] could not generate an unused room code')
+}
+
+/**
+ * Removes a session and everything it owned. The symmetric half of
+ * `createSession` — plan 032d ("end this session") is its intended caller,
+ * and `createMuanCompanionServer` already uses it to tear down its own
+ * boot-time session when the http server closes, so a process that stands up
+ * a server, closes it, and stands up another under the same room code
+ * doesn't trip `createSession`'s duplicate check on a room nothing is
+ * serving any more.
+ *
+ * Does **not** delete the room's `uploadsDir` from disk: uploads have no
+ * retention/cleanup policy anywhere in this package (plan 028's explicit
+ * out-of-scope call — the whole tree is under the OS temp directory and goes
+ * away with the machine's own temp cleanup), and deleting files while a
+ * response might still be streaming one is a worse failure than leaving a
+ * few kilobytes behind. Returns whether a room actually existed, mirroring
+ * `removePendingConnection`'s "did anything change" return so callers know
+ * whether there's anything to broadcast.
+ */
+export function destroySession(roomCode: string): boolean {
+  return rooms.delete(roomCode)
+}
+
+export function addPendingConnection(room: RoomState, socketId: string, now: number = Date.now()): void {
+  room.pendingConnections.set(socketId, { socketId, connectedAt: now })
 }
 
 /**
@@ -119,12 +436,12 @@ export function addPendingConnection(socketId: string, now: number = Date.now())
  * `server.ts`'s `disconnect` handler knows whether there's a now-vanished
  * pending row to broadcast.
  */
-export function removePendingConnection(socketId: string): boolean {
-  return pendingConnections.delete(socketId)
+export function removePendingConnection(room: RoomState, socketId: string): boolean {
+  return room.pendingConnections.delete(socketId)
 }
 
-export function listPendingConnections(): PendingConnection[] {
-  return [...pendingConnections.values()]
+export function listPendingConnections(room: RoomState): PendingConnection[] {
+  return [...room.pendingConnections.values()]
 }
 
 /**
@@ -170,10 +487,16 @@ export interface JoinResult {
  * you? Join as someone else" link is the client-side mitigation for the one
  * new consequence that introduces (a shared/kiosk browser resuming the
  * previous person's identity), not a server-side concern.
+ *
+ * Plan 032a: the lookup is scoped to `room.participants`, so a
+ * `participantId` minted in room A resolves to nothing in room B and falls
+ * through to an ordinary fresh join there — which means room B's room-code
+ * gate (`server.ts`'s `isKnownResume` check) still applies to it in full.
+ * Resume tokens do not cross rooms.
  */
-export function joinParticipant(name: string, existingId: string | undefined, generateId: () => string, socketId: string): JoinResult {
+export function joinParticipant(room: RoomState, name: string, existingId: string | undefined, generateId: () => string, socketId: string): JoinResult {
   const now = Date.now()
-  const existing = existingId ? participants.get(existingId) : undefined
+  const existing = existingId ? room.participants.get(existingId) : undefined
 
   if (existing) {
     // Plan 030 Step 1: name is part of what's being resumed — the resumed
@@ -210,7 +533,7 @@ export function joinParticipant(name: string, existingId: string | undefined, ge
     visibility: 'visible',
     socketIds: [socketId],
   }
-  participants.set(participant.id, participant)
+  room.participants.set(participant.id, participant)
   return { participant, outcome: existingId ? 'resume-fallback' : 'fresh' }
 }
 
@@ -231,8 +554,8 @@ export function joinParticipant(name: string, existingId: string | undefined, ge
  * own `disconnect` fires. `presence.ts`'s staleness sweep clears the whole
  * array in one go when it determines a participant is fully gone.
  */
-export function removeParticipantSocket(participantId: string, socketId: string): boolean {
-  const participant = participants.get(participantId)
+export function removeParticipantSocket(room: RoomState, participantId: string, socketId: string): boolean {
+  const participant = room.participants.get(participantId)
   if (!participant)
     return false
   participant.socketIds = participant.socketIds.filter(id => id !== socketId)
@@ -263,18 +586,20 @@ export function removeParticipantSocket(participantId: string, socketId: string)
  * Returns the removed participant (so the caller can read its `socketIds`
  * to actually disconnect them — see `server.ts`'s handler), or `undefined`
  * for an unknown id — a no-op, not an error, same "trust the caller"
- * posture as every other mutator here.
+ * posture as every other mutator here. A participant id belonging to a
+ * different* room is an unknown id here, so a presenter can only ever kick
+ * their own room's participants (plan 032a).
  */
-export function removeParticipant(participantId: string): Participant | undefined {
-  const participant = participants.get(participantId)
+export function removeParticipant(room: RoomState, participantId: string): Participant | undefined {
+  const participant = room.participants.get(participantId)
   if (!participant)
     return undefined
-  participants.delete(participantId)
+  room.participants.delete(participantId)
   return participant
 }
 
-export function setStepStatus(participantId: string, stepId: string, state: StepState): void {
-  stepStatus.set(`${participantId}:${stepId}`, { state, updatedAt: Date.now() })
+export function setStepStatus(room: RoomState, participantId: string, stepId: string, state: StepState): void {
+  room.stepStatus.set(`${participantId}:${stepId}`, { state, updatedAt: Date.now() })
 }
 
 export interface StepStatusEntry {
@@ -295,8 +620,8 @@ export interface StepStatusEntry {
   updatedAt: number
 }
 
-export function listStepStatus(): StepStatusEntry[] {
-  return [...stepStatus.entries()].map(([key, value]) => {
+export function listStepStatus(room: RoomState): StepStatusEntry[] {
+  return [...room.stepStatus.entries()].map(([key, value]) => {
     const separatorIndex = key.indexOf(':')
     return {
       participantId: key.slice(0, separatorIndex),
@@ -348,32 +673,6 @@ export interface ThreadMessage {
 }
 
 /**
- * `ErrorReport` (PRD §9, plan 028 Step 1; extended by the "Ask for Help"
- * UX redesign): a participant's text and/or screenshot report tied to
- * `participantId`/`stepId`. `text`/`screenshotUrl` stay as the *original*
- * submission only — everything sent after that (a presenter reply, a
- * participant's confirm/reopen response, a follow-up question) lives in
- * `thread`, not mixed into these two fields.
- */
-export interface ErrorReport {
-  id: string
-  participantId: string
-  participantName: string
-  stepId: string
-  kind: HelpRequestKind
-  text?: string
-  screenshotUrl?: string
-  ts: number
-  status: HelpRequestStatus
-  thread: ThreadMessage[]
-}
-
-// Append-only for the session's lifetime — no retention/cleanup policy
-// (plan 028's explicit out-of-scope call: no cross-restart persistence
-// requirement in the PRD, §4 non-goals).
-export const errorReports: ErrorReport[] = []
-
-/**
  * Cap (in UTF-16 code units) for any free-text field a socket can push into
  * this process's unbounded, in-memory, append-only state: an `ErrorReport`'s
  * `text`, or a `thread` entry's `text` (`resolveErrorReport`'s/
@@ -419,25 +718,31 @@ function sanitizeMessage(text: string | undefined): string | undefined {
 }
 
 /**
- * Adds a new `ErrorReport`. Callers pass everything but `status`/`thread` —
- * a freshly-reported request always starts `'open'` with an empty thread;
- * nothing in this codebase ever creates one pre-resolved or pre-seeded with
- * messages. `text`, if present, is capped at `MAX_TEXT_LENGTH` — see that
- * constant's own doc comment.
+ * Adds a new `ErrorReport` to one room's append-only feed. Callers pass
+ * everything but `status`/`thread` — a freshly-reported request always
+ * starts `'open'` with an empty thread; nothing in this codebase ever
+ * creates one pre-resolved or pre-seeded with messages. `text`, if present,
+ * is capped at `MAX_TEXT_LENGTH` — see that constant's own doc comment.
+ *
+ * The feed is append-only for the session's lifetime — no retention/cleanup
+ * policy (plan 028's explicit out-of-scope call: no cross-restart
+ * persistence requirement in the PRD, §4 non-goals). Under plan 032a it is
+ * bounded by the session rather than by the process: `destroySession` is
+ * what finally releases it.
  */
-export function addErrorReport(report: Omit<ErrorReport, 'status' | 'thread'>): ErrorReport {
+export function addErrorReport(room: RoomState, report: Omit<ErrorReport, 'status' | 'thread'>): ErrorReport {
   const full: ErrorReport = {
     ...report,
     text: report.text !== undefined ? capText(report.text) : report.text,
     status: 'open',
     thread: [],
   }
-  errorReports.push(full)
+  room.errorReports.push(full)
   return full
 }
 
-function findReport(errorId: string): ErrorReport | undefined {
-  return errorReports.find(r => r.id === errorId)
+function findReport(room: RoomState, errorId: string): ErrorReport | undefined {
+  return room.errorReports.find(r => r.id === errorId)
 }
 
 /**
@@ -455,10 +760,12 @@ function findReport(errorId: string): ErrorReport | undefined {
  * second lookup), or `undefined` if no report matched — an unknown
  * `errorId` is a no-op, not an error, mirroring `setStepStatus`'s "no-op
  * rather than a guess" precedent for a socket acting on an id it doesn't
- * recognize.
+ * recognize. An `errorId` belonging to a different room is an unknown id
+ * here (plan 032a), so a presenter can only ever act on their own room's
+ * reports even if they somehow learn another room's report id.
  */
-export function resolveErrorReport(errorId: string, message?: string): ErrorReport | undefined {
-  const report = findReport(errorId)
+export function resolveErrorReport(room: RoomState, errorId: string, message?: string): ErrorReport | undefined {
+  const report = findReport(room, errorId)
   if (!report)
     return undefined
   report.status = 'awaiting_confirmation'
@@ -475,8 +782,8 @@ export function resolveErrorReport(errorId: string, message?: string): ErrorRepo
  * ever marking it resolved. A blank/whitespace-only message is a no-op:
  * there's nothing to append.
  */
-export function addPresenterMessage(errorId: string, text: string): ErrorReport | undefined {
-  const report = findReport(errorId)
+export function addPresenterMessage(room: RoomState, errorId: string, text: string): ErrorReport | undefined {
+  const report = findReport(room, errorId)
   const sanitized = sanitizeMessage(text)
   if (!report || !sanitized)
     return undefined
@@ -491,8 +798,8 @@ export function addPresenterMessage(errorId: string, text: string): ErrorReport 
  * `confirmResolution` below, not this: that's a status transition, this
  * never is.
  */
-export function addParticipantMessage(errorId: string, text: string): ErrorReport | undefined {
-  const report = findReport(errorId)
+export function addParticipantMessage(room: RoomState, errorId: string, text: string): ErrorReport | undefined {
+  const report = findReport(room, errorId)
   const sanitized = sanitizeMessage(text)
   if (!report || !sanitized)
     return undefined
@@ -514,8 +821,8 @@ export function addParticipantMessage(errorId: string, text: string): ErrorRepor
  * An optional message is appended as a participant thread message either
  * way.
  */
-export function confirmResolution(errorId: string, confirmed: boolean, message?: string): ErrorReport | undefined {
-  const report = findReport(errorId)
+export function confirmResolution(room: RoomState, errorId: string, confirmed: boolean, message?: string): ErrorReport | undefined {
+  const report = findReport(room, errorId)
   if (!report)
     return undefined
   report.status = confirmed ? 'resolved' : 'reopened'
@@ -526,30 +833,59 @@ export function confirmResolution(errorId: string, confirmed: boolean, message?:
 }
 
 // Copies the array, same as `listPendingConnections`/`listStepStatus` above
-// — returning the live `errorReports` array itself would let a caller
+// — returning the live `room.errorReports` array itself would let a caller
 // mutate the master list by e.g. `.push()`-ing onto the returned value
 // directly, bypassing `addErrorReport`. The `ErrorReport` objects *inside*
 // the copy are still the real, shared, in-place-mutated records (finding
 // one and pushing onto its own `thread` is exactly how every mutator above
 // works) — only the array's own identity is protected here, matching the
 // existing "trust the caller with the records themselves" posture.
-export function listErrorReports(): ErrorReport[] {
-  return [...errorReports]
+export function listErrorReports(room: RoomState): ErrorReport[] {
+  return [...room.errorReports]
 }
 
 /**
- * Resets all M2/M3 state — participants, step status, current step id, and
- * error reports — back to a fresh session. Test-only: production never
- * needs to reset a running server's state; `beforeEach` in `server.test.ts`
- * uses this so tests don't leak state into each other via these singleton
- * maps/arrays (mirroring how M1's tests reset `session.currentSlideIndex`
- * directly).
+ * Finds the room a given participant id belongs to, scanning every live
+ * session. The one place in this module that deliberately searches *across*
+ * rooms rather than within one, and it exists for exactly one caller:
+ * `POST /api/screenshot` (`screenshotUpload.ts`), whose multipart body
+ * carries a `participantId` but no room information.
+ *
+ * That's safe to resolve this way — unlike `participant:connecting`, which
+ * genuinely has no identity yet and therefore needed a new wire-contract
+ * room hint (see `server.ts`'s `roomOf`) — because a `participantId` is
+ * a 122-bit `crypto.randomUUID()` minted server-side at join time (see
+ * `joinParticipant`), so it is globally unique across rooms by construction
+ * and unambiguously names the room that minted it. The endpoint's
+ * authorization is unchanged by this: it accepted exactly one credential
+ * before (a `participantId` the server recognizes) and accepts exactly the
+ * same one now — the lookup just also tells it *which* room's uploads
+ * directory and error feed the report belongs in, instead of assuming the
+ * single process-wide one.
+ *
+ * Returns `undefined` for an unknown id, which the caller turns into the
+ * same `400 unknown participantId` it has always returned.
+ */
+export function findRoomByParticipantId(participantId: string): RoomState | undefined {
+  for (const room of rooms.values()) {
+    if (room.participants.has(participantId))
+      return room
+  }
+  return undefined
+}
+
+/**
+ * Drops every live session. Test-only: production never needs to reset a
+ * running server's state; `beforeEach` in `server.test.ts`/`session.test.ts`
+ * uses this so tests don't leak state into each other via the module-level
+ * `rooms` map.
+ *
+ * Under plan 032a this replaced a function that reset the *fields* of the
+ * one singleton session (slide index, step id, participants, …) — with state
+ * keyed by room there is no singleton to reset, and clearing the map is both
+ * simpler and stricter: a test can't accidentally inherit a room a previous
+ * test created under a different code.
  */
 export function resetSessionStateForTests(): void {
-  session.currentSlideIndex = 1
-  session.currentStepId = '1'
-  participants.clear()
-  pendingConnections.clear()
-  stepStatus.clear()
-  errorReports.length = 0
+  rooms.clear()
 }

@@ -1,11 +1,10 @@
 import type { Server as HttpServer, IncomingMessage, ServerResponse } from 'node:http'
 import type { Socket } from 'socket.io'
 import type { WorkshopAuthConfig } from './auth'
-import type { HelpRequestKind, ParticipantVisibility, StepState } from './session'
+import type { CreateSessionOptions, CreateSessionResult, HelpRequestKind, ParticipantVisibility, RoomState, StepState } from './session'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
 import { createServer } from 'node:http'
-import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import connect from 'connect'
 import { join } from 'pathe'
@@ -21,16 +20,19 @@ import {
   addPendingConnection,
   addPresenterMessage,
   confirmResolution,
+  createSession,
+  destroySession,
+  getRoom,
+  getUploadsRootDir,
   joinParticipant,
   listErrorReports,
   listPendingConnections,
+  listRooms,
   listStepStatus,
-  participants,
   removeParticipant,
   removeParticipantSocket,
   removePendingConnection,
   resolveErrorReport,
-  session,
   setStepStatus,
 } from './session'
 import { resolveUploadPath } from './uploads'
@@ -44,6 +46,12 @@ export interface CreateMuanCompanionServerOptions {
    * `isValidCode`: a missing configured code is never satisfied by "nothing
    * supplied" behaving like a wildcard. Fail closed, not open, if an
    * operator forgets to configure this (see `index.ts`'s startup warning).
+   *
+   * Plan 032a: this is the **boot session's** room code specifically, not a
+   * process-wide setting — it's forwarded to `createSession` (`session.ts`)
+   * as the code for the one session this server stands up at construction
+   * time. Further sessions created later (032b/032d, via the returned
+   * server's own `createSession`) carry their own, independent codes.
    */
   roomCode?: string
   /**
@@ -51,7 +59,9 @@ export interface CreateMuanCompanionServerOptions {
    * §12 / plan 029 Step 1) — deliberately a *separate* secret from
    * `roomCode`, never derivable from it, so a participant who knows the room
    * code still can't move slides or open the dashboard. Same fail-closed
-   * behavior as `roomCode` when unset.
+   * behavior as `roomCode` when unset, and (as of 032a) likewise per-session
+   * rather than per-process: room A's presenter code is worthless against
+   * room B.
    */
   presenterCode?: string
   /**
@@ -114,6 +124,40 @@ export function buildJoinUrl(deckUrl: string, roomCode: string): string | undefi
 export interface MuanCompanionServer {
   httpServer: HttpServer
   io: SocketIOServer
+  /**
+   * The session this server stood up at construction time, exactly as
+   * `createSession` returned it. Its `roomCode` is also the room every
+   * socket that arrives *without* a room hint is resolved into (see
+   * `roomOf`/`ROOM_CODE_QUERY_PARAM` below) — which is what keeps every
+   * pre-032a client working against a now-multi-room server.
+   *
+   * Exposed because a server constructed without explicit codes now gets
+   * generated* ones rather than unusable empty strings, so the caller
+   * (`index.ts`, whose startup log has to print both codes) can no longer
+   * assume it already knows what they are.
+   */
+  bootSession: CreateSessionResult
+  /**
+   * Plan 032a's seam for 032b (the presentation-launcher UI) and 032d:
+   * stands up an additional, fully isolated session on this same running
+   * server and tells every `dashboard:home` subscriber about it. Delegates
+   * straight to `session.ts`'s `createSession` — this wrapper exists only to
+   * pair session creation with the home broadcast, so no caller can create a
+   * session the home view never hears about.
+   *
+   * Throws (from `createSession`) if the requested room code is already in
+   * use — callers driving this from user input should catch that and surface
+   * "that code is taken" rather than assuming success.
+   */
+  createSession: (options?: CreateSessionOptions) => CreateSessionResult
+  /**
+   * The symmetric half of `createSession` above — 032d's "end this session"
+   * action. Returns whether a session actually existed. Every socket still
+   * in the destroyed room's dashboard/participant rooms simply stops
+   * receiving updates for it (their next event resolves no room and no-ops,
+   * exactly like a socket naming a room that never existed).
+   */
+  destroySession: (roomCode: string) => boolean
 }
 
 /**
@@ -129,6 +173,20 @@ interface WithPresenterCode {
 }
 
 /**
+ * The `WorkshopAuthConfig` (`auth.ts`) for one room. Plan 032a: the auth
+ * config used to be a single object built once per process from
+ * `createMuanCompanionServer`'s options; it's now derived per room, so every
+ * gate below checks the credential it was handed against **the room the
+ * calling socket actually resolved to** rather than against one global pair.
+ * The check itself (`auth.ts`'s constant-time compare, and its refusal to
+ * treat a missing configured code as a wildcard) is untouched — only where
+ * the expected values come from changed.
+ */
+function authConfigOf(room: RoomState): WorkshopAuthConfig {
+  return { roomCode: room.roomCode, presenterCode: room.presenterCode }
+}
+
+/**
  * Wraps a `presenter:*` socket handler so the shared "no-op on
  * invalid/missing presenterCode" gate (plan 029 Step 1) lives in one place
  * instead of being repeated as an `if (!isValidPresenterCode(...)) return`
@@ -141,12 +199,26 @@ interface WithPresenterCode {
  * use this wrapper — its rejection acks `{ ok: false }` instead of silently
  * doing nothing, a genuinely different shape, not just a variant worth
  * generalizing this helper over for a single caller.
+ *
+ * Plan 032a: the wrapper now also resolves the room (via the `resolveRoom`
+ * function it's handed) and passes it to the wrapped handler, so a
+ * `presenter:*` handler can't accidentally act on a *different* room than
+ * the one whose presenter code it just validated against — the two come
+ * from the same lookup, in this one place, rather than each handler
+ * repeating the pair. A socket whose room can't be resolved at all (it named
+ * a room that doesn't exist, or one that has since been destroyed) is the
+ * same silent no-op as a bad code, for the same reason: nothing to act on,
+ * and nothing worth telling a stray client about.
  */
-function requirePresenterCode<T extends WithPresenterCode>(authConfig: WorkshopAuthConfig, handler: (payload: T) => void) {
+function requirePresenterCode<T extends WithPresenterCode>(
+  resolveRoom: () => RoomState | undefined,
+  handler: (room: RoomState, payload: T) => void,
+) {
   return (payload: T) => {
-    if (!isValidPresenterCode(authConfig, payload.presenterCode))
+    const room = resolveRoom()
+    if (!room || !isValidPresenterCode(authConfigOf(room), payload.presenterCode))
       return
-    handler(payload)
+    handler(room, payload)
   }
 }
 
@@ -183,11 +255,89 @@ export interface DashboardJoinAck {
   joinQrDataUrl?: string
 }
 
-// Sockets that have joined this room get every `state:update` broadcast —
-// participant sockets never join it, so the full roster/step-status payload
-// isn't sent to every participant on every other participant's keystroke
-// (plan 027 Step 1 / STOP condition 3).
-const DASHBOARD_ROOM = 'dashboard'
+/**
+ * Sockets that have joined a room's dashboard get every `state:update`
+ * broadcast for *that room* — participant sockets never join it, so the full
+ * roster/step-status payload isn't sent to every participant on every other
+ * participant's keystroke (plan 027 Step 1 / STOP condition 3).
+ *
+ * Plan 032a: one Socket.io room per workshop session (`dashboard:${roomCode}`)
+ * rather than the single global `'dashboard'` this used to be — 031 Q2
+ * identified this existing room mechanism as "exactly the right primitive to
+ * extend", and this is that extension. Room A's dashboard is not in room B's
+ * Socket.io room, so it never receives room B's roster, step status, help
+ * requests, or pending connections; there is no filtering step that could be
+ * forgotten, because the wrong room's payload is never sent in the first
+ * place.
+ */
+function dashboardRoomFor(roomCode: string): string {
+  return `dashboard:${roomCode}`
+}
+
+/**
+ * The cross-session "home" feed room — new in plan 032a, with no equivalent
+ * in 031. A future home view (032b) that lists every live session across
+ * rooms subscribes here and gets a fresh `home:update` whenever a session is
+ * created or destroyed, instead of polling or being rebuilt on every
+ * `state:update`.
+ *
+ * **Nothing joins this room yet, deliberately.** Wiring the room and its
+ * broadcast now is what lets 032b subscribe without reopening this
+ * refactor — but adding the `socket.join(HOME_DASHBOARD_ROOM)` handler is
+ * 032b's job *and* 032b's security decision, because `buildHomeUpdate`'s
+ * payload necessarily carries every live room's code (that's what a
+ * session list is), and a room code is the participant-level credential for
+ * its session. Whatever credential gates that join, it must be at least as
+ * strong as the per-room presenter code that gates `dashboard:join` today —
+ * a cross-room view is strictly more privileged than any single room's
+ * dashboard, so it must not be reachable with less. Until then this room is
+ * always empty and `broadcastHomeUpdate` is a no-op on the wire, which is
+ * the correct fail-closed default for a feed with no gate written yet.
+ */
+export const HOME_DASHBOARD_ROOM = 'dashboard:home'
+
+/** One row of the `home:update` feed — a live session, summarized. */
+export interface HomeSessionSummary {
+  roomCode: string
+  deckUrl: string
+  createdAt: number
+  currentSlideIndex: number
+  currentStepId: string
+  participantCount: number
+  /** Participants currently `connected` — the "how full is this room right now" number a home view actually wants. */
+  connectedCount: number
+  openHelpRequestCount: number
+}
+
+/**
+ * Builds the `home:update` payload. Exported so 032b's home view can render
+ * an immediate snapshot to a newly-subscribed socket (mirroring how
+ * `dashboard:join` emits `buildStateUpdate()` to the joining socket) rather
+ * than making it wait for the next session to be created or destroyed.
+ *
+ * Deliberately a *summary*, not the rooms themselves: no participant names,
+ * no help-request text, no presenter codes. A home view needs to know which
+ * sessions exist and roughly how busy they are; handing it every room's full
+ * state would make one subscription equivalent to N dashboards.
+ */
+export function buildHomeUpdate(): { sessions: HomeSessionSummary[] } {
+  return {
+    sessions: listRooms().map(room => ({
+      roomCode: room.roomCode,
+      deckUrl: room.deckUrl,
+      createdAt: room.session.createdAt,
+      currentSlideIndex: room.session.currentSlideIndex,
+      currentStepId: room.session.currentStepId,
+      participantCount: room.participants.size,
+      connectedCount: [...room.participants.values()].filter(p => p.connected).length,
+      openHelpRequestCount: room.errorReports.filter(r => r.status === 'open' || r.status === 'reopened').length,
+    })),
+  }
+}
+
+function broadcastHomeUpdate(io: SocketIOServer) {
+  io.to(HOME_DASHBOARD_ROOM).emit('home:update', buildHomeUpdate())
+}
 
 // The dashboard (plan 027 Step 3) is served as a small static page by this
 // same process — same origin as the Socket.io server, so no CORS
@@ -195,49 +345,43 @@ const DASHBOARD_ROOM = 'dashboard'
 // 1 of the two considered in the plan).
 const DASHBOARD_PUBLIC_DIR = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'public', 'dashboard')
 
-function buildStateUpdate() {
-  return {
-    currentSlideIndex: session.currentSlideIndex,
-    currentStepId: session.currentStepId,
-    participants: [...participants.values()],
-    // Sockets that connected and announced themselves (`participant:connecting`
-    // below) but haven't completed `participant:join` yet — the "someone's
-    // here but we don't know their name" visibility feature. A *separate*
-    // field from `participants` above, not folded in as a fake participant
-    // row: `Participant` requires a real `name`/`id`, and every other
-    // consumer of `participants` (error reports, step status, the resume
-    // flow) genuinely needs that to be true. The dashboard renders the two
-    // together (see `public/dashboard/index.html`).
-    pendingConnections: listPendingConnections(),
-    stepStatus: listStepStatus(),
-    // PRD §10's literal `state:update` shape (`{ currentSlideIndex,
-    // participants[], errors[] }`) — folded straight into the existing
-    // payload rather than a separate event (plan 028 Step 1's decision):
-    // error reports are rare compared to step-status churn, so the combined
-    // payload isn't a size/frequency problem at realistic volumes, and the
-    // dashboard client needs no restructuring beyond rendering a new field.
-    errors: listErrorReports(),
-  }
-}
-
-function broadcastStateUpdate(io: SocketIOServer) {
-  io.to(DASHBOARD_ROOM).emit('state:update', buildStateUpdate())
-}
-
 /**
- * Gates the `/dashboard` static route on the presenter credential, supplied
- * as a `?code=` query param (plan 029 Step 1's "simple query param... gate
- * on the dashboard's static route" option). Chosen over HTTP Basic Auth so
- * the *same* value the operator hands out in the dashboard URL is also what
- * `public/dashboard/index.html`'s own script reads back out of
- * `location.search` to authenticate its Socket.io `dashboard:join` — one
- * credential, one place it lives (the URL the operator was given), never
- * embedded in any served bundle. Runs *before* `sirv` in the middleware
- * chain below, so an invalid/missing code never reaches the static file
- * handler at all — satisfies plan 029's "dashboard route ... requires the
- * presenter credential to access" done-criterion for the route itself, not
- * just the Socket.io data feed layered on top of it.
+ * The query-string / handshake-query parameter a client uses to say which
+ * session it means, at points in its life where nothing else can say it.
+ *
+ * Plan 032a decision (031 Q2's Addendum explicitly left this open — "a query
+ * param at connection time? a field on `participant:connecting` itself? —
+ * worth deciding explicitly rather than rediscovering it mid-implementation"):
+ * **a Socket.io handshake query parameter**, read once in `io.on('connection')`
+ * and cached on `socket.data.roomCode`, mirroring exactly how
+ * `socket.data.participantId` is set once at join time and read by every
+ * later handler.
+ *
+ * Chosen over a field on `participant:connecting` because a payload field
+ * only answers the question for that one event, whereas the room is needed
+ * before* any event at all: `slide:sync` is emitted synchronously the
+ * instant a socket connects, and it must carry the right room's slide index.
+ * One mechanism that covers the connection handshake, `participant:connecting`,
+ * and every subsequent handler beats two that each cover part of it.
+ *
+ * This hint is **not a credential and grants nothing**. It only selects
+ * which room's auth config a later check runs against: `participant:join`
+ * still validates the supplied room code against that room
+ * (`isValidRoomCode`, constant-time, unchanged), every `presenter:*` event
+ * and `dashboard:join` still require that room's presenter code, and naming
+ * a room that doesn't exist resolves to nothing and no-ops. The only thing an
+ * unauthenticated socket gets by naming a room is that room's `slide:sync`
+ * — which is already emitted to every connecting socket with no
+ * authentication whatsoever today, so scoping it to a named room is strictly
+ * narrower than the status quo, not a new exposure.
+ *
+ * Same parameter name as the participant-facing join link's own query param
+ * (`buildJoinUrl` above, and the addon's `roomCode.ts`), so 032b's client
+ * work is "pass the room code you already read out of the URL into
+ * `io(url, { query })`", not a second name to learn.
  */
+const ROOM_CODE_QUERY_PARAM = 'roomCode'
+
 /**
  * A `Content-Security-Policy` for `/dashboard` specifically (not applied
  * globally — `/uploads` serves participant-supplied image bytes and
@@ -264,7 +408,7 @@ function broadcastStateUpdate(io: SocketIOServer) {
  * - `img-src 'self' data:` — `data:` is required for the QR code image
  *   (`dashboard:join`'s `joinQrDataUrl`, set directly as an `<img>` `src`);
  *   `'self'` covers the screenshot thumbnails/lightbox, which point at this
- *   same server's `/uploads/:filename`.
+ *   same server's `/uploads/:room/:filename`.
  * - `connect-src 'self'` — Socket.io's handshake (`ws:`/`wss:` and the
  *   polling fallback) is same-origin; nothing on this page ever calls out to
  *   another host.
@@ -294,11 +438,34 @@ function dashboardContentSecurityPolicy() {
   }
 }
 
-function requireDashboardCode(authConfig: WorkshopAuthConfig) {
+/**
+ * Gates the `/dashboard` static route on the presenter credential, supplied
+ * as a `?code=` query param (plan 029 Step 1's "simple query param... gate
+ * on the dashboard's static route" option). Chosen over HTTP Basic Auth so
+ * the *same* value the operator hands out in the dashboard URL is also what
+ * `public/dashboard/index.html`'s own script reads back out of
+ * `location.search` to authenticate its Socket.io `dashboard:join` — one
+ * credential, one place it lives (the URL the operator was given), never
+ * embedded in any served bundle. Runs *before* `sirv` in the middleware
+ * chain below, so an invalid/missing code never reaches the static file
+ * handler at all — satisfies plan 029's "dashboard route ... requires the
+ * presenter credential to access" done-criterion for the route itself, not
+ * just the Socket.io data feed layered on top of it.
+ *
+ * Plan 032a: which room's presenter code is expected now comes from the same
+ * `?roomCode=` hint every socket uses (`ROOM_CODE_QUERY_PARAM`), defaulting
+ * to the boot session when absent so an existing dashboard URL keeps working
+ * verbatim. Naming an unknown room is a 401 with the exact same body as a
+ * wrong code — a caller learns nothing about which room codes exist from the
+ * response, and there is no path where an unresolvable room means "let it
+ * through".
+ */
+function requireDashboardCode(resolveRoomFromRequest: (req: IncomingMessage) => RoomState | undefined) {
   return (req: IncomingMessage, res: ServerResponse, next: () => void) => {
     const url = new URL(req.url ?? '/', 'http://internal')
     const supplied = url.searchParams.get('code') ?? undefined
-    if (isValidPresenterCode(authConfig, supplied)) {
+    const room = resolveRoomFromRequest(req)
+    if (room && isValidPresenterCode(authConfigOf(room), supplied)) {
       next()
       return
     }
@@ -315,40 +482,97 @@ function requireDashboardCode(authConfig: WorkshopAuthConfig) {
  * without touching process bootstrapping.
  */
 export function createMuanCompanionServer(options: CreateMuanCompanionServerOptions = {}): MuanCompanionServer {
-  const authConfig: WorkshopAuthConfig = {
-    roomCode: options.roomCode ?? '',
-    presenterCode: options.presenterCode ?? '',
+  const deckUrl = options.deckUrl ?? DEFAULT_DECK_URL
+
+  // Plan 032a: the boot session goes through the *same* `createSession` that
+  // 032b/032d will call at runtime — there is deliberately no second,
+  // special-cased path for "the first session". Everything that's true of a
+  // session created later (its own codes, its own uploads directory, an
+  // entry in `rooms`, a `home:update` for subscribers) is therefore true of
+  // this one too, without this function having to remember to do any of it.
+  //
+  // Both codes are passed straight through, `undefined` included: to
+  // `createSession`, `undefined` means "generate one" — 031a's posture,
+  // which `index.ts` used to implement on its own for the single session it
+  // booted, now applied to every session from one place. The visible
+  // consequence is that a server constructed with no codes at all no longer
+  // sits in the old "no code is configured, therefore nothing works"
+  // state — it gets a real, unguessable pair instead. That is strictly
+  // *more* usable and no less safe: `auth.ts`'s gates are untouched, and a
+  // generated 8/10-character code is a real secret rather than an empty
+  // string nobody can satisfy. An explicit empty string is still honored
+  // verbatim (and still fails closed) for a caller that genuinely wants
+  // that — see `createSession`'s own doc comment.
+  //
+  // No `broadcastHomeUpdate` for this one: `io` doesn't exist yet at this
+  // point in construction, and by definition no socket can have subscribed
+  // to a server that isn't built.
+  const bootSession = createSession({
+    roomCode: options.roomCode,
+    presenterCode: options.presenterCode,
+    deckUrl,
+  })
+  const defaultRoomCode = bootSession.roomCode
+
+  /**
+   * Resolves the room a socket belongs to. `socket.data.roomCode` is set
+   * once, in `io.on('connection')` below, from the handshake's room hint
+   * (see `ROOM_CODE_QUERY_PARAM`) — exactly mirroring how
+   * `socket.data.participantId` is set once at `participant:join` and read
+   * by every later handler rather than re-derived.
+   *
+   * Returns `undefined` for a socket naming a room that doesn't exist (or
+   * one destroyed since it connected). Every caller below treats that as the
+   * same no-op it already treats an unjoined socket / unknown id as — the
+   * established "no-op rather than a guess" posture of this whole file —
+   * rather than falling back to some other room, which would be exactly the
+   * cross-room leak this plan exists to prevent.
+   */
+  function roomOf(socket: Socket): RoomState | undefined {
+    return getRoom(socket.data.roomCode as string | undefined)
   }
 
-  // Computed once, here, rather than per-request: both the deck URL and the
-  // room code are fixed for this server process's entire lifetime today (no
-  // dynamic code rotation exists — see the README's threat-model note), so
-  // there's nothing that would make a second computation ever differ from
-  // the first. `joinUrl` is `undefined` whenever `buildJoinUrl` finds no room
-  // code configured — see that function's own doc comment for why that's the
-  // right behavior rather than emitting a link that doesn't actually work.
-  const deckUrl = options.deckUrl ?? DEFAULT_DECK_URL
-  const joinUrl = buildJoinUrl(deckUrl, authConfig.roomCode)
+  /**
+   * Computes this room's join URL on demand rather than once at construction
+   * time: before 032a both the deck URL and the room code were fixed for the
+   * process's entire lifetime, so one precomputed value could serve every
+   * caller. With N sessions, each created at a different moment with its own
+   * deck URL, that's no longer true — but the value is still pure and cheap
+   * (one template string), so there's nothing to cache. `undefined` whenever
+   * `buildJoinUrl` finds no room code configured — see that function's own
+   * doc comment for why that's the right behavior rather than emitting a
+   * link that doesn't actually work.
+   */
+  function joinUrlOf(room: RoomState): string | undefined {
+    return buildJoinUrl(room.deckUrl, room.roomCode)
+  }
 
-  // `QRCode.toDataURL` is async (it's doing real PNG encoding work), and
-  // deliberately *not* awaited right here at server-construction time: this
-  // function is called synchronously by every test in `server.test.ts` (and
-  // by `index.ts` before `httpServer.listen`), and forcing all of them to
-  // pay for a PNG encode up front — for a value most of them never touch —
-  // would slow the whole suite for no benefit. Instead this is computed
-  // lazily, the *first* time anything actually asks for it
-  // (`getJoinQrDataUrl` below, called from the `dashboard:join` handler), and
-  // the resulting `Promise` (not just its resolved value) is cached in this
-  // closure so a second dashboard tab opening moments later reuses the same
-  // in-flight/completed encode instead of re-generating identical bytes.
-  // Caching the `Promise` rather than waiting for it once and caching the
-  // string is what makes that safe against two `dashboard:join` calls racing
-  // before the first encode finishes.
-  let joinQrDataUrlPromise: Promise<string | undefined> | undefined
-  function getJoinQrDataUrl(): Promise<string | undefined> {
+  /**
+   * `QRCode.toDataURL` is async (it's doing real PNG encoding work), and
+   * deliberately *not* awaited at session-creation time: sessions are created
+   * synchronously by every test in `server.test.ts` (and by `index.ts`
+   * before `httpServer.listen`), and forcing all of them to pay for a PNG
+   * encode up front — for a value most of them never touch — would slow the
+   * whole suite for no benefit. Instead this is computed lazily, the *first*
+   * time anything actually asks for it (called from the `dashboard:join`
+   * handler), and the resulting `Promise` (not just its resolved value) is
+   * cached so a second dashboard tab opening moments later reuses the same
+   * in-flight/completed encode instead of re-generating identical bytes.
+   * Caching the `Promise` rather than waiting for it once and caching the
+   * string is what makes that safe against two `dashboard:join` calls racing
+   * before the first encode finishes.
+   *
+   * Plan 032a / 031 Q2's Addendum: the cache lives on the `RoomState`, one
+   * promise per room, rather than in a single closure variable per process.
+   * The encoded payload is derived from the room code, so a process-wide
+   * cache would have handed the second room's dashboard the *first* room's
+   * QR code — a wrong-workshop join link, silently, forever.
+   */
+  function getJoinQrDataUrl(room: RoomState): Promise<string | undefined> {
+    const joinUrl = joinUrlOf(room)
     if (!joinUrl)
       return Promise.resolve(undefined)
-    if (!joinQrDataUrlPromise) {
+    if (!room.joinQrDataUrlPromise) {
       // `.catch(() => undefined)` rather than letting a rejection propagate:
       // `dashboard:join`'s handler `await`s this directly, and socket.io
       // doesn't catch a listener's own async rejections for you — an
@@ -357,9 +581,45 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // convenience on top of the plain `joinUrl` text link (still shown
       // regardless), not load-bearing, so degrading to "no QR image" beats
       // crashing the dashboard connection over it.
-      joinQrDataUrlPromise = QRCode.toDataURL(joinUrl).catch(() => undefined)
+      room.joinQrDataUrlPromise = QRCode.toDataURL(joinUrl).catch(() => undefined)
     }
-    return joinQrDataUrlPromise
+    return room.joinQrDataUrlPromise
+  }
+
+  function buildStateUpdate(room: RoomState) {
+    return {
+      currentSlideIndex: room.session.currentSlideIndex,
+      currentStepId: room.session.currentStepId,
+      participants: [...room.participants.values()],
+      // Sockets that connected and announced themselves (`participant:connecting`
+      // below) but haven't completed `participant:join` yet — the "someone's
+      // here but we don't know their name" visibility feature. A *separate*
+      // field from `participants` above, not folded in as a fake participant
+      // row: `Participant` requires a real `name`/`id`, and every other
+      // consumer of `participants` (error reports, step status, the resume
+      // flow) genuinely needs that to be true. The dashboard renders the two
+      // together (see `public/dashboard/index.html`).
+      pendingConnections: listPendingConnections(room),
+      stepStatus: listStepStatus(room),
+      // PRD §10's literal `state:update` shape (`{ currentSlideIndex,
+      // participants[], errors[] }`) — folded straight into the existing
+      // payload rather than a separate event (plan 028 Step 1's decision):
+      // error reports are rare compared to step-status churn, so the combined
+      // payload isn't a size/frequency problem at realistic volumes, and the
+      // dashboard client needs no restructuring beyond rendering a new field.
+      errors: listErrorReports(room),
+    }
+  }
+
+  /**
+   * Broadcasts one room's state to *that room's* dashboard subscribers only
+   * (plan 032a). Every call site passes the room it just mutated, resolved
+   * from the acting socket — so a mutation in room A can't reach room B's
+   * dashboard even by accident, because room B's Socket.io room is never
+   * named.
+   */
+  function broadcastStateUpdate(io: SocketIOServer, room: RoomState) {
+    io.to(dashboardRoomFor(room.roomCode)).emit('state:update', buildStateUpdate(room))
   }
 
   // `sirv` is mounted on the connect app *before* Socket.io attaches to the
@@ -422,56 +682,90 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     next()
   })
 
+  /**
+   * The HTTP-side twin of `roomOf` above: reads the same `?roomCode=` hint
+   * off a plain request's query string, falling back to the boot session so
+   * a `/dashboard?code=...` URL an operator was handed before 032a keeps
+   * working with no room parameter at all.
+   */
+  function roomOfRequest(req: IncomingMessage): RoomState | undefined {
+    const url = new URL(req.url ?? '/', 'http://internal')
+    return getRoom(url.searchParams.get(ROOM_CODE_QUERY_PARAM) ?? defaultRoomCode)
+  }
+
   app.use('/dashboard', dashboardContentSecurityPolicy())
-  app.use('/dashboard', requireDashboardCode(authConfig))
+  app.use('/dashboard', requireDashboardCode(roomOfRequest))
   app.use('/dashboard', sirv(DASHBOARD_PUBLIC_DIR, { single: true, dev: true, etag: true }))
 
-  // Session-scoped uploads dir (plan 028 Step 1): a fresh `mkdtemp`-ed
-  // directory per server instance, not a fixed path in the repo — matches
-  // the PRD's "keep them in memory/disk for the session, no cross-restart
-  // persistence requirement" (§4 non-goals) without needing an explicit
-  // cleanup job, and gives every test run (each of which creates its own
-  // server) an isolated directory rather than sharing one across runs.
-  const uploadsDir = mkdtempSync(join(tmpdir(), 'slidev-muan-companion-uploads-'))
+  // Staging directory for in-flight screenshot uploads (plan 032a). The
+  // per-*room* directories every accepted upload actually lands in are
+  // created by `createSession` (`session.ts`) as siblings under
+  // `getUploadsRootDir()`; this one is a sibling of those, holding bytes
+  // only for as long as it takes to parse the rest of the multipart body and
+  // work out which room the upload belongs to. See
+  // `createScreenshotUploadHandler`'s own doc comment for why the room can't
+  // be known before the first byte of the file arrives.
+  const uploadsStagingDir = mkdtempSync(join(getUploadsRootDir(), 'staging-'))
 
-  // `GET /uploads/:filename` — served by the same `sirv` used for the
-  // dashboard, from the confined `uploadsDir` above. `resolveUploadPath`
-  // (`uploads.ts`) is checked *first*, ahead of sirv, so a path-traversal
-  // attempt or any filename that doesn't match the server's own
-  // `${randomUUID()}.${ext}` naming scheme is rejected before sirv ever
-  // touches the filesystem — defense-in-depth on top of sirv's own path
-  // normalization, not a replacement for it.
+  // `GET /uploads/:roomDir/:filename` — served by the same `sirv` used for
+  // the dashboard, from the shared uploads root, with each room's own
+  // `mkdtemp`-ed subdirectory underneath it (`RoomState.uploadsDir`). Both
+  // path segments are checked *first*, ahead of sirv, so a path-traversal
+  // attempt, an unknown room directory, or any filename that doesn't match
+  // the server's own `${randomUUID()}.${ext}` naming scheme is rejected
+  // before sirv ever touches the filesystem — defense-in-depth on top of
+  // sirv's own path normalization, not a replacement for it.
+  //
+  // The room segment is matched against live rooms' `uploadsDirName` rather
+  // than merely pattern-checked: a directory belonging to a session that has
+  // been destroyed is no longer servable, and a segment that never named a
+  // room is a 404 rather than a filesystem probe. Note the room *code* never
+  // appears in this URL (see `RoomState.uploadsDirName`), so serving a
+  // screenshot leaks no credential.
   app.use('/uploads', (req, res, next) => {
     const raw = (req.url ?? '').replace(/^\/+/, '').split('?')[0]
-    let requested: string
+    let segments: string[]
     try {
-      requested = decodeURIComponent(raw)
+      // Decoded *before* the shape check below, deliberately: malformed
+      // percent-encoding is a 400 ("that isn't a well-formed request")
+      // rather than a 404 ("no such file"), and that has to stay true
+      // regardless of how many path segments the request happened to carry.
+      segments = raw.split('/').map(decodeURIComponent)
     }
     catch {
-      // Malformed percent-encoding — not a filename this server ever wrote,
+      // Malformed percent-encoding — not a path this server ever wrote,
       // reject rather than guess.
       res.writeHead(400).end()
       return
     }
-    if (!resolveUploadPath(uploadsDir, requested)) {
+    // Exactly `<room uploads dir>/<filename>` — plan 032a's two-segment
+    // shape. Anything else (the pre-032a flat `/uploads/:filename`, or a
+    // deeper path) never named a file this server wrote.
+    if (segments.length !== 2) {
+      res.writeHead(404).end()
+      return
+    }
+    const [roomDir, requested] = segments
+    const room = listRooms().find(r => r.uploadsDirName === roomDir)
+    if (!room || !resolveUploadPath(room.uploadsDir, requested)) {
       res.writeHead(404).end()
       return
     }
     next()
   })
-  app.use('/uploads', sirv(uploadsDir, { dev: true, etag: true }))
+  app.use('/uploads', sirv(getUploadsRootDir(), { dev: true, etag: true }))
 
   const httpServer = createServer(app)
   const io = new SocketIOServer(httpServer, {
     cors: { origin: options.origin ?? '*' },
   })
 
-  app.use(createScreenshotUploadHandler(uploadsDir, () => broadcastStateUpdate(io)))
+  app.use(createScreenshotUploadHandler(uploadsStagingDir, room => broadcastStateUpdate(io, room)))
 
-  function touchLastSeen(participantId: string | undefined) {
+  function touchLastSeen(room: RoomState, participantId: string | undefined) {
     if (!participantId)
       return
-    const participant = participants.get(participantId)
+    const participant = room.participants.get(participantId)
     if (participant)
       participant.lastSeen = Date.now()
   }
@@ -504,16 +798,18 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
   // (e.g. `presenter:kickParticipant` deleted it — reports are append-only,
   // see `removeParticipant`'s doc comment) even though their past report
   // still exists — `notifyReporter` below is what actually no-ops on that.
-  function reporterOf(report: { participantId: string }) {
-    return participants.get(report.participantId)
+  function reporterOf(room: RoomState, report: { participantId: string }) {
+    return room.participants.get(report.participantId)
   }
 
   // The ownership check `participant:confirmResolution` and
   // `participant:addMessage` below both need: a report exists *and* it
   // belongs to the calling socket's own participant. Returns the report
   // itself (not just a boolean) so callers don't need a second lookup.
-  function errorReportOwnedBy(errorId: string, participantId: string) {
-    return listErrorReports().find(r => r.id === errorId && r.participantId === participantId)
+  // Scoped to one room (plan 032a), so a report id learned from another
+  // room resolves to nothing here rather than to that other room's report.
+  function errorReportOwnedBy(room: RoomState, errorId: string, participantId: string) {
+    return listErrorReports(room).find(r => r.id === errorId && r.participantId === participantId)
   }
 
   // Targets *every* socket currently in `reporter.socketIds`, not just one:
@@ -531,12 +827,11 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
   /**
    * M1's slide-sync events. Split out of the single giant `io.on('connection', ...)`
    * body (027-030's handlers had all accumulated inline there) purely for
-   * navigability — every closure captured here (`io`, `authConfig`) is
-   * exactly what these handlers already relied on, nothing changes about
-   * when or how they fire.
+   * navigability — every closure captured here (`io`) is exactly what these
+   * handlers already relied on, nothing changes about when or how they fire.
    */
   function registerSlideHandlers(socket: Socket) {
-    socket.on('presenter:setSlide', requirePresenterCode(authConfig, ({ index }: { index: number, presenterCode?: string }) => {
+    socket.on('presenter:setSlide', requirePresenterCode(() => roomOf(socket), (room, { index }: { index: number, presenterCode?: string }) => {
       // Plan 029 Step 1: gated on the presenter credential, distinct from
       // the participant room code (`requirePresenterCode` above) — a
       // stray/misconfigured client shouldn't be able to crash the server,
@@ -544,9 +839,17 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // disconnect (matches this event's pre-029 shape — no ack — and the
       // plan's own verify step: "rejected/ignored, verified via ... the
       // fact that no other client's slide moves").
-      session.currentSlideIndex = index
-      io.emit('slide:changed', { index })
-      broadcastStateUpdate(io)
+      room.session.currentSlideIndex = index
+      // Plan 032a: `io.emit` (every connected socket in the process) would
+      // now move *every room's* participants, including rooms this
+      // presenter holds no credential for — the single most obvious
+      // cross-room leak in this whole refactor. Targeted at this room's own
+      // participant Socket.io room instead; `participantRoomFor` is joined
+      // by every socket at connection time (see `io.on('connection')`
+      // below), so a participant hears their own presenter and nobody
+      // else's.
+      io.to(participantRoomFor(room.roomCode)).emit('slide:changed', { index })
+      broadcastStateUpdate(io, room)
     }))
 
     // Not in PRD §10's literal event list — a deliberate addition (mirroring
@@ -559,9 +862,9 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // independent of when the router's `afterEach` (which drives
     // `presenter:setSlide`) fires — see that component's own comment for
     // why they can't share one event.
-    socket.on('presenter:setStep', requirePresenterCode(authConfig, ({ stepId }: { stepId: string, presenterCode?: string }) => {
-      session.currentStepId = stepId
-      broadcastStateUpdate(io)
+    socket.on('presenter:setStep', requirePresenterCode(() => roomOf(socket), (room, { stepId }: { stepId: string, presenterCode?: string }) => {
+      room.session.currentStepId = stepId
+      broadcastStateUpdate(io, room)
     }))
   }
 
@@ -590,9 +893,20 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // presence visible on the dashboard instead of invisible, and pairs
     // with `presenter:kickPendingConnection` (`registerKickHandlers` below)
     // to let the presenter disconnect a socket they don't want around.
+    //
+    // Plan 032a: "which dashboard should see this anonymous socket" is
+    // answered by the connection-time room hint (`ROOM_CODE_QUERY_PARAM`),
+    // which is precisely the gap 031 Q2's Addendum flagged — this event
+    // carries no identity of its own and never could, since the whole point
+    // is "before any identity exists". A socket that named no room falls
+    // back to the boot session, which is what keeps today's single-session
+    // addon working unchanged.
     socket.on('participant:connecting', () => {
-      addPendingConnection(socket.id)
-      broadcastStateUpdate(io)
+      const room = roomOf(socket)
+      if (!room)
+        return
+      addPendingConnection(room, socket.id)
+      broadcastStateUpdate(io, room)
     })
 
     socket.on(
@@ -606,6 +920,17 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         // identity, show the prompt again" rather than assuming success.
         ack?: (payload: { participantId: string, currentSlideIndex: number, resumed: boolean } | { error: 'invalid_room_code' }) => void,
       ) => {
+        const room = roomOf(socket)
+        // A socket naming a room that doesn't exist is rejected with the
+        // same `invalid_room_code` the wrong-code path uses, deliberately:
+        // "that room isn't here" and "that isn't the code" are the same
+        // answer as far as an unauthenticated caller is concerned, so
+        // probing this event can't be used to enumerate which room codes
+        // name live sessions.
+        if (!room) {
+          ack?.({ error: 'invalid_room_code' })
+          return
+        }
         // Plan 029 Step 1: the participant room code, distinct from (and
         // lower-privilege than) the presenter credential above. Rejected via
         // the ack rather than a forced disconnect — lets the join screen
@@ -627,12 +952,17 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         // doesn't currently recognize (unknown/stale — e.g. the server
         // restarted) still goes through the full room-code gate below,
         // exactly like a brand-new join.
-        const isKnownResume = participantId !== undefined && participants.has(participantId)
-        if (!isKnownResume && !isValidRoomCode(authConfig, roomCode)) {
+        //
+        // Plan 032a: `room.participants` scopes that exemption to this room
+        // — an id minted in another room is "unknown" here, so it earns no
+        // free pass and falls through to the room-code gate like any other
+        // stranger. Resume tokens do not cross rooms.
+        const isKnownResume = participantId !== undefined && room.participants.has(participantId)
+        if (!isKnownResume && !isValidRoomCode(authConfigOf(room), roomCode)) {
           ack?.({ error: 'invalid_room_code' })
           return
         }
-        const { participant, outcome } = joinParticipant(name, participantId, randomUUID, socket.id)
+        const { participant, outcome } = joinParticipant(room, name, participantId, randomUUID, socket.id)
         // Plan 030 Step 1: log a resume distinctly from both a normal
         // first-time join and a *failed* resume — an operator watching the
         // server's own logs during a real session needs to be able to tell
@@ -663,13 +993,16 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         // transition from an anonymous placeholder to the real name in one
         // atomic update rather than a flicker of "disappeared, then
         // reappeared as someone else".
-        removePendingConnection(socket.id)
-        ack?.({ participantId: participant.id, currentSlideIndex: session.currentSlideIndex, resumed: outcome === 'resumed' })
-        broadcastStateUpdate(io)
+        removePendingConnection(room, socket.id)
+        ack?.({ participantId: participant.id, currentSlideIndex: room.session.currentSlideIndex, resumed: outcome === 'resumed' })
+        broadcastStateUpdate(io, room)
       },
     )
 
     socket.on('disconnect', () => {
+      const room = roomOf(socket)
+      if (!room)
+        return
       const participantId = getJoinedParticipantId(socket)
       if (!participantId) {
         // Never joined — if this socket had announced itself as pending
@@ -678,8 +1011,8 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         // forever. A presenter/dashboard socket (never pending in the first
         // place) hits `removePendingConnection`'s own no-op path here,
         // matching this handler's pre-existing behavior for those.
-        if (removePendingConnection(socket.id))
-          broadcastStateUpdate(io)
+        if (removePendingConnection(room, socket.id))
+          broadcastStateUpdate(io, room)
         return
       }
       // A clean Socket.io `disconnect` is a definitive, immediate signal for
@@ -693,8 +1026,8 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // participant is genuinely still `viewing now`. Only broadcast when
       // that actually happened — removing one of several live sockets
       // changes nothing the dashboard renders.
-      if (removeParticipantSocket(participantId, socket.id))
-        broadcastStateUpdate(io)
+      if (removeParticipantSocket(room, participantId, socket.id))
+        broadcastStateUpdate(io, room)
     })
   }
 
@@ -702,17 +1035,18 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
   function registerStepTrackingHandlers(socket: Socket) {
     function handleStepAction(state: StepState) {
       return ({ stepId }: { stepId: string }, ack?: (payload: { stepId: string, state: StepState }) => void) => {
+        const room = roomOf(socket)
         const participantId = getJoinedParticipantId(socket)
         // A client can only act on behalf of the participant it joined as
         // (set on `participant:join` above) — a socket that hasn't joined
         // yet has nothing to attach the status to, so this is a no-op
         // rather than a guess.
-        if (!participantId)
+        if (!room || !participantId)
           return
-        setStepStatus(participantId, stepId, state)
-        touchLastSeen(participantId)
+        setStepStatus(room, participantId, stepId, state)
+        touchLastSeen(room, participantId)
         ack?.({ stepId, state })
-        broadcastStateUpdate(io)
+        broadcastStateUpdate(io, room)
       }
     }
 
@@ -742,13 +1076,14 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // `participant:copy`/`done` above — the room code was already checked
     // once, at `participant:join`.
     socket.on('participant:error', ({ stepId, text, kind }: { stepId: string, text?: string, kind?: HelpRequestKind }) => {
+      const room = roomOf(socket)
       const participantId = getJoinedParticipantId(socket)
       // Same "no-op rather than a guess" rule as `participant:copy`/`done`
       // above — a socket that hasn't joined has no participant to attach
       // the report to.
-      if (!participantId)
+      if (!room || !participantId)
         return
-      const participant = participants.get(participantId)
+      const participant = room.participants.get(participantId)
       // Defensive, not just theoretical: a presenter could in principle
       // `presenter:kickParticipant` this exact participant in the brief
       // window between this event being sent and being processed — the
@@ -756,7 +1091,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // `socket.data.participantId` (set once, at join) still points at it.
       if (!participant)
         return
-      addErrorReport({
+      addErrorReport(room, {
         id: randomUUID(),
         participantId,
         participantName: participant.name,
@@ -767,11 +1102,11 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       })
       // Plan 029: "any activity counts as liveness", not just the dedicated
       // heartbeat — reporting an error is real, recent activity.
-      touchLastSeen(participantId)
-      broadcastStateUpdate(io)
+      touchLastSeen(room, participantId)
+      broadcastStateUpdate(io, room)
     })
 
-    socket.on('presenter:resolveError', requirePresenterCode(authConfig, ({ errorId, message }: { errorId: string, message?: string, presenterCode?: string }) => {
+    socket.on('presenter:resolveError', requirePresenterCode(() => roomOf(socket), (room, { errorId, message }: { errorId: string, message?: string, presenterCode?: string }) => {
       // Plan 029 Step 1: same presenter-credential gate as `presenter:setSlide`
       // / `presenter:setStep` (`registerSlideHandlers` above) — resolving a
       // report is exactly as privileged as moving everyone's slide. (This
@@ -785,15 +1120,16 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // loop back to the *specific* participant who filed this report — not
       // a broadcast, and not the dashboard room (they already got it via
       // the `state:update` below).
-      const report = resolveErrorReport(errorId, message)
+      const report = resolveErrorReport(room, errorId, message)
       // Only broadcast once something actually changed — an unknown
       // `errorId` (with an otherwise-valid presenter code) is a no-op, same
       // "nothing to tell the dashboard" posture as every other handler here
-      // that checks its lookup's result before broadcasting.
+      // that checks its lookup's result before broadcasting. Under 032a an
+      // errorId belonging to *another* room is likewise unknown here.
       if (!report)
         return
-      broadcastStateUpdate(io)
-      notifyReporter(reporterOf(report), 'participant:errorResolved', {
+      broadcastStateUpdate(io, room)
+      notifyReporter(reporterOf(room, report), 'participant:errorResolved', {
         errorId: report.id,
         stepId: report.stepId,
         status: report.status,
@@ -816,12 +1152,12 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // sees the new thread entry via the `state:update` broadcast below, and
     // the reporting participant is pushed the same message live so they
     // don't have to reopen the widget to notice it.
-    socket.on('presenter:sendMessage', requirePresenterCode(authConfig, ({ errorId, text }: { errorId: string, text: string, presenterCode?: string }) => {
-      const report = addPresenterMessage(errorId, text)
+    socket.on('presenter:sendMessage', requirePresenterCode(() => roomOf(socket), (room, { errorId, text }: { errorId: string, text: string, presenterCode?: string }) => {
+      const report = addPresenterMessage(room, errorId, text)
       if (!report)
         return
-      broadcastStateUpdate(io)
-      notifyReporter(reporterOf(report), 'participant:message', {
+      broadcastStateUpdate(io, room)
+      notifyReporter(reporterOf(room, report), 'participant:message', {
         errorId: report.id,
         stepId: report.stepId,
         text: report.thread.at(-1)!.text,
@@ -839,15 +1175,16 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // what actually stops one participant from confirming/reopening
     // another's report, not just a UI nicety.
     socket.on('participant:confirmResolution', ({ errorId, confirmed, message }: { errorId: string, confirmed: boolean, message?: string }) => {
+      const room = roomOf(socket)
       const participantId = getJoinedParticipantId(socket)
-      if (!participantId)
+      if (!room || !participantId)
         return
-      const report = errorReportOwnedBy(errorId, participantId)
+      const report = errorReportOwnedBy(room, errorId, participantId)
       if (!report)
         return
-      confirmResolution(errorId, confirmed, message)
-      touchLastSeen(participantId)
-      broadcastStateUpdate(io)
+      confirmResolution(room, errorId, confirmed, message)
+      touchLastSeen(room, participantId)
+      broadcastStateUpdate(io, room)
     })
 
     // Lets a participant add a follow-up on their own report's thread —
@@ -857,15 +1194,16 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // Same ownership restriction as `participant:confirmResolution`, for the
     // same reason.
     socket.on('participant:addMessage', ({ errorId, text }: { errorId: string, text: string }) => {
+      const room = roomOf(socket)
       const participantId = getJoinedParticipantId(socket)
-      if (!participantId)
+      if (!room || !participantId)
         return
-      const report = errorReportOwnedBy(errorId, participantId)
+      const report = errorReportOwnedBy(room, errorId, participantId)
       if (!report)
         return
-      addParticipantMessage(errorId, text)
-      touchLastSeen(participantId)
-      broadcastStateUpdate(io)
+      addParticipantMessage(room, errorId, text)
+      touchLastSeen(room, participantId)
+      broadcastStateUpdate(io, room)
     })
   }
 
@@ -879,10 +1217,11 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // ignored rather than trusted verbatim, so a client can't self-report
     // `'closed'` and short-circuit the server's own disconnect/sweep signals.
     socket.on('participant:visibility', ({ state }: { state: ParticipantVisibility }) => {
+      const room = roomOf(socket)
       const participantId = getJoinedParticipantId(socket)
-      if (!participantId || (state !== 'visible' && state !== 'hidden'))
+      if (!room || !participantId || (state !== 'visible' && state !== 'hidden'))
         return
-      const participant = participants.get(participantId)
+      const participant = room.participants.get(participantId)
       // Defensive, not just theoretical — same kick-race reasoning as
       // `participant:error`'s identical check (`registerHelpRequestHandlers`
       // above): the record can vanish between this socket's last join and
@@ -891,7 +1230,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         return
       participant.visibility = state
       participant.lastSeen = Date.now()
-      broadcastStateUpdate(io)
+      broadcastStateUpdate(io, room)
     })
 
     // PRD §10 `participant:heartbeat { stepId }` — sent every
@@ -907,7 +1246,10 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // `touchLastSeen` itself no-ops on an unjoined socket, so there's no
     // extra guard needed here the way the other handlers above need one.
     socket.on('participant:heartbeat', () => {
-      touchLastSeen(getJoinedParticipantId(socket))
+      const room = roomOf(socket)
+      if (!room)
+        return
+      touchLastSeen(room, getJoinedParticipantId(socket))
     })
   }
 
@@ -932,7 +1274,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // Socket.io-level session), matching what a presenter clicking "kick"
     // actually wants: this browser stops working *now*, not "on its next
     // reconnect attempt".
-    socket.on('presenter:kickParticipant', requirePresenterCode(authConfig, ({ participantId }: { participantId: string, presenterCode?: string }) => {
+    socket.on('presenter:kickParticipant', requirePresenterCode(() => roomOf(socket), (room, { participantId }: { participantId: string, presenterCode?: string }) => {
       // `removeParticipant` (session.ts) is the hard delete — see its own
       // doc comment for why a mere disconnect isn't enough to actually kick
       // someone (they could just silently auto-resume). Disconnect every
@@ -941,12 +1283,17 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // any of these sockets would otherwise hit `removeParticipantSocket`
       // looking up an id `removeParticipant` already deleted — harmless
       // (it no-ops on an unknown id) but backwards from the intended order.
-      const removed = removeParticipant(participantId)
+      //
+      // Scoped to this presenter's own room (plan 032a): a participant id
+      // from another room isn't in `room.participants`, so this is the same
+      // no-op as an id that never existed — one room's presenter can't kick
+      // another room's participants even knowing their id.
+      const removed = removeParticipant(room, participantId)
       if (!removed)
         return
       for (const socketId of removed.socketIds)
         io.sockets.sockets.get(socketId)?.disconnect(true)
-      broadcastStateUpdate(io)
+      broadcastStateUpdate(io, room)
     }))
 
     // The pending-connection equivalent — there's no `Participant` record to
@@ -957,11 +1304,15 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // the dashboard's row disappears immediately on the presenter's own
     // broadcast rather than waiting on a second round-trip for the
     // disconnect event to come back through.
-    socket.on('presenter:kickPendingConnection', requirePresenterCode(authConfig, ({ socketId }: { socketId: string, presenterCode?: string }) => {
-      if (!removePendingConnection(socketId))
+    //
+    // Likewise room-scoped: the pending entry has to be in *this* room's
+    // `pendingConnections` for the disconnect to happen at all, so a socket
+    // id observed on another room's dashboard is inert here.
+    socket.on('presenter:kickPendingConnection', requirePresenterCode(() => roomOf(socket), (room, { socketId }: { socketId: string, presenterCode?: string }) => {
+      if (!removePendingConnection(room, socketId))
         return
       io.sockets.sockets.get(socketId)?.disconnect(true)
-      broadcastStateUpdate(io)
+      broadcastStateUpdate(io, room)
     }))
   }
 
@@ -981,15 +1332,21 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // dashboard tab doesn't have to wait for the next mutation to render
     // anything.
     socket.on('dashboard:join', async ({ presenterCode }: { presenterCode?: string } = {}, ack?: (result: DashboardJoinAck) => void) => {
+      const room = roomOf(socket)
       // Plan 029 Step 1: same presenter credential as `presenter:*` above —
       // opening the dashboard is exactly as privileged as moving everyone's
-      // slide, so it shares the same gate rather than a weaker one.
-      if (!isValidPresenterCode(authConfig, presenterCode)) {
+      // slide, so it shares the same gate rather than a weaker one. Plan
+      // 032a: checked against *this socket's room* specifically, so room A's
+      // presenter code opens room A's dashboard and nothing else. An
+      // unresolvable room acks the same `{ ok: false }` as a wrong code —
+      // see `participant:join`'s equivalent note on why the two failures are
+      // deliberately indistinguishable.
+      if (!room || !isValidPresenterCode(authConfigOf(room), presenterCode)) {
         ack?.({ ok: false })
         return
       }
-      socket.join(DASHBOARD_ROOM)
-      socket.emit('state:update', buildStateUpdate())
+      socket.join(dashboardRoomFor(room.roomCode))
+      socket.emit('state:update', buildStateUpdate(room))
       // Hand both codes back so the dashboard page can display them for the
       // operator to copy — safe to do here specifically because reaching
       // this line already proved the caller holds the presenter code (the
@@ -1005,24 +1362,62 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
       // delay this ack.
       ack?.({
         ok: true,
-        roomCode: authConfig.roomCode,
-        presenterCode: authConfig.presenterCode,
-        deckUrl,
-        joinUrl,
-        joinQrDataUrl: await getJoinQrDataUrl(),
+        roomCode: room.roomCode,
+        presenterCode: room.presenterCode,
+        deckUrl: room.deckUrl,
+        joinUrl: joinUrlOf(room),
+        joinQrDataUrl: await getJoinQrDataUrl(room),
       })
     })
   }
 
+  /**
+   * Every socket in one session's *participant* broadcast room. Plan 032a
+   * introduced this alongside `dashboardRoomFor`: `slide:changed` used to go
+   * out via a bare `io.emit` (every socket in the process), which was
+   * correct only because a process had exactly one session. With N sessions
+   * that would move every room's deck at once, so each socket joins its own
+   * room's participant room at connection time and slide broadcasts are
+   * addressed to it.
+   *
+   * Distinct from the dashboard room even though a dashboard socket is also
+   * in it: the two carry different events (`slide:changed` vs
+   * `state:update`) with different privilege (`slide:changed` is the
+   * unauthenticated deck sync every participant needs; `state:update` is the
+   * presenter-gated roster feed), so collapsing them would push roster data
+   * to participants.
+   */
+  function participantRoomFor(roomCode: string): string {
+    return `participants:${roomCode}`
+  }
+
   io.on('connection', (socket) => {
-    // Sync the newly-connected client to current state immediately — needed
-    // for M1's own acceptance bar (a participant who loads *after* the
-    // presenter has already moved past slide 1 must still land on the right
-    // slide). This event isn't in PRD §10's list; it's the minimum addition
-    // needed to make `slide:changed` (a rebroadcast-only event) useful to
-    // late joiners, and is a deliberate, documented addition — not scope
-    // creep.
-    socket.emit('slide:sync', { index: session.currentSlideIndex })
+    // Plan 032a: resolve "which session is this socket talking about" once,
+    // here, from the handshake's room hint, and cache it on `socket.data`
+    // exactly the way `participant:join` caches `participantId` — every
+    // handler below reads it back via `roomOf(socket)` rather than
+    // re-deriving it. Falling back to the boot session when no hint is
+    // supplied is what keeps every pre-032a client (the addon's `client.ts`,
+    // which passes no query, and the dashboard page) working unchanged
+    // against a server that now merely *can* hold more than one session.
+    //
+    // The hint is not authenticated and is not treated as a credential —
+    // see `ROOM_CODE_QUERY_PARAM`'s own doc comment.
+    const hinted = socket.handshake.query[ROOM_CODE_QUERY_PARAM]
+    socket.data.roomCode = typeof hinted === 'string' && hinted ? hinted : defaultRoomCode
+
+    const room = roomOf(socket)
+    if (room) {
+      socket.join(participantRoomFor(room.roomCode))
+      // Sync the newly-connected client to current state immediately —
+      // needed for M1's own acceptance bar (a participant who loads *after*
+      // the presenter has already moved past slide 1 must still land on the
+      // right slide). This event isn't in PRD §10's list; it's the minimum
+      // addition needed to make `slide:changed` (a rebroadcast-only event)
+      // useful to late joiners, and is a deliberate, documented addition —
+      // not scope creep.
+      socket.emit('slide:sync', { index: room.session.currentSlideIndex })
+    }
 
     registerSlideHandlers(socket)
     registerParticipantLifecycleHandlers(socket)
@@ -1041,14 +1436,45 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
   // exists to correct when it's gone stale. A participant counts as
   // connected here if *any* of its `socketIds` is still live — same
   // multi-tab reasoning as the `disconnect` handler above.
+  //
+  // Plan 032a: sweeps every live room, not one process-wide participant map,
+  // and broadcasts per room so only the rooms that actually changed pay for
+  // an update.
   const sweepIntervalId = setInterval(() => {
-    const changed = sweepStaleParticipants(participants, participant => participant.socketIds.some(id => io.sockets.sockets.has(id)))
-    if (changed)
-      broadcastStateUpdate(io)
+    for (const room of listRooms()) {
+      const changed = sweepStaleParticipants(room.participants, participant => participant.socketIds.some(id => io.sockets.sockets.has(id)))
+      if (changed)
+        broadcastStateUpdate(io, room)
+    }
   }, options.sweepIntervalMs ?? HEARTBEAT_INTERVAL_MS)
   // Cleared when the http server closes (see `server.test.ts`'s `afterEach`)
-  // so tests don't leak a running interval across runs.
-  httpServer.on('close', () => clearInterval(sweepIntervalId))
+  // so tests don't leak a running interval across runs. The boot session is
+  // torn down at the same time (plan 032a): a closed server isn't serving
+  // its room any more, and leaving the entry in `rooms` would make a later
+  // `createSession` under the same code fail as a "duplicate" against a
+  // session nothing can reach. No `broadcastHomeUpdate` here, unlike the
+  // returned `destroySession` below — a server that's closing has no
+  // sockets left to tell, and emitting into a shutting-down `io` would be
+  // noise at best.
+  httpServer.on('close', () => {
+    clearInterval(sweepIntervalId)
+    destroySession(defaultRoomCode)
+  })
 
-  return { httpServer, io }
+  return {
+    httpServer,
+    io,
+    bootSession,
+    createSession: (sessionOptions: CreateSessionOptions = {}) => {
+      const created = createSession({ deckUrl, ...sessionOptions })
+      broadcastHomeUpdate(io)
+      return created
+    },
+    destroySession: (roomCode: string) => {
+      const destroyed = destroySession(roomCode)
+      if (destroyed)
+        broadcastHomeUpdate(io)
+      return destroyed
+    },
+  }
 }

@@ -39,8 +39,19 @@ function constantTimeEquals(expected: string, actual: string): boolean {
  * A missing/undefined/empty supplied code is always invalid, even against an
  * (accidentally) empty configured code — an unset code must never be
  * satisfied by "nothing supplied" behaving like a wildcard.
+ *
+ * Exported (plan 032d) as **the** shared-secret comparison primitive for this
+ * package, rather than staying private to the two checks below. `adminAuth.ts`
+ * needs exactly this behavior — constant-time compare, fail-closed on an
+ * unconfigured expected value — for the cross-room admin code, and a second
+ * hand-rolled copy of it is precisely the kind of drift that turns one
+ * reviewed comparison into two, only one of which stays timing-safe after the
+ * next edit. The admin code lives in its own module (not as a third field on
+ * `WorkshopAuthConfig`) because it is deliberately *not* per-room state — see
+ * `adminAuth.ts`'s own doc comment — but the comparison itself is the same
+ * comparison, so it is shared rather than reimplemented.
  */
-function isValidCode(configured: string, supplied: string | undefined): boolean {
+export function isValidCode(configured: string, supplied: string | undefined): boolean {
   if (!configured || !supplied)
     return false
   return constantTimeEquals(configured, supplied)

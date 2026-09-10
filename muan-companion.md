@@ -50,19 +50,26 @@ the same code path the local quick start already uses.
 
 ### `muan-companion-server` (runtime env vars)
 
-| Variable                               | What it does                                                                                                                                                                                                                                | Default                                        | Required?                                                                                                                                                                                                                                  |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `PORT`                                 | TCP port the HTTP + Socket.io server listens on.                                                                                                                                                                                            | `3710`                                         | No                                                                                                                                                                                                                                         |
-| `SLIDEV_MUAN_COMPANION_ROOM_CODE`      | Low-privilege shared secret participants supply to `participant:join`.                                                                                                                                                                      | Auto-generated fresh on every startup if unset | No — an explicit value only matters if you want the _same_ code across restarts (e.g. a recurring demo); the server is fully functional with none set.                                                                                     |
-| `SLIDEV_MUAN_COMPANION_PRESENTER_CODE` | High-privilege secret required for every `presenter:*` event and to open `/dashboard`. Never derivable from the room code.                                                                                                                  | Auto-generated fresh on every startup if unset | No — same as the room code above.                                                                                                                                                                                                          |
-| `SLIDEV_MUAN_COMPANION_ORIGIN`         | CORS origin allowed to connect (the deck's origin, since it's cross-origin to this server — see §6).                                                                                                                                        | `*`                                            | No, but set it explicitly in production (see §6).                                                                                                                                                                                          |
-| `SLIDEV_MUAN_COMPANION_DECK_URL`       | Base URL of the participant-facing Slidev deck — a _different_ process/port than this server. Used only to build the shareable join link (`${SLIDEV_MUAN_COMPANION_DECK_URL}?roomCode=${roomCode}`) and the QR code shown on the dashboard. | `http://localhost:3030`                        | No for a local trial (the default matches Slidev's own default dev port); **yes, set it** in production — otherwise the dashboard's join link/QR point at `localhost:3030`, which is meaningless to anyone but the operator's own machine. |
+| Variable                               | What it does                                                                                                                                                                                                                                                                       | Default                                        | Required?                                                                                                                                                                                                                                  |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PORT`                                 | TCP port the HTTP + Socket.io server listens on.                                                                                                                                                                                                                                   | `3710`                                         | No                                                                                                                                                                                                                                         |
+| `SLIDEV_MUAN_COMPANION_ROOM_CODE`      | Low-privilege shared secret participants supply to `participant:join`.                                                                                                                                                                                                             | Auto-generated fresh on every startup if unset | No — an explicit value only matters if you want the _same_ code across restarts (e.g. a recurring demo); the server is fully functional with none set.                                                                                     |
+| `SLIDEV_MUAN_COMPANION_PRESENTER_CODE` | High-privilege secret required for every `presenter:*` event and to open `/dashboard`. Never derivable from the room code.                                                                                                                                                         | Auto-generated fresh on every startup if unset | No — same as the room code above.                                                                                                                                                                                                          |
+| `SLIDEV_MUAN_COMPANION_ADMIN_CODE`     | High-privilege **cross-room** secret, separate from both codes above. Required to mint a one-time connect key (`POST /api/connect-key`) for registering an already-running deck. At least as privileged as a presenter code — one connect key is enough to create a whole session. | Auto-generated fresh on every startup if unset | No — same as the two codes above; the startup log prints it, and the whole cross-room surface is closed rather than open when none is set.                                                                                                 |
+| `SLIDEV_MUAN_COMPANION_ORIGIN`         | CORS origin allowed to connect (the deck's origin, since it's cross-origin to this server — see §6).                                                                                                                                                                               | `*`                                            | No, but set it explicitly in production (see §6).                                                                                                                                                                                          |
+| `SLIDEV_MUAN_COMPANION_DECK_URL`       | Base URL of the participant-facing Slidev deck — a _different_ process/port than this server. Used only to build the shareable join link (`${SLIDEV_MUAN_COMPANION_DECK_URL}?roomCode=${roomCode}`) and the QR code shown on the dashboard.                                        | `http://localhost:3030`                        | No for a local trial (the default matches Slidev's own default dev port); **yes, set it** in production — otherwise the dashboard's join link/QR point at `localhost:3030`, which is meaningless to anyone but the operator's own machine. |
 
 ### The deck (build-time env var)
 
-| Variable                                | What it does                                                                                                                                                                                                                              | Default                 | Required?                                                                                                                       |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `VITE_SLIDEV_MUAN_COMPANION_SERVER_URL` | Base URL of the sync server that the deck's addon JS connects to, for both the Socket.io connection and the `POST /api/screenshot` error-report upload. Read once at build/dev-server start (Vite env var), baked into the deck's bundle. | `http://localhost:3710` | No for local dev; **yes, set it** for any deployment where the deck isn't served from the same machine/port as the sync server. |
+| Variable                                 | What it does                                                                                                                                                                                                                                                                           | Default                 | Required?                                                                                                                       |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `VITE_SLIDEV_MUAN_COMPANION_SERVER_URL`  | Base URL of the sync server that the deck's addon JS connects to, for both the Socket.io connection and the `POST /api/screenshot` error-report upload. Read once at build/dev-server start (Vite env var), baked into the deck's bundle.                                              | `http://localhost:3710` | No for local dev; **yes, set it** for any deployment where the deck isn't served from the same machine/port as the sync server. |
+| `VITE_SLIDEV_MUAN_COMPANION_CONNECT_KEY` | One-time key that makes this deck register _itself_ with the sync server on load, creating a fresh session for it (see §3). Mint one with `POST /api/connect-key`. Single-use, expires 5 minutes after minting. Unset means no registration attempt is made at all — a complete no-op. | _unset_                 | No. Only set it to connect a deck you started yourself to a server that didn't launch it.                                       |
+
+Because it's a `VITE_` variable, `VITE_SLIDEV_MUAN_COMPANION_CONNECT_KEY` is
+baked into the built bundle like the server URL beside it. That's tolerable
+only because a connect key dies on first use and expires in five minutes — but
+don't publish a deck built with one set; treat it as spent, not as harmless.
 
 ## 3. Local quick start
 
@@ -88,6 +95,46 @@ pnpm dev
 This is fine for rehearsing locally but isn't a deployment — both processes
 die when you close the terminals, and nobody outside your machine's network
 can reach either one.
+
+### Connecting a deck you started yourself
+
+The quick start above pairs one deck with one server via env vars on both
+sides. There's a second way in: a deck you started your own way can register
+_itself_ with a running server using a one-time connect key, creating a fresh
+session for it without the server having launched anything.
+
+```bash
+# 1. Mint a key. The admin code comes from the server's startup log, or from
+#    SLIDEV_MUAN_COMPANION_ADMIN_CODE if you pinned one (see §2).
+curl -X POST \
+  -H 'x-muan-companion-admin-code: <admin-code>' \
+  http://localhost:3710/api/connect-key
+# => {"key":"ABCD2345EFGH","expiresAt":1700000300000}
+
+# 2. Start your deck with that key. It registers itself on load.
+VITE_SLIDEV_MUAN_COMPANION_SERVER_URL=http://localhost:3710 \
+  VITE_SLIDEV_MUAN_COMPANION_CONNECT_KEY=ABCD2345EFGH \
+  pnpm dev
+```
+
+The deck has no UI for this, so **the result is printed to the deck's browser
+console** (prefixed `[muan-companion]`): the room code to hand out, the
+presenter URL, and the participant join link. Open the browser devtools on the
+deck to read them. The presenter URL carries the presenter code — don't project
+that window.
+
+Notes:
+
+- The key is **single-use and expires 5 minutes after minting**. Mint a fresh
+  one per deck; a reused or expired one simply fails.
+- Every registration failure returns the same opaque error on purpose, so the
+  endpoint can't be used to test whether a guessed key is real. The deck's own
+  console message is where you diagnose it — it echoes back the deck URL it
+  sent and the HTTP status.
+- Repeated failed attempts from one source address are rate-limited (5 failures
+  per minute, then a one-minute lockout).
+- Leave `VITE_SLIDEV_MUAN_COMPANION_CONNECT_KEY` unset and none of this
+  happens — no request, no log, no change in behavior.
 
 ## 4. Production build
 
@@ -317,6 +364,23 @@ restart between workshops — see §8.
   env vars explicitly if you specifically want the _same_ codes to survive
   a restart (e.g. a recurring demo) — there's still no in-app
   regenerate-_while running_-without-a-restart feature.
+- **The admin code is the most powerful of the three.**
+  `SLIDEV_MUAN_COMPANION_ADMIN_CODE` isn't scoped to one workshop the way the
+  other two are — it mints connect keys, and each connect key creates a whole
+  session. Treat it as strictly more sensitive than a presenter code, never
+  put it in a URL you might share, and prefer the
+  `x-muan-companion-admin-code` header over `?code=` so it stays out of access
+  logs and browser history. Leaving it unset (the default) is fine: a fresh one
+  is generated per start and printed to the startup log.
+- **`/api/register` and the connect-key bootstrap have not had a dedicated
+  security review yet.** This is the one endpoint in this package reachable
+  with a credential that didn't require already holding another credential —
+  it sits in front of session creation, so no session-level auth can stop a
+  caller earlier. It ships with a short TTL, single-use keys, uniform opaque
+  errors, strict `deckUrl` validation, and per-source rate limiting, but plan
+  032's own §Security notes call for a review pass over this surface (item
+  032e) before it's relied on in a hostile environment. Until that happens,
+  don't expose this server's HTTP port to an untrusted network.
 - A server restart with different env vars invalidates every URL built
   from the old codes — see §9's 401 entry.
 

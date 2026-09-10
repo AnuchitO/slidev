@@ -9,8 +9,9 @@ import { tmpdir } from 'node:os'
 import { join as joinPath } from 'pathe'
 import { io as ioClient } from 'socket.io-client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { buildHomeUpdate, createMuanCompanionServer, DEFAULT_DECK_URL } from './server'
-import { MAX_TEXT_LENGTH, removeParticipant, resetSessionStateForTests } from './session'
+import { CONNECT_KEY_TTL_MS, MAX_FAILED_ATTEMPTS, resetConnectKeyStateForTests } from './connectKey'
+import { buildHomeUpdate, buildJoinUrl, buildPresenterUrl, createMuanCompanionServer, DEFAULT_DECK_URL, HOME_DASHBOARD_ROOM } from './server'
+import { getRoom, MAX_TEXT_LENGTH, removeParticipant, resetSessionStateForTests } from './session'
 
 // `DashboardJoinAck` (M4's two codes, plus the join-link/QR fields added for
 // the shareable-join-link feature) is imported from `server.ts` itself now
@@ -2829,6 +2830,438 @@ describe('createMuanCompanionServer', () => {
         const { room: inherited } = server.createSession()
 
         expect(inherited.deckUrl).toBe(DEFAULT_DECK_URL)
+      })
+    })
+  })
+
+  // Plan 032d — Flow B: a deck someone is already running registers *itself*
+  // into this server using a one-time, server-minted connect key. Both routes
+  // are exercised over plain `fetch`, deliberately: they must be independently
+  // usable with `curl` alone, with no `/home` dashboard UI wired to them (032b
+  // is a separate, parallel workstream).
+  //
+  // This block stands up its own server (the pattern the join-link tests above
+  // established) because the shared one from the outer `beforeEach` has no
+  // admin code configured — which is itself the fail-closed default, asserted
+  // as its own case below.
+  describe('connect-key registration (032d)', () => {
+    const TEST_ADMIN_CODE = 'admin-secret'
+    const DECK = 'http://registered-deck.test:3030'
+
+    beforeEach(async () => {
+      resetConnectKeyStateForTests()
+      await stopServer()
+      resetSessionStateForTests()
+      await startServer({
+        roomCode: TEST_ROOM_CODE,
+        presenterCode: TEST_PRESENTER_CODE,
+        adminCode: TEST_ADMIN_CODE,
+      })
+    })
+
+    async function mintKey(): Promise<string> {
+      const response = await fetch(`${url}/api/connect-key`, {
+        method: 'POST',
+        headers: { 'x-muan-companion-admin-code': TEST_ADMIN_CODE },
+      })
+      expect(response.status).toBe(201)
+      return (await response.json() as { key: string }).key
+    }
+
+    function register(body: unknown) {
+      return fetch(`${url}/api/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: typeof body === 'string' ? body : JSON.stringify(body),
+      })
+    }
+
+    // A local copy of the multi-room block's own `connectClientInRoom` — that
+    // one is scoped to its describe, and a registered session is only
+    // reachable by naming its room in the handshake query
+    // (`ROOM_CODE_QUERY_PARAM`), which is exactly the point of the isolation
+    // test below.
+    function connectInRoom(roomCode: string): Promise<ClientSocket> {
+      const socket = ioClient(url, { forceNew: true, transports: ['websocket'], query: { roomCode } })
+      clients.push(socket)
+      return new Promise((resolve, reject) => {
+        socket.once('connect', () => resolve(socket))
+        socket.once('connect_error', reject)
+      })
+    }
+
+    describe('post /api/connect-key (admin-gated)', () => {
+      it('mints a key with an expiry for a caller holding the admin code', async () => {
+        const before = Date.now()
+        const response = await fetch(`${url}/api/connect-key`, {
+          method: 'POST',
+          headers: { 'x-muan-companion-admin-code': TEST_ADMIN_CODE },
+        })
+
+        expect(response.status).toBe(201)
+        const body = await response.json() as { key: string, expiresAt: number }
+        expect(body.key).toMatch(/^[A-HJKMNP-Z2-9]{12}$/)
+        expect(body.expiresAt).toBeGreaterThanOrEqual(before + CONNECT_KEY_TTL_MS)
+      })
+
+      // The curl-friendly fallback carrier — see `ADMIN_CODE_HEADER`'s doc
+      // comment for why both are accepted and why the header is preferred.
+      it('also accepts the admin code as a ?code= query param', async () => {
+        const response = await fetch(`${url}/api/connect-key?code=${TEST_ADMIN_CODE}`, { method: 'POST' })
+
+        expect(response.status).toBe(201)
+      })
+
+      it('rejects a caller with no admin code at all', async () => {
+        const response = await fetch(`${url}/api/connect-key`, { method: 'POST' })
+
+        expect(response.status).toBe(401)
+        expect(await response.json()).toEqual({ error: 'not authorized' })
+      })
+
+      it('rejects a wrong admin code with the identical body as a missing one', async () => {
+        const wrong = await fetch(`${url}/api/connect-key`, {
+          method: 'POST',
+          headers: { 'x-muan-companion-admin-code': 'guess' },
+        })
+        const missing = await fetch(`${url}/api/connect-key`, { method: 'POST' })
+
+        expect(wrong.status).toBe(missing.status)
+        expect(await wrong.text()).toBe(await missing.text())
+      })
+
+      // The presenter code is *not* the admin code. A cross-room action must
+      // not be reachable with a single room's credential — 032a's
+      // `HOME_DASHBOARD_ROOM` comment states this requirement directly.
+      it('does not accept a room or presenter code in place of the admin code', async () => {
+        for (const code of [TEST_PRESENTER_CODE, TEST_ROOM_CODE]) {
+          const response = await fetch(`${url}/api/connect-key`, {
+            method: 'POST',
+            headers: { 'x-muan-companion-admin-code': code },
+          })
+          expect(response.status).toBe(401)
+        }
+      })
+
+      // Fail closed, never open, when no admin code is configured — the same
+      // posture `auth.ts` takes for an unset room/presenter code.
+      it('is unreachable on a server with no admin code configured', async () => {
+        await stopServer()
+        resetSessionStateForTests()
+        await startServer({ roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE })
+
+        const empty = await fetch(`${url}/api/connect-key`, {
+          method: 'POST',
+          headers: { 'x-muan-companion-admin-code': '' },
+        })
+        const anything = await fetch(`${url}/api/connect-key?code=anything`, { method: 'POST' })
+
+        expect(empty.status).toBe(401)
+        expect(anything.status).toBe(401)
+      })
+
+      // An unauthorized caller must never reach `mintConnectKey` — a key
+      // minted and then discarded would still be redeemable. Verified by the
+      // fact that a rejected mint leaves nothing behind that a later
+      // registration could use.
+      it('mints nothing when the admin gate rejects', async () => {
+        await fetch(`${url}/api/connect-key`, { method: 'POST' })
+        const key = await mintKey()
+
+        // The one key that exists is the one the *authorized* call returned;
+        // registering with it succeeds exactly once, so no second key was
+        // silently minted by the rejected call.
+        expect((await register({ connectKey: key, deckUrl: DECK })).status).toBe(201)
+        expect((await register({ connectKey: key, deckUrl: DECK })).status).toBe(400)
+      })
+
+      it('falls through to 404 for a GET (this route is POST-only)', async () => {
+        const response = await fetch(`${url}/api/connect-key?code=${TEST_ADMIN_CODE}`)
+
+        expect(response.status).toBe(404)
+      })
+    })
+
+    describe('post /api/register (connect-key gated)', () => {
+      it('creates a real, isolated session and returns its codes and URLs', async () => {
+        const key = await mintKey()
+
+        const response = await register({ connectKey: key, deckUrl: DECK })
+
+        expect(response.status).toBe(201)
+        const body = await response.json() as {
+          roomCode: string
+          presenterCode: string
+          presenterUrl: string
+          participantUrl: string
+        }
+
+        // A genuinely new session, not the boot one re-labelled.
+        expect(body.roomCode).not.toBe(TEST_ROOM_CODE)
+        expect(body.presenterCode).not.toBe(TEST_PRESENTER_CODE)
+        // Codes it generated for itself, at the same lengths every other
+        // session gets — the caller never got to choose them.
+        expect(body.roomCode).toMatch(/^[A-HJKMNP-Z2-9]{8}$/)
+        expect(body.presenterCode).toMatch(/^[A-HJKMNP-Z2-9]{10}$/)
+        // Exactly the shapes `buildJoinUrl`/`buildPresenterUrl` produce — the
+        // same helpers every other surface in this package uses.
+        expect(body.participantUrl).toBe(buildJoinUrl(DECK, body.roomCode))
+        expect(body.presenterUrl).toBe(buildPresenterUrl(DECK, body.presenterCode))
+        expect(body.presenterUrl).toBe(`${DECK}/presenter/1?code=${encodeURIComponent(body.presenterCode)}`)
+      })
+
+      it('registers the session in rooms with the supplied deck URL, isolated from the boot session', async () => {
+        const key = await mintKey()
+        const body = await (await register({ connectKey: key, deckUrl: DECK })).json() as { roomCode: string }
+
+        const registered = getRoom(body.roomCode)!
+        expect(registered.deckUrl).toBe(DECK)
+        expect(registered.participants.size).toBe(0)
+        // The boot session is untouched — a registration adds a room, it never
+        // mutates an existing one.
+        expect(getRoom(TEST_ROOM_CODE)!.deckUrl).toBe(DEFAULT_DECK_URL)
+      })
+
+      // The one seam 032a built for this: a session created over HTTP must be
+      // visible to a home view exactly like one created through the server's
+      // own `createSession`, without this handler arranging it.
+      it('makes the new session appear in the home feed', async () => {
+        const key = await mintKey()
+        const body = await (await register({ connectKey: key, deckUrl: DECK })).json() as { roomCode: string }
+
+        const summary = buildHomeUpdate().sessions.find(s => s.roomCode === body.roomCode)
+        expect(summary).toBeDefined()
+        expect(summary!.deckUrl).toBe(DECK)
+      })
+
+      // The other half of that seam: not just that `buildHomeUpdate` would
+      // *report* the session, but that registering actually pushes a
+      // `home:update` on the wire, so an already-open home view sees the deck
+      // appear live (proposal Flow B step 4) rather than only on its next
+      // reload.
+      //
+      // 032b owns the `dashboard:home` *join handler* and its gate (see
+      // `HOME_DASHBOARD_ROOM`'s own comment on why that's deliberately its
+      // decision, not 032a's or this one's), so nothing joins that room yet.
+      // This test therefore joins it server-side by hand — standing in for
+      // whatever credential check 032b lands — which is what makes the
+      // broadcast observable today without pre-empting that decision.
+      it('pushes home:update to a subscribed home socket when a deck registers', async () => {
+        const home = await connectClient()
+        server.io.sockets.sockets.get(home.id!)!.join(HOME_DASHBOARD_ROOM)
+        const update = waitFor<{ sessions: { roomCode: string, deckUrl: string }[] }>(home, 'home:update')
+        const key = await mintKey()
+
+        const response = await register({ connectKey: key, deckUrl: DECK })
+        expect(response.status).toBe(201)
+        const { roomCode } = await response.json() as { roomCode: string }
+
+        const payload = await update
+        expect(payload.sessions.find(s => s.roomCode === roomCode)?.deckUrl).toBe(DECK)
+      })
+
+      it('the registered session actually works — a participant can join it with its own codes', async () => {
+        const key = await mintKey()
+        const body = await (await register({ connectKey: key, deckUrl: DECK })).json() as {
+          roomCode: string
+          presenterCode: string
+        }
+
+        const client = await connectInRoom(body.roomCode)
+        const ack = await emitWithAck<{ participantId?: string, error?: string }>(
+          client,
+          'participant:join',
+          { name: 'Ada', roomCode: body.roomCode },
+        )
+
+        expect(ack.participantId).toBeTruthy()
+        // And the *boot* session's room code is worthless against it — real
+        // isolation, not a shared namespace.
+        const wrongCode = await connectInRoom(body.roomCode)
+        const rejected = await emitWithAck<{ error?: string }>(
+          wrongCode,
+          'participant:join',
+          { name: 'Eve', roomCode: TEST_ROOM_CODE },
+        )
+        expect(rejected.error).toBeTruthy()
+      })
+
+      it('refuses a key that has already been redeemed, without creating a second session', async () => {
+        const key = await mintKey()
+        const first = await register({ connectKey: key, deckUrl: DECK })
+        expect(first.status).toBe(201)
+        const roomsAfterFirst = buildHomeUpdate().sessions.length
+
+        const second = await register({ connectKey: key, deckUrl: DECK })
+
+        expect(second.status).toBe(400)
+        expect(await second.json()).toEqual({ error: 'registration failed' })
+        expect(buildHomeUpdate().sessions).toHaveLength(roomsAfterFirst)
+      })
+
+      it('refuses a key that was never minted', async () => {
+        const response = await register({ connectKey: 'NEVERMINTED9', deckUrl: DECK })
+
+        expect(response.status).toBe(400)
+        expect(await response.json()).toEqual({ error: 'registration failed' })
+      })
+
+      it('refuses a missing or non-string connectKey', async () => {
+        for (const body of [{ deckUrl: DECK }, { connectKey: 42, deckUrl: DECK }, { connectKey: null, deckUrl: DECK }]) {
+          const response = await register(body)
+          expect(response.status).toBe(400)
+        }
+      })
+
+      // "Reveal nothing extra" (see `REGISTRATION_FAILED_BODY`): a caller must
+      // not be able to tell a valid-key-bad-URL failure from a bad-key
+      // failure, or either from a malformed body — otherwise the endpoint is a
+      // key oracle.
+      it('returns byte-identical failures for a bad key, a bad deck URL, and a malformed body', async () => {
+        const key = await mintKey()
+        const badUrl = await register({ connectKey: key, deckUrl: 'not a url' })
+        const badKey = await register({ connectKey: 'NEVERMINTED9', deckUrl: DECK })
+        const malformed = await register('{ not json')
+
+        expect(badUrl.status).toBe(400)
+        expect(badKey.status).toBe(400)
+        expect(malformed.status).toBe(400)
+        const bodies = [await badUrl.text(), await badKey.text(), await malformed.text()]
+        expect(new Set(bodies).size).toBe(1)
+      })
+
+      // Operator ergonomics, and the reason `deckUrl` is validated before the
+      // key is consumed: a typo'd URL must not silently burn a good key.
+      it('does not burn the key when the deck URL is rejected', async () => {
+        const key = await mintKey()
+        expect((await register({ connectKey: key, deckUrl: 'not a url' })).status).toBe(400)
+
+        expect((await register({ connectKey: key, deckUrl: DECK })).status).toBe(201)
+      })
+
+      it('rejects deck URLs that are not well-formed absolute http(s) URLs', async () => {
+        const rejected = [
+          'not a url',
+          '/relative/path',
+          'localhost:3030',
+          // Schemes that would be a genuine attack once rendered as a link or
+          // encoded into a projected QR code — an allowlist, not a denylist.
+          'javascript:alert(1)',
+          'data:text/html,<script>alert(1)</script>',
+          'file:///etc/passwd',
+          // Embedded credentials — the classic look-alike-link trick.
+          'http://evil@trusted.example',
+          // A fragment would land *before* `?roomCode=`, silently producing a
+          // join link whose query the deck never sees.
+          'http://deck.test:3030#/1',
+          '',
+        ]
+
+        for (const deckUrl of rejected) {
+          // Reset between cases: this list is longer than `MAX_FAILED_ATTEMPTS`
+          // and every entry is a genuine failure, so without this the rate
+          // limiter (correctly) locks this source out partway through and the
+          // remaining URLs would be "rejected" for the wrong reason. Resetting
+          // keeps each assertion about `normalizeDeckUrl` alone.
+          resetConnectKeyStateForTests()
+          const key = await mintKey()
+          const response = await register({ connectKey: key, deckUrl })
+          expect(response.status, `expected ${JSON.stringify(deckUrl)} to be rejected`).toBe(400)
+        }
+      })
+
+      it('rejects an absurdly long deck URL rather than storing it', async () => {
+        const key = await mintKey()
+        const response = await register({ connectKey: key, deckUrl: `http://deck.test/${'a'.repeat(4000)}` })
+
+        expect(response.status).toBe(400)
+      })
+
+      it('rejects a body larger than the read cap', async () => {
+        const key = await mintKey()
+        const response = await register({ connectKey: key, deckUrl: DECK, padding: 'x'.repeat(8192) })
+
+        expect(response.status).toBe(400)
+      })
+
+      it('rejects a JSON body that is not an object', async () => {
+        for (const raw of ['null', '[]', '"a string"', '42']) {
+          const response = await register(raw)
+          expect(response.status).toBe(400)
+        }
+      })
+
+      // Normalization (see `normalizeDeckUrl`): every session's links come out
+      // in the same shape no matter how the operator typed the URL, so
+      // `buildJoinUrl`'s bare concatenation never produces `host/?roomCode=`.
+      it('normalizes a trailing slash off the deck URL before storing it', async () => {
+        const key = await mintKey()
+        const body = await (await register({ connectKey: key, deckUrl: `${DECK}/` })).json() as {
+          roomCode: string
+          participantUrl: string
+        }
+
+        expect(getRoom(body.roomCode)!.deckUrl).toBe(DECK)
+        expect(body.participantUrl).toBe(`${DECK}?roomCode=${encodeURIComponent(body.roomCode)}`)
+      })
+
+      it('accepts an https deck URL with a path and query intact', async () => {
+        const key = await mintKey()
+        const deckUrl = 'https://decks.example/workshop?theme=dark'
+        const body = await (await register({ connectKey: key, deckUrl })).json() as { roomCode: string }
+
+        expect(getRoom(body.roomCode)!.deckUrl).toBe(deckUrl)
+      })
+
+      it('falls through to 404 for a GET (this route is POST-only)', async () => {
+        const response = await fetch(`${url}/api/register`)
+
+        expect(response.status).toBe(404)
+      })
+    })
+
+    describe('rate limiting (032d — the new credential-free-ish surface)', () => {
+      it('locks a source out after repeated failed attempts, then refuses even a valid key', async () => {
+        const key = await mintKey()
+
+        for (let i = 0; i < MAX_FAILED_ATTEMPTS; i++) {
+          const response = await register({ connectKey: 'WRONGKEY1234', deckUrl: DECK })
+          expect(response.status).toBe(400)
+        }
+
+        const locked = await register({ connectKey: key, deckUrl: DECK })
+
+        expect(locked.status).toBe(429)
+        expect(await locked.json()).toEqual({ error: 'too many attempts, try again shortly' })
+        // A locked-out request does no work at all — the valid key it carried
+        // was not consumed, and no session was created.
+        expect(buildHomeUpdate().sessions).toHaveLength(1)
+      })
+
+      it('counts malformed bodies toward the lockout, not only bad keys', async () => {
+        for (let i = 0; i < MAX_FAILED_ATTEMPTS; i++)
+          expect((await register('{ not json')).status).toBe(400)
+
+        expect((await register({ connectKey: await mintKey(), deckUrl: DECK })).status).toBe(429)
+      })
+
+      it('does not lock out a source that stays under the threshold', async () => {
+        for (let i = 0; i < MAX_FAILED_ATTEMPTS - 1; i++)
+          expect((await register({ connectKey: 'WRONGKEY1234', deckUrl: DECK })).status).toBe(400)
+
+        expect((await register({ connectKey: await mintKey(), deckUrl: DECK })).status).toBe(201)
+      })
+
+      it('clears a source failure history on a successful registration', async () => {
+        for (let i = 0; i < MAX_FAILED_ATTEMPTS - 1; i++)
+          await register({ connectKey: 'WRONGKEY1234', deckUrl: DECK })
+        expect((await register({ connectKey: await mintKey(), deckUrl: DECK })).status).toBe(201)
+
+        // Fresh budget: the pre-success failures no longer count, so another
+        // near-threshold run still doesn't lock this source out.
+        for (let i = 0; i < MAX_FAILED_ATTEMPTS - 1; i++)
+          expect((await register({ connectKey: 'WRONGKEY1234', deckUrl: DECK })).status).toBe(400)
+        expect((await register({ connectKey: await mintKey(), deckUrl: DECK })).status).toBe(201)
       })
     })
   })

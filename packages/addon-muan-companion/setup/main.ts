@@ -1,6 +1,7 @@
 import { defineAppSetup } from '@slidev/types'
 import { getWorkshopSocket } from '../src/client'
 import { getPresenterCodeFromUrl } from '../src/presenterCode'
+import { registerDeckIfConfigured } from '../src/register'
 
 // Matches the route path format `slidePath.ts` produces:
 // `presenter ? `/presenter/${no}` : `/${no}``. No other formats exist for
@@ -23,6 +24,21 @@ function isPresenterPath(path: string): boolean {
 // `inject()`. Only the `router` object passed as an argument is safe to use;
 // parse the route path directly instead.
 export default defineAppSetup(({ router }) => {
+  // Plan 032d (Flow B): if — and only if —
+  // `VITE_SLIDEV_MUAN_COMPANION_CONNECT_KEY` was set when this deck's dev
+  // server/build started, tell the companion server this deck exists and get
+  // a session for it. A complete no-op otherwise, which is why it can sit
+  // unconditionally at the top of app setup: every deployment that hasn't
+  // opted in behaves exactly as it did before this line existed.
+  //
+  // `void`, not `await`: app setup is synchronous, this is a one-shot side
+  // effect nothing below depends on, and `registerDeckIfConfigured` is
+  // documented never to reject — so there is nothing to sequence and nothing
+  // to catch. Deliberately *not* gated on the presenter route: the deck
+  // registering itself is a property of the process, and the operator's own
+  // window may well be a participant view while they check the console.
+  void registerDeckIfConfigured()
+
   const socket = getWorkshopSocket()
 
   // Guards against a participant's remote-driven navigation re-triggering

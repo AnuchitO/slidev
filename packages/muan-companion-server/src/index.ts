@@ -105,6 +105,11 @@ httpServer.listen(PORT, () => {
   // log can't drift from what's actually enforced.
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
   console.log(`[muan-companion-server] Admin code (server operator, all rooms): ${adminCode}${adminCodeFromEnv ? '' : ' (auto-generated — set SLIDEV_MUAN_COMPANION_ADMIN_CODE for a fixed one)'}`)
+  // Plan 032d: a copy-pasteable example for the deck-initiated registration
+  // flow, right under the code it needs — an operator who wants Flow B
+  // shouldn't have to go find the admin code above and hand-assemble this.
+  // eslint-disable-next-line no-console -- deliberate startup log, see above.
+  console.log(`[muan-companion-server] Mint a connect key: curl -X POST -H 'x-muan-companion-admin-code: ${adminCode}' http://localhost:${PORT}/api/connect-key`)
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
   console.log(`[muan-companion-server] Dashboard: http://localhost:${PORT}/dashboard?code=${presenterCode}`)
   // The cross-room home view (plan 032b): every live session, plus the

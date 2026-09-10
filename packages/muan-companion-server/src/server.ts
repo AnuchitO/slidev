@@ -16,6 +16,7 @@ import { isValidPresenterCode, isValidRoomCode } from './auth'
 import { generateCode } from './codeGeneration'
 import { HEARTBEAT_INTERVAL_MS, sweepStaleParticipants } from './presence'
 import { listPresentations } from './presentations'
+import { createRegistrationRoutes } from './registrationRoutes'
 import { createScreenshotUploadHandler } from './screenshotUpload'
 import {
   addErrorReport,
@@ -91,11 +92,11 @@ export interface CreateMuanCompanionServerOptions {
    */
   deckUrl?: string
   /**
-   * The **cross-room operator credential** (plan 032b) — see `adminAuth.ts`
-   * for why it exists as a third secret rather than a reuse of either
-   * per-room code. Gates `/home`, `home:join`, and `GET /api/presentations`
-   * today, and (per plan 032) the deck launcher and connect-key minting
-   * later.
+   * The **cross-room operator credential** (plan 032b, consumed by 032d's
+   * registration routes too) — see `adminAuth.ts` for why it exists as a
+   * third secret rather than a reuse of either per-room code. Gates `/home`,
+   * `home:join`, `GET /api/presentations`, and `POST /api/connect-key` today,
+   * and (per plan 032) the deck launcher later.
    *
    * `undefined` means **generate one**, exactly as `roomCode`/`presenterCode`
    * do at `createSession` (plan 031a's posture): a server started with no
@@ -156,6 +157,37 @@ export const DEFAULT_DECK_URL = 'http://localhost:3030'
  */
 export function buildJoinUrl(deckUrl: string, roomCode: string): string | undefined {
   return roomCode ? `${deckUrl}?roomCode=${encodeURIComponent(roomCode)}` : undefined
+}
+
+/**
+ * `buildJoinUrl`'s presenter-side twin (plan 032d): the URL the person running
+ * the deck opens to drive it, with the presenter credential already attached.
+ *
+ * Lives next to `buildJoinUrl` for the same reason that one exists — this is
+ * the single place the presenter URL's shape is decided, so the three things
+ * that have to agree on it can't drift: this function, `index.ts`'s startup
+ * log ("Append `?code=…` to your own `/presenter/N` deck URL"), and the addon's
+ * `getPresenterCodeFromUrl` (`addon-muan-companion/src/presenterCode.ts`),
+ * which reads back exactly the `code` param written here. `POST /api/register`
+ * is its first caller: a deck that registers itself has no operator watching a
+ * startup log, so the presenter URL has to be handed back in the response,
+ * fully formed.
+ *
+ * Slide 1 specifically, matching every other "here's where to start" affordance
+ * in this package: a freshly-registered session's `currentSlideIndex` is 1
+ * (see `createSession`), so any other number would open the presenter on a
+ * slide the session doesn't think it's on.
+ *
+ * Unlike `buildJoinUrl` this always returns a string, never `undefined`. The
+ * asymmetry is real, not an oversight: an empty room code makes a join *link*
+ * meaningless (it would silently send participants to the plain deck with
+ * nothing prefilled — see `buildJoinUrl`'s own comment), whereas a presenter
+ * URL with an empty code is still the correct URL to open; it simply won't
+ * authorize anything, which is the intended fail-closed outcome for a session
+ * with no presenter code rather than a link worth suppressing.
+ */
+export function buildPresenterUrl(deckUrl: string, presenterCode: string): string {
+  return `${deckUrl}/presenter/1?code=${encodeURIComponent(presenterCode)}`
 }
 
 export interface MuanCompanionServer {
@@ -966,6 +998,52 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
 
   app.use(createScreenshotUploadHandler(uploadsStagingDir, room => broadcastStateUpdate(io, room)))
 
+  /**
+   * Creates a session *and* tells every `dashboard:home` subscriber about it —
+   * the pairing `MuanCompanionServer.createSession` documents as its whole
+   * reason for existing ("so no caller can create a session the home view
+   * never hears about").
+   *
+   * Hoisted out of the returned object literal (where 032a defined it inline)
+   * because 032d added a second caller: `POST /api/register`'s handler, which
+   * is wired into the middleware chain *above* the return statement. Passing
+   * the same function to both is what keeps the invariant true for a session
+   * created over HTTP by a registering deck, not just for one created by an
+   * external caller holding the returned server object.
+   */
+  function createSessionAndBroadcast(sessionOptions: CreateSessionOptions = {}): CreateSessionResult {
+    const created = createSession({ deckUrl, ...sessionOptions })
+    broadcastHomeUpdate(io)
+    return created
+  }
+
+  // Plan 032d's connect-key routes (`POST /api/connect-key`, `POST
+  // /api/register`). Mounted after the screenshot handler and, like it, as a
+  // fall-through middleware rather than a path mount — see
+  // `createRegistrationRoutes`' own doc comment.
+  //
+  // Reconciled with 032b at merge time: this used to read `options.adminCode
+  // ?? ''` directly, on the reasoning that an unset admin code should leave
+  // the cross-room surface closed rather than silently generating a
+  // credential nothing ever prints. 032b landed first and settled that
+  // question the other way — `adminCode` (below, generated a few lines up
+  // when `options.adminCode` is absent) is already the one resolved value
+  // every other admin-gated surface on this server uses (`requireAdminCode`,
+  // `home:join`, `home:dashboardUrl`) precisely so a zero-config server is
+  // fully usable, same as the room/presenter codes, and `index.ts` prints it
+  // either way (see its own `adminCode` log line). Using the raw option here
+  // instead of the resolved variable would have meant `/api/connect-key`
+  // silently required a *different, always-empty* code than every other
+  // admin surface on the same running server — passing the resolved
+  // `adminCode` is what keeps there being exactly one admin credential per
+  // process, not a second one this route alone disagreed about.
+  app.use(createRegistrationRoutes({
+    adminCode,
+    createSession: createSessionAndBroadcast,
+    buildJoinUrl,
+    buildPresenterUrl,
+  }))
+
   function touchLastSeen(room: RoomState, participantId: string | undefined) {
     if (!participantId)
       return
@@ -1766,11 +1844,12 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     io,
     bootSession,
     adminCode,
-    createSession: (sessionOptions: CreateSessionOptions = {}) => {
-      const created = createSession({ deckUrl, ...sessionOptions })
-      broadcastHomeUpdate(io)
-      return created
-    },
+    // Hoisted to `createSessionAndBroadcast` above (plan 032d) so `POST
+    // /api/register`'s handler — wired into the middleware chain above this
+    // return statement — creates a session through the exact same
+    // create-and-broadcast pairing an external caller gets from the returned
+    // server object, rather than a second copy of this closure.
+    createSession: createSessionAndBroadcast,
     destroySession: (roomCode: string) => {
       const destroyed = destroySession(roomCode)
       if (destroyed)

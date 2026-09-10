@@ -1,6 +1,8 @@
 import type { Server as HttpServer, IncomingMessage, ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import type { Socket } from 'socket.io'
 import type { WorkshopAuthConfig } from './auth'
+import type { SpawnDeckProcess } from './deckLauncher'
 import type { CreateSessionOptions, CreateSessionResult, HelpRequestKind, ParticipantVisibility, RoomState, StepState } from './session'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
@@ -14,6 +16,7 @@ import { Server as SocketIOServer } from 'socket.io'
 import { isValidAdminCode } from './adminAuth'
 import { isValidPresenterCode, isValidRoomCode } from './auth'
 import { generateCode } from './codeGeneration'
+import { createDeckLaunchRoutes } from './deckLaunchRoutes'
 import { HEARTBEAT_INTERVAL_MS, sweepStaleParticipants } from './presence'
 import { listPresentations } from './presentations'
 import { createRegistrationRoutes } from './registrationRoutes'
@@ -125,6 +128,60 @@ export interface CreateMuanCompanionServerOptions {
    * it (see `Presentation`'s own doc comment).
    */
   presentationsDir?: string
+  /**
+   * The externally-reachable URL of **this** server (plan 032c —
+   * `SLIDEV_MUAN_COMPANION_PUBLIC_URL`). Two jobs, both Flow-A only:
+   *
+   * 1. It is injected into every spawned deck's environment as
+   *    `VITE_SLIDEV_MUAN_COMPANION_SERVER_URL`, which is how the deck's addon
+   *    finds its way back here with no change to `client.ts` at all. Vite
+   *    inlines `VITE_*` variables **into the browser bundle**, so this value
+   *    is resolved in the *participant's* browser, not in the child process —
+   *    which is exactly why it has to be the externally-reachable URL and not
+   *    something derived from the loopback interface.
+   * 2. Its scheme and hostname are the origin the spawned deck's own URL is
+   *    built from (the child's port replaces this server's) — see
+   *    `deckLaunchRoutes.ts`'s `deckUrlFor`.
+   *
+   * Unset defaults to `http://localhost:<the port this server is listening
+   * on>`, resolved lazily at launch time because the port is not known until
+   * `listen` has happened (and is ephemeral in every test). That default is
+   * correct only for an operator whose participants are on the same machine —
+   * which is precisely the same caveat, and the same deliberate choice, as
+   * `DEFAULT_DECK_URL` above: a zero-config server produces a well-formed link
+   * that works locally rather than refusing to start or emitting something
+   * obviously broken, and a real deployment sets the env var.
+   */
+  publicUrl?: string
+  /**
+   * Flow-A deck-launcher configuration and test seams (plan 032c). Grouped
+   * into one option rather than six top-level ones because they are only
+   * meaningful together, and because five of the six are inert on a server
+   * nobody ever clicks Present on.
+   *
+   * `spawn`, `allocatePort`, `readinessTimeoutMs` and `readinessPollIntervalMs`
+   * are test-only overrides in the same spirit as `sweepIntervalMs` above:
+   * they let `deckLaunch.test.ts` drive the real launcher, the real readiness
+   * probe and the real registry without a `slidev` installation, following
+   * this package's inject-a-function convention (`createSessionOptions.generate`,
+   * `mintConnectKeyOptions.now`) rather than module mocking.
+   */
+  deckLaunch?: {
+    /**
+     * Bind spawned decks to every interface (`--remote=`) instead of
+     * `localhost`. Off by default — see `buildSlidevArgs` for why this is an
+     * operator's decision to make knowingly.
+     */
+    remote?: boolean
+    /** Explicit path to the Slidev CLI — see `resolveSlidevBinary`. */
+    slidevBinary?: string
+    /** Concurrency cap; defaults to `MAX_CONCURRENT_SPAWNED_DECKS` (4). */
+    maxConcurrent?: number
+    readinessTimeoutMs?: number
+    readinessPollIntervalMs?: number
+    spawn?: SpawnDeckProcess
+    allocatePort?: () => Promise<number>
+  }
 }
 
 /**
@@ -135,6 +192,18 @@ export interface CreateMuanCompanionServerOptions {
  * same* literal rather than two copies of this string drifting apart.
  */
 export const DEFAULT_DECK_URL = 'http://localhost:3030'
+
+/**
+ * The port `index.ts` listens on when `PORT` is unset, and the port
+ * `resolvePublicUrl` assumes when it is asked for this server's own URL before
+ * `listen` has assigned one (only reachable in a test that launches a deck
+ * against an unlistened server — a real launch always comes in over HTTP, so
+ * the server is listening by definition).
+ *
+ * Exported for the same reason `DEFAULT_DECK_URL` is: `index.ts` needs the
+ * same literal, and two copies of a port number are two things that can drift.
+ */
+export const DEFAULT_SERVER_PORT = 3710
 
 /**
  * Builds the participant-facing "join this workshop" URL from the deck URL
@@ -1017,6 +1086,46 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     return created
   }
 
+  /**
+   * `createSessionAndBroadcast`'s symmetric half, hoisted out of the returned
+   * object literal for the same reason that one was (plan 032c): it now has a
+   * second and third caller inside this function — `POST /api/stop` and the
+   * crash handler that reaps a session whose spawned deck died — and all three
+   * must end a session the *same* way, or a session torn down by a crash would
+   * vanish from `rooms` while every open home view kept showing its row.
+   */
+  function destroySessionAndBroadcast(roomCode: string): boolean {
+    const destroyed = destroySession(roomCode)
+    if (destroyed)
+      broadcastHomeUpdate(io)
+    return destroyed
+  }
+
+  /**
+   * This server's own externally-reachable URL, for the two Flow-A purposes
+   * `CreateMuanCompanionServerOptions.publicUrl` documents.
+   *
+   * A function rather than a value computed at construction time, because the
+   * fallback needs `httpServer.address()` — which is `null` until `listen` has
+   * happened, and every test (and `index.ts` itself) constructs the server
+   * before listening. Resolved per launch, which is also what keeps the
+   * fallback honest on a server listening on an ephemeral port.
+   *
+   * The `Host` header is deliberately *not* consulted. It is client-controlled,
+   * and this value is baked into a spawned deck's client bundle where every
+   * participant will resolve it — letting a request decide where every
+   * participant's browser connects would be a genuine attack, not a
+   * convenience. Same reasoning `dashboardUrlFor` gives for staying
+   * root-relative.
+   */
+  function resolvePublicUrl(): string {
+    if (options.publicUrl)
+      return options.publicUrl
+    const address = httpServer.address()
+    const port = address !== null && typeof address !== 'string' ? (address as AddressInfo).port : DEFAULT_SERVER_PORT
+    return `http://localhost:${port}`
+  }
+
   // Plan 032d's connect-key routes (`POST /api/connect-key`, `POST
   // /api/register`). Mounted after the screenshot handler and, like it, as a
   // fall-through middleware rather than a path mount — see
@@ -1042,6 +1151,37 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     createSession: createSessionAndBroadcast,
     buildJoinUrl,
     buildPresenterUrl,
+  }))
+
+  // Plan 032c's Flow-A routes (`POST /api/launch`, `POST /api/stop`). Mounted
+  // as a fall-through middleware next to the registration routes above, and
+  // for the same reason — see `createDeckLaunchRoutes`' own doc comment for
+  // why these are flat paths with their subject in the body rather than
+  // `/api/presentations/:id/launch`, and in particular why living under the
+  // `/api/presentations` prefix (whose `requireAdminCode` mount only reads
+  // `?code=`) would give one route two contradictory answers to "how do I
+  // authenticate".
+  //
+  // Every dependency is injected rather than imported by the routes module,
+  // matching `createRegistrationRoutes`: session creation and destruction both
+  // go through this file's broadcast-pairing wrappers, so a launched session
+  // and a crashed one are indistinguishable from any other as far as the home
+  // view is concerned.
+  app.use(createDeckLaunchRoutes({
+    adminCode,
+    presentationsDir: options.presentationsDir,
+    publicUrl: resolvePublicUrl,
+    createSession: createSessionAndBroadcast,
+    destroySession: destroySessionAndBroadcast,
+    buildJoinUrl,
+    buildPresenterUrl,
+    remote: options.deckLaunch?.remote,
+    slidevBinary: options.deckLaunch?.slidevBinary,
+    maxConcurrent: options.deckLaunch?.maxConcurrent,
+    readinessTimeoutMs: options.deckLaunch?.readinessTimeoutMs,
+    readinessPollIntervalMs: options.deckLaunch?.readinessPollIntervalMs,
+    spawn: options.deckLaunch?.spawn,
+    allocatePort: options.deckLaunch?.allocatePort,
   }))
 
   function touchLastSeen(room: RoomState, participantId: string | undefined) {
@@ -1850,11 +1990,11 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     // create-and-broadcast pairing an external caller gets from the returned
     // server object, rather than a second copy of this closure.
     createSession: createSessionAndBroadcast,
-    destroySession: (roomCode: string) => {
-      const destroyed = destroySession(roomCode)
-      if (destroyed)
-        broadcastHomeUpdate(io)
-      return destroyed
-    },
+    // Hoisted to `destroySessionAndBroadcast` above (plan 032c) so the stop
+    // route and the spawned-deck crash handler — both wired into the
+    // middleware chain above this return statement — end a session through
+    // exactly the same destroy-and-broadcast pairing an external caller gets
+    // from the returned server object.
+    destroySession: destroySessionAndBroadcast,
   }
 }

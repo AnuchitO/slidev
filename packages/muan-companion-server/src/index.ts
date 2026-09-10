@@ -1,5 +1,7 @@
 import process from 'node:process'
+import { generateCode } from './codeGeneration'
 import { buildJoinUrl, createMuanCompanionServer, DEFAULT_DECK_URL } from './server'
+import { PRESENTER_CODE_LENGTH } from './session'
 
 const PORT = Number(process.env.PORT ?? 3710)
 
@@ -34,10 +36,31 @@ const presenterCodeFromEnv = process.env.SLIDEV_MUAN_COMPANION_PRESENTER_CODE
 // own doc comment in `server.ts` for why the literal lives there, not here.
 const deckUrl = process.env.SLIDEV_MUAN_COMPANION_DECK_URL ?? DEFAULT_DECK_URL
 
+// Plan 032d: the process-wide **cross-room** credential (`adminAuth.ts`) —
+// what `POST /api/connect-key` requires, and what 032b/032c will require for
+// the home view and the deck launcher. Same env-var-wins-else-generate posture
+// as the two codes above, for the same 031a reason: an operator running
+// `pnpm dev` with no configuration should get a working, unguessable
+// credential rather than a closed door they have to go read source to open.
+//
+// Generated *here* rather than inside `createMuanCompanionServer` (which is
+// where the room/presenter codes are invented, via `createSession`) because
+// this is the only layer that can tell the operator the value it invented —
+// see the constructor's own comment at the `adminCode` call site. There is no
+// dashboard ack carrying this one back the way `dashboard:join` carries the
+// room/presenter pair, so if it isn't printed below it may as well not exist.
+//
+// `PRESENTER_CODE_LENGTH`, never the shorter room-code length: this credential
+// is at least as privileged as a presenter code (it can mint connect keys, and
+// each of those can create a session), so it never gets less entropy than one.
+const adminCodeFromEnv = process.env.SLIDEV_MUAN_COMPANION_ADMIN_CODE
+const adminCode = adminCodeFromEnv || generateCode(PRESENTER_CODE_LENGTH)
+
 const { httpServer, bootSession } = createMuanCompanionServer({
   origin: process.env.SLIDEV_MUAN_COMPANION_ORIGIN ?? '*',
   roomCode: roomCodeFromEnv || undefined,
   presenterCode: presenterCodeFromEnv || undefined,
+  adminCode,
   deckUrl,
 })
 
@@ -74,6 +97,15 @@ httpServer.listen(PORT, () => {
   console.log(`[muan-companion-server] Room code (give to participants): ${roomCode}${roomCodeFromEnv ? '' : ' (auto-generated — set SLIDEV_MUAN_COMPANION_ROOM_CODE for a fixed one)'}`)
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
   console.log(`[muan-companion-server] Presenter code (yours only): ${presenterCode}${presenterCodeFromEnv ? '' : ' (auto-generated — set SLIDEV_MUAN_COMPANION_PRESENTER_CODE for a fixed one)'}`)
+  // Plan 032d. Same "generated or from the env var" note as the two codes
+  // above, for the same reason — a generated one changes every restart, and an
+  // operator scripting `POST /api/connect-key` needs to know to pin it.
+  // Printed *after* the two session codes so the pre-032d lines keep their
+  // existing positions in an operator's familiar startup output.
+  // eslint-disable-next-line no-console -- deliberate startup log, see above.
+  console.log(`[muan-companion-server] Admin code (cross-room actions, yours only): ${adminCode}${adminCodeFromEnv ? '' : ' (auto-generated — set SLIDEV_MUAN_COMPANION_ADMIN_CODE for a fixed one)'}`)
+  // eslint-disable-next-line no-console -- deliberate startup log, see above.
+  console.log(`[muan-companion-server] Mint a connect key: curl -X POST -H 'x-muan-companion-admin-code: ${adminCode}' http://localhost:${PORT}/api/connect-key`)
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
   console.log(`[muan-companion-server] Dashboard: http://localhost:${PORT}/dashboard?code=${presenterCode}`)
   // eslint-disable-next-line no-console -- deliberate startup log, see above.

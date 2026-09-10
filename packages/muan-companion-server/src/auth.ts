@@ -39,8 +39,19 @@ function constantTimeEquals(expected: string, actual: string): boolean {
  * A missing/undefined/empty supplied code is always invalid, even against an
  * (accidentally) empty configured code — an unset code must never be
  * satisfied by "nothing supplied" behaving like a wildcard.
+ *
+ * Exported as of plan 032b so `adminAuth.ts` (the cross-room admin
+ * credential) can be built on **this exact primitive** rather than growing a
+ * second, near-identical constant-time compare of its own. There is one
+ * "compare a shared secret" implementation in this package and every gate
+ * goes through it — the admin code is a different *credential* with a
+ * different scope, not a different comparison. Deliberately not re-exported
+ * as a room/presenter-shaped helper: it takes a bare configured string, so a
+ * caller has to name which secret it means, which is what keeps
+ * `isValidRoomCode`/`isValidPresenterCode`/`isValidAdminCode` from ever being
+ * accidentally interchangeable.
  */
-function isValidCode(configured: string, supplied: string | undefined): boolean {
+export function isValidCode(configured: string, supplied: string | undefined): boolean {
   if (!configured || !supplied)
     return false
   return constantTimeEquals(configured, supplied)

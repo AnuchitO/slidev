@@ -1,11 +1,11 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { ErrorReport } from './session'
+import type { ErrorReport, RoomState } from './session'
 import { randomUUID } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { unlink } from 'node:fs/promises'
+import { rename, unlink } from 'node:fs/promises'
 import Busboy from 'busboy'
 import { join } from 'pathe'
-import { addErrorReport, participants } from './session'
+import { addErrorReport, findRoomByParticipantId } from './session'
 import { ALLOWED_SCREENSHOT_MIME_TYPES, UPLOAD_MAX_BYTES } from './uploads'
 
 const UPLOAD_ROUTE = '/api/screenshot'
@@ -47,8 +47,19 @@ async function deleteQuietly(filePath: string) {
  * Any request that isn't `POST /api/screenshot` falls through to `next()`
  * so this can sit in the same `connect()` chain as the `/dashboard` and
  * `/uploads` static mounts.
+ *
+ * Plan 032a: uploads are now stored per *room*, not per process, but which
+ * room a request belongs to can only be known once its `participantId`
+ * field has been parsed — and busboy delivers parts in whatever order the
+ * client wrote them, so the file part can legitimately arrive first. Rather
+ * than depend on a client's part ordering for correctness, bytes are
+ * streamed into `stagingDir` (one process-wide directory, passed in by
+ * `server.ts`) and `rename`d into the resolved room's own directory only
+ * once every field is in and the request has been fully validated. A
+ * rejected upload is unlinked from staging exactly as before, so nothing
+ * ever lands in a room's directory that isn't a report the room accepted.
  */
-export function createScreenshotUploadHandler(uploadsDir: string, onUploaded: (report: ErrorReport) => void) {
+export function createScreenshotUploadHandler(stagingDir: string, onUploaded: (room: RoomState, report: ErrorReport) => void) {
   return (req: IncomingMessage, res: ServerResponse, next: (err?: unknown) => void) => {
     if (req.method !== 'POST' || req.url !== UPLOAD_ROUTE) {
       next()
@@ -86,7 +97,7 @@ export function createScreenshotUploadHandler(uploadsDir: string, onUploaded: (r
       }
 
       const filename = `${randomUUID()}.${ext}`
-      const filePath = join(uploadsDir, filename)
+      const filePath = join(stagingDir, filename)
       savedFile = { filename, filePath }
 
       stream.on('limit', () => {
@@ -130,8 +141,16 @@ export function createScreenshotUploadHandler(uploadsDir: string, onUploaded: (r
         }
 
         const { participantId, stepId, text } = fields
-        const participant = participantId ? participants.get(participantId) : undefined
-        if (!participant) {
+        // Plan 032a: the room is resolved *from* the participant id rather
+        // than from a new form field — see `findRoomByParticipantId`'s own
+        // doc comment for why that's unambiguous (server-minted UUIDs are
+        // globally unique across rooms) and why it leaves this endpoint's
+        // authorization exactly as strict as it was. An id no live room
+        // knows is the same `400 unknown participantId` as before, whether
+        // it's nonsense or a stale id from a session that has since ended.
+        const room = participantId ? findRoomByParticipantId(participantId) : undefined
+        const participant = room?.participants.get(participantId)
+        if (!room || !participant) {
           await deleteQuietly(savedFile.filePath)
           respond(res, 400, 'unknown participantId')
           return
@@ -142,22 +161,45 @@ export function createScreenshotUploadHandler(uploadsDir: string, onUploaded: (r
           return
         }
 
+        // Every check has passed, so this upload genuinely belongs to this
+        // room — move it out of staging into the room's own directory (see
+        // this factory's doc comment for why it wasn't written there
+        // directly). A failed rename is treated as a failed upload rather
+        // than silently recording a report whose `screenshotUrl` points at
+        // nothing: the staging copy is cleaned up and the client is told,
+        // same as any other rejection above.
+        const finalPath = join(room.uploadsDir, savedFile.filename)
+        try {
+          await rename(savedFile.filePath, finalPath)
+        }
+        catch {
+          await deleteQuietly(savedFile.filePath)
+          respond(res, 500, 'could not store the uploaded screenshot')
+          return
+        }
+
         // Screenshot capture is only ever offered on the "Report a problem"
         // tab (`ErrorReportWidget.vue` — the "Ask a question" tab is
         // text-only), so this upload path always tags the report `'problem'`
         // — there's no form field for `kind` to read here.
-        const report = addErrorReport({
+        //
+        // The URL carries the room's own uploads-directory *name* (a
+        // server-generated `mkdtemp` suffix, never the operator-supplied
+        // room code — see `RoomState.uploadsDirName`), which is what lets
+        // `server.ts` keep one `sirv` mount for `/uploads` while serving N
+        // isolated per-room directories underneath it.
+        const report = addErrorReport(room, {
           id: randomUUID(),
           participantId: participant.id,
           participantName: participant.name,
           stepId,
           kind: 'problem',
           text: text || undefined,
-          screenshotUrl: `/uploads/${savedFile.filename}`,
+          screenshotUrl: `/uploads/${room.uploadsDirName}/${savedFile.filename}`,
           ts: Date.now(),
         })
 
-        onUploaded(report)
+        onUploaded(room, report)
         res.writeHead(201, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ id: report.id, screenshotUrl: report.screenshotUrl }))
       })().catch(() => {

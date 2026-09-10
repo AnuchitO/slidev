@@ -1,12 +1,14 @@
 import type { AddressInfo } from 'node:net'
 import type { Socket as ClientSocket } from 'socket.io-client'
 import type { DashboardJoinAck, MuanCompanionServer } from './server'
+import type { RoomState } from './session'
 import { Buffer } from 'node:buffer'
+import { rmSync } from 'node:fs'
 import { connect as netConnect } from 'node:net'
 import { io as ioClient } from 'socket.io-client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMuanCompanionServer, DEFAULT_DECK_URL } from './server'
-import { errorReports, MAX_TEXT_LENGTH, participants, removeParticipant, resetSessionStateForTests, session, stepStatus } from './session'
+import { buildHomeUpdate, createMuanCompanionServer, DEFAULT_DECK_URL } from './server'
+import { MAX_TEXT_LENGTH, removeParticipant, resetSessionStateForTests } from './session'
 
 // `DashboardJoinAck` (M4's two codes, plus the join-link/QR fields added for
 // the shareable-join-link feature) is imported from `server.ts` itself now
@@ -34,6 +36,15 @@ const TEST_PRESENTER_CODE = 'presenter-secret'
 describe('createMuanCompanionServer', () => {
   let server: MuanCompanionServer
   let url: string
+  // Plan 032a: the state these tests assert against used to be module-level
+  // singletons in `session.ts` (`participants`, `stepStatus`, `errorReports`,
+  // `session`). It's now owned by a `RoomState`, so each test reads it off
+  // the server's own boot session — the room every client below implicitly
+  // lands in, since none of them passes a room hint. What each assertion
+  // pins down is unchanged; it just has an address now. The dedicated
+  // "multi-room isolation" block at the bottom of this file is where more
+  // than one room is actually in play.
+  let room: RoomState
   const clients: ClientSocket[] = []
 
   // Creates a client socket (connecting immediately) without waiting for
@@ -110,23 +121,42 @@ describe('createMuanCompanionServer', () => {
     return emitWithAck<{ ok: boolean }>(client, 'dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
   }
 
-  beforeEach(async () => {
-    resetSessionStateForTests()
-    server = createMuanCompanionServer({ roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE })
+  // Stands up a server and points `url`/`room` at it. Extracted (plan 032a)
+  // because several tests below replace the shared server mid-test to
+  // exercise a non-default `options` value, and each of them now also has to
+  // re-resolve the boot room — `room` would otherwise still point at the
+  // *closed* server's session, which `createMuanCompanionServer`'s own
+  // `close` handler has already dropped from `rooms`.
+  async function startServer(options: Parameters<typeof createMuanCompanionServer>[0] = {}) {
+    server = createMuanCompanionServer(options)
+    room = server.bootSession.room
     await new Promise<void>(resolve => server.httpServer.listen(0, resolve))
     const { port } = server.httpServer.address() as AddressInfo
     url = `http://localhost:${port}`
+  }
+
+  // Closes the shared server. Its boot session is destroyed as part of that
+  // (see `createMuanCompanionServer`'s `close` handler), which is what lets
+  // a replacement server be created under the same room code without
+  // tripping `createSession`'s duplicate-room-code guard.
+  async function stopServer() {
+    server.io.close()
+    await new Promise<void>(resolve => server.httpServer.close(() => resolve()))
+  }
+
+  beforeEach(async () => {
+    resetSessionStateForTests()
+    await startServer({ roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE })
   })
 
   afterEach(async () => {
     for (const client of clients.splice(0))
       client.disconnect()
-    server.io.close()
-    await new Promise<void>(resolve => server.httpServer.close(() => resolve()))
+    await stopServer()
   })
 
   it('sends the current slide index to a newly-connected client via slide:sync', async () => {
-    session.currentSlideIndex = 3
+    room.session.currentSlideIndex = 3
     const client = newClient()
 
     const payload = await waitFor<{ index: number }>(client, 'slide:sync')
@@ -169,7 +199,7 @@ describe('createMuanCompanionServer', () => {
       )
 
       expect(ack).toEqual({ error: 'invalid_room_code' })
-      expect(participants.size).toBe(0)
+      expect(room.participants.size).toBe(0)
     })
 
     it('rejects participant:join with a missing room code and does not create a participant', async () => {
@@ -182,7 +212,7 @@ describe('createMuanCompanionServer', () => {
       )
 
       expect(ack).toEqual({ error: 'invalid_room_code' })
-      expect(participants.size).toBe(0)
+      expect(room.participants.size).toBe(0)
     })
 
     // Follow-up fix: a resume of an already-known identity no longer needs
@@ -207,7 +237,7 @@ describe('createMuanCompanionServer', () => {
         )
 
         expect(ack).toEqual({ participantId, currentSlideIndex: 1, resumed: true })
-        expect(participants.size).toBe(1)
+        expect(room.participants.size).toBe(1)
       })
 
       it('resumes successfully even with a wrong roomCode, given a participantId the server already knows', async () => {
@@ -248,7 +278,7 @@ describe('createMuanCompanionServer', () => {
         // fallback participant to clean up, unlike the pre-fix flow). An
         // ordinary fresh join with no participantId at all is already
         // covered by the two tests just above this describe block.
-        expect(participants.size).toBe(0)
+        expect(room.participants.size).toBe(0)
       })
     })
 
@@ -265,7 +295,7 @@ describe('createMuanCompanionServer', () => {
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
       expect(bystanderSawSlideChange).toBe(false)
-      expect(session.currentSlideIndex).not.toBe(99)
+      expect(room.session.currentSlideIndex).not.toBe(99)
     })
 
     it('ignores presenter:setSlide with a missing presenter code (a valid room code alone is not enough)', async () => {
@@ -279,7 +309,7 @@ describe('createMuanCompanionServer', () => {
       participant.emit('presenter:setSlide', { index: 42 })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(session.currentSlideIndex).not.toBe(42)
+      expect(room.session.currentSlideIndex).not.toBe(42)
     })
 
     it('ignores presenter:setStep with a wrong presenter code — currentStepId is untouched', async () => {
@@ -288,7 +318,7 @@ describe('createMuanCompanionServer', () => {
       attacker.emit('presenter:setStep', { stepId: 'attacker-step', presenterCode: 'wrong-code' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(session.currentStepId).not.toBe('attacker-step')
+      expect(room.session.currentStepId).not.toBe('attacker-step')
     })
 
     it('dashboard:join with a wrong presenter code does not join the dashboard room or receive state:update', async () => {
@@ -407,16 +437,35 @@ describe('createMuanCompanionServer', () => {
         expect(secondAck.joinQrDataUrl).toBe(firstAck.joinQrDataUrl)
       })
 
-      it('omits joinUrl and joinQrDataUrl entirely when no room code is configured (fail closed, nothing to show)', async () => {
+      // Adapted for plan 032a (this test previously asserted the exact
+      // opposite, and deliberately so — the change is explained here rather
+      // than silently rewritten). Before 032a, `createMuanCompanionServer`
+      // turned an unset `roomCode` into `''` and the server sat in a "no
+      // code is configured, nothing works, nothing to share" state, which is
+      // what this test pinned down. 032a routes the boot session through
+      // `createSession`, to which an absent code means "generate one" —
+      // 031a's already-shipped posture, previously implemented only in
+      // `index.ts` for the one session it booted, now applied wherever a
+      // session is created. So there is no longer a reachable "server with
+      // no room code" state to assert against: a session always has a real,
+      // unguessable code, and therefore always has a real join link.
+      //
+      // Nothing about the fail-closed *auth* behavior changed: `auth.ts` is
+      // untouched, and `buildJoinUrl`/`isValidCode`'s handling of an empty
+      // configured code is still covered — by `session.test.ts`'s "allows an
+      // explicit empty room code, which stays permanently unreachable" case
+      // (the state layer, where an empty code is still honored verbatim for
+      // a caller that asks for one) and by `auth.test.ts` (the gate itself).
+      it('a server constructed with no room code gets a generated one, and still produces a real join link', async () => {
         // A separate server instance with no `roomCode` at all — mirrors how
-        // the `cors`/staleness-sweep tests above construct a server with
+        // the `cors`/staleness-sweep tests below construct a server with
         // different `options` rather than mutating the shared one.
-        await server.io.close()
-        await new Promise<void>(resolve => server.httpServer.close(() => resolve()))
-        server = createMuanCompanionServer({ presenterCode: TEST_PRESENTER_CODE })
-        await new Promise<void>(resolve => server.httpServer.listen(0, resolve))
-        const { port } = server.httpServer.address() as AddressInfo
-        url = `http://localhost:${port}`
+        await stopServer()
+        await startServer({ presenterCode: TEST_PRESENTER_CODE })
+
+        const generatedRoomCode = server.bootSession.roomCode
+        expect(generatedRoomCode).toBeTruthy()
+        expect(generatedRoomCode).not.toBe(TEST_ROOM_CODE)
 
         const dashboard = await connectClient()
         const ack = await emitWithAck<DashboardJoinAck>(
@@ -426,15 +475,12 @@ describe('createMuanCompanionServer', () => {
         )
 
         expect(ack.ok).toBe(true)
-        // `authConfig.roomCode` defaults to `''` when unset (falsy, but not
-        // itself `undefined` — see `createMuanCompanionServer`), which is
-        // exactly the "not configured" input `buildJoinUrl` treats as "no
-        // link to build". `deckUrl` is still present (it's independent,
-        // static server config — see its own doc comment) even though
-        // there's nothing to link it to yet.
+        expect(ack.roomCode).toBe(generatedRoomCode)
+        // `deckUrl` is independent, static server config (see its own doc
+        // comment), so it's unaffected either way.
         expect(ack.deckUrl).toBe(DEFAULT_DECK_URL)
-        expect(ack.joinUrl).toBeUndefined()
-        expect(ack.joinQrDataUrl).toBeUndefined()
+        expect(ack.joinUrl).toBe(`${DEFAULT_DECK_URL}?roomCode=${encodeURIComponent(generatedRoomCode)}`)
+        expect(ack.joinQrDataUrl).toMatch(/^data:image\/png;base64,/)
       })
     })
   })
@@ -536,8 +582,8 @@ describe('createMuanCompanionServer', () => {
 
       expect(ack.participantId).toBeTruthy()
       expect(ack.currentSlideIndex).toBe(1)
-      expect(participants.size).toBe(1)
-      expect(participants.get(ack.participantId)?.name).toBe('Ada')
+      expect(room.participants.size).toBe(1)
+      expect(room.participants.get(ack.participantId)?.name).toBe('Ada')
     })
 
     it('reconnecting with the same stored participant id does not create a duplicate participant', async () => {
@@ -557,7 +603,7 @@ describe('createMuanCompanionServer', () => {
 
       expect(secondAck.participantId).toBe(firstAck.participantId)
       expect(secondAck.resumed).toBe(true)
-      expect(participants.size).toBe(1)
+      expect(room.participants.size).toBe(1)
     })
 
     it('mints a fresh id when a client-supplied participantId is unknown to the server, with resumed: false (plan 030)', async () => {
@@ -571,7 +617,7 @@ describe('createMuanCompanionServer', () => {
 
       expect(ack.participantId).not.toBe('guessed-id-from-a-different-server-run')
       expect(ack.resumed).toBe(false)
-      expect(participants.size).toBe(1)
+      expect(room.participants.size).toBe(1)
     })
 
     it('a resumed rejoin keeps the original name even if a different one is supplied (plan 030 STOP condition)', async () => {
@@ -589,7 +635,7 @@ describe('createMuanCompanionServer', () => {
         { name: 'Someone Else Entirely', participantId: firstAck.participantId, roomCode: TEST_ROOM_CODE },
       )
 
-      expect(participants.get(firstAck.participantId)?.name).toBe('Ada')
+      expect(room.participants.get(firstAck.participantId)?.name).toBe('Ada')
     })
 
     it('logs a resume distinctly from a fresh join and from a failed resume (plan 030 operator-visibility requirement)', async () => {
@@ -625,7 +671,7 @@ describe('createMuanCompanionServer', () => {
       )
 
       expect(ack).toEqual({ stepId: 'install-deps', state: 'copied' })
-      expect(stepStatus.get(`${participantId}:install-deps`)).toEqual({ state: 'copied', updatedAt: expect.any(Number) })
+      expect(room.stepStatus.get(`${participantId}:install-deps`)).toEqual({ state: 'copied', updatedAt: expect.any(Number) })
     })
 
     it('participant:done marks the step done and acks the caller', async () => {
@@ -639,7 +685,7 @@ describe('createMuanCompanionServer', () => {
       )
 
       expect(ack).toEqual({ stepId: 'install-deps', state: 'done' })
-      expect(stepStatus.get(`${participantId}:install-deps`)).toEqual({ state: 'done', updatedAt: expect.any(Number) })
+      expect(room.stepStatus.get(`${participantId}:install-deps`)).toEqual({ state: 'done', updatedAt: expect.any(Number) })
     })
 
     it('updatedAt refreshes on each state transition (copy, then done, are two different timestamps)', async () => {
@@ -647,11 +693,11 @@ describe('createMuanCompanionServer', () => {
       const { participantId } = await join(client) as { participantId: string }
 
       await emitWithAck(client, 'participant:copy', { stepId: 'install-deps' })
-      const afterCopy = stepStatus.get(`${participantId}:install-deps`)!.updatedAt
+      const afterCopy = room.stepStatus.get(`${participantId}:install-deps`)!.updatedAt
 
       await new Promise<void>(resolve => setTimeout(resolve, 10))
       await emitWithAck(client, 'participant:done', { stepId: 'install-deps' })
-      const afterDone = stepStatus.get(`${participantId}:install-deps`)!.updatedAt
+      const afterDone = room.stepStatus.get(`${participantId}:install-deps`)!.updatedAt
 
       expect(afterDone).toBeGreaterThan(afterCopy)
     })
@@ -662,7 +708,7 @@ describe('createMuanCompanionServer', () => {
       client.emit('participant:copy', { stepId: 'install-deps' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(stepStatus.size).toBe(0)
+      expect(room.stepStatus.size).toBe(0)
     })
   })
 
@@ -697,7 +743,7 @@ describe('createMuanCompanionServer', () => {
       client.emit('participant:visibility', { state: 'closed' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(participants.get(participantId)?.visibility).toBe('visible')
+      expect(room.participants.get(participantId)?.visibility).toBe('visible')
     })
 
     // Same kick-race reasoning as `participant:error`'s equivalent guard
@@ -706,24 +752,24 @@ describe('createMuanCompanionServer', () => {
     it('participant:visibility from a socket whose participant record was removed mid-flight is a no-op', async () => {
       const client = await connectClient()
       const { participantId } = await join(client) as { participantId: string }
-      removeParticipant(participantId)
+      removeParticipant(room, participantId)
 
       expect(() => client.emit('participant:visibility', { state: 'hidden' })).not.toThrow()
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(participants.has(participantId)).toBe(false)
+      expect(room.participants.has(participantId)).toBe(false)
     })
 
     it('participant:heartbeat updates lastSeen without erroring for a joined participant', async () => {
       const client = await connectClient()
       const { participantId } = await join(client) as { participantId: string }
-      const before = participants.get(participantId)!.lastSeen
+      const before = room.participants.get(participantId)!.lastSeen
 
       await new Promise<void>(resolve => setTimeout(resolve, 10))
       client.emit('participant:heartbeat', { stepId: 'install-deps' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(participants.get(participantId)!.lastSeen).toBeGreaterThan(before)
+      expect(room.participants.get(participantId)!.lastSeen).toBeGreaterThan(before)
     })
 
     it('participant:heartbeat from a socket that has not joined yet is a harmless no-op', async () => {
@@ -735,7 +781,7 @@ describe('createMuanCompanionServer', () => {
       expect(() => client.emit('participant:heartbeat', { stepId: 'install-deps' })).not.toThrow()
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(participants.size).toBe(0)
+      expect(room.participants.size).toBe(0)
     })
 
     it('a clean disconnect immediately marks the participant closed and broadcasts state:update', async () => {
@@ -855,8 +901,8 @@ describe('createMuanCompanionServer', () => {
         new Promise<string>(resolve => setTimeout(resolve, 300, 'still connected (expected)')),
       ])
       expect(raced).toBe('still connected (expected)')
-      expect(participants.get(participantId)?.connected).toBe(true)
-      expect(participants.get(participantId)?.visibility).not.toBe('closed')
+      expect(room.participants.get(participantId)?.connected).toBe(true)
+      expect(room.participants.get(participantId)?.visibility).not.toBe('closed')
 
       // Now close the *first* (last remaining) tab — this one really should
       // close the participant.
@@ -911,16 +957,12 @@ describe('createMuanCompanionServer', () => {
       // this file's existing "give the server a tick" pattern) confirms
       // `server.ts` actually calls `sweepStaleParticipants` on a timer and
       // rebroadcasts when it changes something.
-      await server.io.close()
-      await new Promise<void>(resolve => server.httpServer.close(() => resolve()))
-      server = createMuanCompanionServer({
+      await stopServer()
+      await startServer({
         roomCode: TEST_ROOM_CODE,
         presenterCode: TEST_PRESENTER_CODE,
         sweepIntervalMs: 20,
       })
-      await new Promise<void>(resolve => server.httpServer.listen(0, resolve))
-      const { port } = server.httpServer.address() as AddressInfo
-      url = `http://localhost:${port}`
 
       const dashboard = await connectClient()
       const initialSnapshot = waitFor(dashboard, 'state:update')
@@ -951,7 +993,7 @@ describe('createMuanCompanionServer', () => {
       // `STALE_AFTER_MS` so the very next sweep tick sees it as both stale
       // and no-longer-registered.
       const serverSocket = [...server.io.sockets.sockets.values()].find(s => s.id === participant.id) ?? [...server.io.sockets.sockets.values()][0]
-      participants.get(participantId)!.lastSeen = 0
+      room.participants.get(participantId)!.lastSeen = 0
       if (serverSocket)
         server.io.sockets.sockets.delete(serverSocket.id)
 
@@ -1092,7 +1134,7 @@ describe('createMuanCompanionServer', () => {
       // Reaching here without throwing/hanging is the assertion — there was
       // never a pending connection under this socketId to clear, and
       // nothing else on the dashboard changed either.
-      expect(participants.size).toBe(0)
+      expect(room.participants.size).toBe(0)
     })
 
     it('presenter:kickParticipant disconnects every one of the participant\'s sockets and removes them from the dashboard', async () => {
@@ -1123,7 +1165,7 @@ describe('createMuanCompanionServer', () => {
       await removed
       expect(tab1Reason).toBe('io server disconnect')
       expect(tab2Reason).toBe('io server disconnect')
-      expect(participants.has(participantId)).toBe(false)
+      expect(room.participants.has(participantId)).toBe(false)
     })
 
     it('a kicked participant\'s old id cannot resume — a later join with it falls back to a fresh identity', async () => {
@@ -1164,7 +1206,7 @@ describe('createMuanCompanionServer', () => {
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
       expect(disconnected).toBe(false)
-      expect(participants.has(participantId)).toBe(true)
+      expect(room.participants.has(participantId)).toBe(true)
     })
 
     it('presenter:kickParticipant on an unknown id is a no-op (no crash, no broadcast storm)', async () => {
@@ -1179,7 +1221,7 @@ describe('createMuanCompanionServer', () => {
 
       // Reaching here without throwing/hanging is the assertion; nothing
       // else should have changed.
-      expect(participants.size).toBe(0)
+      expect(room.participants.size).toBe(0)
     })
   })
 
@@ -1295,13 +1337,13 @@ describe('createMuanCompanionServer', () => {
       expect(payload.errors).toContainEqual(
         expect.objectContaining({ participantId, stepId: 'install-deps', text: 'npm install failed', kind: 'problem', status: 'open' }),
       )
-      expect(errorReports).toHaveLength(1)
+      expect(room.errorReports).toHaveLength(1)
     })
 
     // Second-pass security fix: `text` had no length cap, so a socket that
     // already completed `participant:join` (an identity check, not a
     // content one) could spam arbitrarily large payloads into this
-    // process's unbounded, in-memory `errorReports` array. Exercised here
+    // process's unbounded, in-memory `room.errorReports` array. Exercised here
     // end-to-end (the real WS handler, not just `session.ts`'s pure
     // `addErrorReport` — see `session.test.ts` for that unit coverage) to
     // confirm the cap is actually wired up on the path a real client uses.
@@ -1352,7 +1394,7 @@ describe('createMuanCompanionServer', () => {
       client.emit('participant:error', { stepId: 'install-deps', text: 'hello' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     it('presenter:resolveError moves a report to awaiting_confirmation and broadcasts the update', async () => {
@@ -1381,7 +1423,7 @@ describe('createMuanCompanionServer', () => {
       const resolvedPayload = await resolved
 
       expect(resolvedPayload.errors.find(e => e.id === errorId)?.status).toBe('awaiting_confirmation')
-      expect(errorReports.find(e => e.id === errorId)?.status).toBe('awaiting_confirmation')
+      expect(room.errorReports.find(e => e.id === errorId)?.status).toBe('awaiting_confirmation')
     })
 
     it('presenter:resolveError on an unknown id is a no-op (no crash, no broadcast storm)', async () => {
@@ -1403,7 +1445,7 @@ describe('createMuanCompanionServer', () => {
       presenter.emit('presenter:resolveError', { errorId: 'does-not-exist', presenterCode: TEST_PRESENTER_CODE })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
       expect(sawUpdate).toBe(false)
     })
 
@@ -1428,7 +1470,7 @@ describe('createMuanCompanionServer', () => {
       attacker.emit('presenter:resolveError', { errorId, presenterCode: 'wrong-code' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(errorReports.find(e => e.id === errorId)?.status).toBe('open')
+      expect(room.errorReports.find(e => e.id === errorId)?.status).toBe('open')
     })
 
     // Reports are append-only and outlive the participant record that filed
@@ -1454,7 +1496,7 @@ describe('createMuanCompanionServer', () => {
       const { errors } = await created
       const errorId = errors[0].id
 
-      removeParticipant(participantId)
+      removeParticipant(room, participantId)
 
       const presenter = await connectClient()
       presenter.emit('presenter:resolveError', { errorId, presenterCode: TEST_PRESENTER_CODE, message: 'fixed on our end' })
@@ -1462,7 +1504,7 @@ describe('createMuanCompanionServer', () => {
 
       // The report itself still transitions normally — only the
       // now-pointless notification is skipped.
-      expect(errorReports.find(e => e.id === errorId)?.status).toBe('awaiting_confirmation')
+      expect(room.errorReports.find(e => e.id === errorId)?.status).toBe('awaiting_confirmation')
     })
 
     // Follow-up after initial manual testing: "Mark resolved" should close
@@ -1499,7 +1541,7 @@ describe('createMuanCompanionServer', () => {
       const notification = await notified
 
       expect(notification).toEqual({ errorId, stepId: 'install-deps', status: 'awaiting_confirmation', message: 'keep going, almost there!' })
-      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([
+      expect(room.errorReports.find(e => e.id === errorId)?.thread).toEqual([
         { from: 'presenter', text: 'keep going, almost there!', ts: expect.any(Number) },
       ])
 
@@ -1555,8 +1597,8 @@ describe('createMuanCompanionServer', () => {
       const notification = await pushed
 
       expect(notification).toEqual({ errorId, stepId: 'install-deps', text: 'still looking into it' })
-      expect(errorReports.find(e => e.id === errorId)?.status).toBe('open')
-      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([
+      expect(room.errorReports.find(e => e.id === errorId)?.status).toBe('open')
+      expect(room.errorReports.find(e => e.id === errorId)?.thread).toEqual([
         { from: 'presenter', text: 'still looking into it', ts: expect.any(Number) },
       ])
     })
@@ -1582,7 +1624,7 @@ describe('createMuanCompanionServer', () => {
       presenter.emit('presenter:sendMessage', { errorId, presenterCode: 'wrong', text: 'nope' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([])
+      expect(room.errorReports.find(e => e.id === errorId)?.thread).toEqual([])
     })
 
     it('presenter:sendMessage with a valid presenterCode but an unknown errorId is a no-op (no crash)', async () => {
@@ -1593,7 +1635,7 @@ describe('createMuanCompanionServer', () => {
 
       // Reaching here without throwing/hanging is the assertion — there's no
       // report to have received the message in the first place.
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     it('participant:confirmResolution from a socket that has not joined yet is a no-op', async () => {
@@ -1601,7 +1643,7 @@ describe('createMuanCompanionServer', () => {
       const { participantId } = await join(reporter) as { participantId: string }
       reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
-      const errorId = errorReports.find(e => e.participantId === participantId)!.id
+      const errorId = room.errorReports.find(e => e.participantId === participantId)!.id
 
       // A socket with no `socket.data.participantId` at all (never called
       // `participant:join`) — distinct from `errorReportOwnedBy`'s ownership
@@ -1611,7 +1653,7 @@ describe('createMuanCompanionServer', () => {
       neverJoined.emit('participant:confirmResolution', { errorId, confirmed: true })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(errorReports.find(e => e.id === errorId)?.status).toBe('open')
+      expect(room.errorReports.find(e => e.id === errorId)?.status).toBe('open')
     })
 
     it('participant:addMessage from a socket that has not joined yet is a no-op', async () => {
@@ -1619,13 +1661,13 @@ describe('createMuanCompanionServer', () => {
       const { participantId } = await join(reporter) as { participantId: string }
       reporter.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
-      const errorId = errorReports.find(e => e.participantId === participantId)!.id
+      const errorId = room.errorReports.find(e => e.participantId === participantId)!.id
 
       const neverJoined = await connectClient()
       neverJoined.emit('participant:addMessage', { errorId, text: 'can I help?' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([])
+      expect(room.errorReports.find(e => e.id === errorId)?.thread).toEqual([])
     })
 
     // Defensive, not just theoretical: a presenter could in principle kick a
@@ -1636,12 +1678,12 @@ describe('createMuanCompanionServer', () => {
     it('participant:error from a socket whose participant record was removed mid-flight is a no-op', async () => {
       const client = await connectClient()
       const { participantId } = await join(client) as { participantId: string }
-      removeParticipant(participantId)
+      removeParticipant(room, participantId)
 
       client.emit('participant:error', { stepId: 'install-deps', text: 'ghost report' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     it('participant:confirmResolution(true) resolves the report and updates the dashboard', async () => {
@@ -1677,7 +1719,7 @@ describe('createMuanCompanionServer', () => {
       const resolvedPayload = await confirmed
 
       expect(resolvedPayload.errors.find(e => e.id === errorId)?.status).toBe('resolved')
-      expect(errorReports.find(e => e.id === errorId)?.thread.at(-1)).toEqual({ from: 'participant', text: 'yep, fixed!', ts: expect.any(Number) })
+      expect(room.errorReports.find(e => e.id === errorId)?.thread.at(-1)).toEqual({ from: 'participant', text: 'yep, fixed!', ts: expect.any(Number) })
     })
 
     it('participant:confirmResolution(false) reopens the report', async () => {
@@ -1732,7 +1774,7 @@ describe('createMuanCompanionServer', () => {
       bystander.emit('participant:confirmResolution', { errorId, confirmed: true })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(errorReports.find(e => e.id === errorId)?.status).toBe('open')
+      expect(room.errorReports.find(e => e.id === errorId)?.status).toBe('open')
     })
 
     it('participant:addMessage appends a follow-up to the reporter\'s own report', async () => {
@@ -1786,7 +1828,7 @@ describe('createMuanCompanionServer', () => {
       bystander.emit('participant:addMessage', { errorId, text: 'not my report but let me add to it' })
       await new Promise<void>(resolve => setTimeout(resolve, 50))
 
-      expect(errorReports.find(e => e.id === errorId)?.thread).toEqual([])
+      expect(room.errorReports.find(e => e.id === errorId)?.thread).toEqual([])
     })
   })
 
@@ -1841,14 +1883,14 @@ describe('createMuanCompanionServer', () => {
       const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
 
       expect(response.status).toBe(400)
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     it('rejects a request with no participantId field at all with 400', async () => {
       // Distinct from the "unknown participantId" case above (a truthy but
       // unrecognized value) — this omits the field entirely, exercising the
       // short-circuit in `screenshotUpload.ts` that skips the registry
-      // lookup rather than calling `participants.get(undefined)`.
+      // lookup rather than calling `room.participants.get(undefined)`.
       const form = new FormData()
       form.set('stepId', 'install-deps')
       form.set('screenshot', new Blob([ONE_PIXEL_PNG], { type: 'image/png' }), 'shot.png')
@@ -1856,7 +1898,7 @@ describe('createMuanCompanionServer', () => {
       const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
 
       expect(response.status).toBe(400)
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     it('rejects a request with no screenshot file (text-only reports use the participant:error WS event)', async () => {
@@ -1875,7 +1917,7 @@ describe('createMuanCompanionServer', () => {
       const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
 
       expect(response.status).toBe(400)
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     it('rejects an unsupported file content type', async () => {
@@ -1894,7 +1936,7 @@ describe('createMuanCompanionServer', () => {
       const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
 
       expect(response.status).toBe(400)
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     it('rejects an upload larger than the size cap with 413', async () => {
@@ -1914,7 +1956,7 @@ describe('createMuanCompanionServer', () => {
       const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
 
       expect(response.status).toBe(413)
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     it('rejects a path-traversal attempt against the uploads static route', async () => {
@@ -1981,7 +2023,7 @@ describe('createMuanCompanionServer', () => {
       expect(response.status).toBe(400)
       const body = await response.text()
       expect(body).toContain('multipart/form-data')
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     it('rejects a multipart upload missing stepId with 400 and cleans up the saved file', async () => {
@@ -2001,7 +2043,7 @@ describe('createMuanCompanionServer', () => {
       expect(response.status).toBe(400)
       const body = await response.text()
       expect(body).toContain('stepId is required')
-      expect(errorReports).toHaveLength(0)
+      expect(room.errorReports).toHaveLength(0)
     })
 
     // Second-pass security fix: the multipart `text` field went straight
@@ -2025,7 +2067,7 @@ describe('createMuanCompanionServer', () => {
       const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
 
       expect(response.status).toBe(201)
-      const report = errorReports.find(e => e.participantId === participantId)
+      const report = room.errorReports.find(e => e.participantId === participantId)
       expect(report?.text).toHaveLength(MAX_TEXT_LENGTH)
     })
   })
@@ -2064,20 +2106,480 @@ describe('createMuanCompanionServer', () => {
     })
 
     it('respects a configured origin instead of always using the wildcard', async () => {
-      await server.io.close()
-      await new Promise<void>(resolve => server.httpServer.close(() => resolve()))
-      server = createMuanCompanionServer({
+      await stopServer()
+      await startServer({
         roomCode: TEST_ROOM_CODE,
         presenterCode: TEST_PRESENTER_CODE,
         origin: 'http://localhost:3030',
       })
-      await new Promise<void>(resolve => server.httpServer.listen(0, resolve))
-      const { port } = server.httpServer.address() as AddressInfo
-      url = `http://localhost:${port}`
 
       const response = await fetch(`${url}/api/screenshot`, { method: 'OPTIONS' })
 
       expect(response.headers.get('access-control-allow-origin')).toBe('http://localhost:3030')
+    })
+  })
+
+  // Plan 032a's whole point, end to end: one process, two concurrent
+  // workshops, no leakage between them in either direction. `session.test.ts`
+  // covers the same isolation at the state layer; these drive it over real
+  // sockets and real HTTP, through the room hint that actually decides which
+  // session a connection belongs to.
+  describe('multi-room isolation (plan 032a)', () => {
+    const ROOM_B_CODE = 'room-b-secret'
+    const PRESENTER_B_CODE = 'presenter-b-secret'
+    let roomB: RoomState
+
+    // The room hint (`ROOM_CODE_QUERY_PARAM` in `server.ts`): a Socket.io
+    // handshake query parameter, read once at connection time. Chosen over a
+    // field on `participant:connecting` because the room is needed *before*
+    // any event — `slide:sync` is emitted the instant a socket connects — so
+    // one mechanism covers the handshake, the pre-join "someone's here"
+    // signal, and every later handler. See that constant's own doc comment
+    // for why it grants nothing on its own.
+    function newClientInRoom(roomCode: string): ClientSocket {
+      const socket = ioClient(url, { forceNew: true, transports: ['websocket'], query: { roomCode } })
+      clients.push(socket)
+      return socket
+    }
+
+    function connectClientInRoom(roomCode: string): Promise<ClientSocket> {
+      const socket = newClientInRoom(roomCode)
+      return new Promise((resolve, reject) => {
+        socket.once('connect', () => resolve(socket))
+        socket.once('connect_error', reject)
+      })
+    }
+
+    async function joinRoomB(client: ClientSocket, name = 'Bob') {
+      return emitWithAck<{ participantId: string, currentSlideIndex: number } | { error: string }>(
+        client,
+        'participant:join',
+        { name, roomCode: ROOM_B_CODE },
+      )
+    }
+
+    beforeEach(() => {
+      // The seam 032b/032d will use to launch a session on a running server
+      // — the same `createSession` the boot session above came through.
+      roomB = server.createSession({ roomCode: ROOM_B_CODE, presenterCode: PRESENTER_B_CODE }).room
+    })
+
+    it('a socket with no room hint lands in the boot session (pre-032a clients keep working)', async () => {
+      const client = await connectClient()
+      const ack = await join(client, 'Ada') as { participantId: string }
+
+      expect(room.participants.has(ack.participantId)).toBe(true)
+      expect(roomB.participants.size).toBe(0)
+    })
+
+    it('a hinted socket joins only its own room, invisible to the other room\'s dashboard', async () => {
+      const dashboardA = await connectClient()
+      const snapshotA = waitFor(dashboardA, 'state:update')
+      await joinAsDashboard(dashboardA)
+      await snapshotA
+
+      const dashboardB = await connectClientInRoom(ROOM_B_CODE)
+      const snapshotB = waitFor(dashboardB, 'state:update')
+      await emitWithAck(dashboardB, 'dashboard:join', { presenterCode: PRESENTER_B_CODE })
+      await snapshotB
+
+      // Registered *before* either join, not after: each join broadcasts to
+      // its own room's dashboard once, so a listener attached afterwards
+      // would have nothing left to observe (same reason
+      // `waitForMatchingStateUpdate` exists at all — see its own comment).
+      const sawAda = waitForMatchingStateUpdate<{ participants: Array<{ id: string, name: string }> }>(
+        dashboardA,
+        p => p.participants.length > 0,
+      )
+      const sawBob = waitForMatchingStateUpdate<{ participants: Array<{ id: string, name: string }> }>(
+        dashboardB,
+        p => p.participants.length > 0,
+      )
+
+      // One participant in each room.
+      const inA = await connectClient()
+      const { participantId: idA } = await join(inA, 'Ada') as { participantId: string }
+      const inB = await connectClientInRoom(ROOM_B_CODE)
+      const { participantId: idB } = await joinRoomB(inB, 'Bob') as { participantId: string }
+
+      const finalB = await sawBob
+      expect(finalB.participants.some(p => p.id === idB)).toBe(true)
+      // Room B's dashboard sees Bob and *only* Bob — Ada's join broadcast
+      // was addressed to `dashboard:${roomA}`, a Socket.io room this socket
+      // is not in, so there is no filtering step that could have been
+      // forgotten: the payload was never sent here at all.
+      expect(finalB.participants.map(p => p.name)).toEqual(['Bob'])
+      expect(finalB.participants.some(p => p.id === idA)).toBe(false)
+
+      const finalA = await sawAda
+      expect(finalA.participants.map(p => p.name)).toEqual(['Ada'])
+      expect(finalA.participants.some(p => p.id === idB)).toBe(false)
+    })
+
+    it('presenter:setSlide in one room does not move the other room\'s participants', async () => {
+      const participantA = await connectClient()
+      await join(participantA, 'Ada')
+      const participantB = await connectClientInRoom(ROOM_B_CODE)
+      await joinRoomB(participantB, 'Bob')
+
+      let bSawSlideChange = false
+      participantB.on('slide:changed', () => {
+        bSawSlideChange = true
+      })
+
+      const aMoved = waitFor<{ index: number }>(participantA, 'slide:changed')
+      const presenterA = await connectClient()
+      presenterA.emit('presenter:setSlide', { index: 9, presenterCode: TEST_PRESENTER_CODE })
+      await expect(aMoved).resolves.toEqual({ index: 9 })
+
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+      expect(bSawSlideChange).toBe(false)
+      expect(room.session.currentSlideIndex).toBe(9)
+      expect(roomB.session.currentSlideIndex).toBe(1)
+    })
+
+    it('a newly-connected socket is synced to its own room\'s slide, not the other room\'s', async () => {
+      const presenterA = await connectClient()
+      presenterA.emit('presenter:setSlide', { index: 6, presenterCode: TEST_PRESENTER_CODE })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      // Each listener is attached in the same tick its socket is created,
+      // before the connection round-trip can complete — `slide:sync` is
+      // emitted synchronously on connection, so attaching the second one
+      // only after awaiting the first would race it (see `newClient`'s own
+      // comment).
+      const lateA = newClient()
+      const syncA = waitFor<{ index: number }>(lateA, 'slide:sync')
+      const lateB = newClientInRoom(ROOM_B_CODE)
+      const syncB = waitFor<{ index: number }>(lateB, 'slide:sync')
+
+      await expect(syncA).resolves.toEqual({ index: 6 })
+      await expect(syncB).resolves.toEqual({ index: 1 })
+    })
+
+    it('one room\'s presenter code is worthless against the other room\'s presenter events', async () => {
+      // The core auth property of the re-key: the presenter credential is
+      // checked against *the socket's own room*, so holding room A's code
+      // grants nothing in room B even though both are served by one process.
+      const attacker = await connectClientInRoom(ROOM_B_CODE)
+
+      attacker.emit('presenter:setSlide', { index: 99, presenterCode: TEST_PRESENTER_CODE })
+      attacker.emit('presenter:setStep', { stepId: 'attacker-step', presenterCode: TEST_PRESENTER_CODE })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(roomB.session.currentSlideIndex).toBe(1)
+      expect(roomB.session.currentStepId).toBe('1')
+      // ...and it didn't act on room A either, since that's not this
+      // socket's room.
+      expect(room.session.currentSlideIndex).toBe(1)
+    })
+
+    it('one room\'s presenter code cannot open the other room\'s dashboard', async () => {
+      const attacker = await connectClientInRoom(ROOM_B_CODE)
+
+      const ack = await emitWithAck<DashboardJoinAck>(attacker, 'dashboard:join', { presenterCode: TEST_PRESENTER_CODE })
+
+      expect(ack).toEqual({ ok: false })
+      expect(ack.roomCode).toBeUndefined()
+      expect(ack.presenterCode).toBeUndefined()
+
+      // And the correct code for *this* room does work, so the rejection
+      // above is about the credential, not about room B being unreachable.
+      const ok = await emitWithAck<DashboardJoinAck>(attacker, 'dashboard:join', { presenterCode: PRESENTER_B_CODE })
+      expect(ok).toMatchObject({ ok: true, roomCode: ROOM_B_CODE, presenterCode: PRESENTER_B_CODE })
+    })
+
+    it('one room\'s room code cannot be used to join the other room', async () => {
+      const client = await connectClientInRoom(ROOM_B_CODE)
+
+      const ack = await emitWithAck<{ error: string } | { participantId: string }>(
+        client,
+        'participant:join',
+        { name: 'Eve', roomCode: TEST_ROOM_CODE },
+      )
+
+      expect(ack).toEqual({ error: 'invalid_room_code' })
+      expect(roomB.participants.size).toBe(0)
+      expect(room.participants.size).toBe(0)
+    })
+
+    it('a participant id minted in one room cannot resume in the other', async () => {
+      const inA = await connectClient()
+      const { participantId } = await join(inA, 'Ada') as { participantId: string }
+
+      // No room code at all — which is exactly what a genuine resume sends
+      // (the known-id exemption). Room B has never seen this id, so the
+      // exemption doesn't apply there and the room-code gate rejects it.
+      const inB = await connectClientInRoom(ROOM_B_CODE)
+      const ack = await emitWithAck<{ error: string } | { participantId: string }>(
+        inB,
+        'participant:join',
+        { name: 'Ada', participantId },
+      )
+
+      expect(ack).toEqual({ error: 'invalid_room_code' })
+      expect(roomB.participants.size).toBe(0)
+      expect(room.participants.get(participantId)?.name).toBe('Ada')
+    })
+
+    it('a socket naming a room that does not exist is rejected, indistinguishably from a bad code', async () => {
+      const client = await connectClientInRoom('no-such-room')
+
+      // Deliberately the same rejections a wrong credential gets, so this
+      // event can't be used to enumerate which room codes name live
+      // sessions.
+      await expect(emitWithAck(client, 'participant:join', { name: 'Eve', roomCode: TEST_ROOM_CODE }))
+        .resolves
+        .toEqual({ error: 'invalid_room_code' })
+      await expect(emitWithAck(client, 'dashboard:join', { presenterCode: TEST_PRESENTER_CODE }))
+        .resolves
+        .toEqual({ ok: false })
+
+      // Every other handler is a silent no-op rather than a crash.
+      client.emit('participant:connecting')
+      client.emit('participant:copy', { stepId: 's1' })
+      client.emit('participant:heartbeat', { stepId: 's1' })
+      client.emit('presenter:setSlide', { index: 42, presenterCode: TEST_PRESENTER_CODE })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(room.participants.size).toBe(0)
+      expect(roomB.participants.size).toBe(0)
+      expect(room.session.currentSlideIndex).toBe(1)
+    })
+
+    it('pending connections show only on their own room\'s dashboard', async () => {
+      const dashboardA = await connectClient()
+      const snapshotA = waitFor(dashboardA, 'state:update')
+      await joinAsDashboard(dashboardA)
+      await snapshotA
+
+      const dashboardB = await connectClientInRoom(ROOM_B_CODE)
+      const snapshotB = waitFor(dashboardB, 'state:update')
+      await emitWithAck(dashboardB, 'dashboard:join', { presenterCode: PRESENTER_B_CODE })
+      await snapshotB
+
+      let aSawPending = false
+      dashboardA.on('state:update', (payload: { pendingConnections: unknown[] }) => {
+        if (payload.pendingConnections.length > 0)
+          aSawPending = true
+      })
+
+      const pendingInB = await connectClientInRoom(ROOM_B_CODE)
+      const seen = waitForMatchingStateUpdate<{ pendingConnections: Array<{ socketId: string }> }>(
+        dashboardB,
+        p => p.pendingConnections.length > 0,
+      )
+      pendingInB.emit('participant:connecting')
+      const payload = await seen
+
+      expect(payload.pendingConnections).toEqual([{ socketId: pendingInB.id, connectedAt: expect.any(Number) }])
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+      expect(aSawPending).toBe(false)
+      expect(room.pendingConnections.size).toBe(0)
+    })
+
+    it('a presenter cannot kick the other room\'s participant or pending connection', async () => {
+      const inA = await connectClient()
+      const { participantId } = await join(inA, 'Ada') as { participantId: string }
+      const pendingInA = await connectClient()
+      pendingInA.emit('participant:connecting')
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      let aDisconnected = false
+      inA.on('disconnect', () => {
+        aDisconnected = true
+      })
+      let pendingDisconnected = false
+      pendingInA.on('disconnect', () => {
+        pendingDisconnected = true
+      })
+
+      // Room B's presenter, holding room B's own valid code, aiming at room
+      // A's ids — a no-op, because the lookup is scoped to their own room.
+      const presenterB = await connectClientInRoom(ROOM_B_CODE)
+      presenterB.emit('presenter:kickParticipant', { participantId, presenterCode: PRESENTER_B_CODE })
+      presenterB.emit('presenter:kickPendingConnection', { socketId: pendingInA.id, presenterCode: PRESENTER_B_CODE })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      expect(aDisconnected).toBe(false)
+      expect(pendingDisconnected).toBe(false)
+      expect(room.participants.has(participantId)).toBe(true)
+      expect(room.pendingConnections.size).toBe(1)
+    })
+
+    it('a presenter cannot resolve or message the other room\'s help request', async () => {
+      const inA = await connectClient()
+      const { participantId } = await join(inA, 'Ada') as { participantId: string }
+      inA.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+      const errorId = room.errorReports.find(e => e.participantId === participantId)!.id
+
+      const presenterB = await connectClientInRoom(ROOM_B_CODE)
+      presenterB.emit('presenter:resolveError', { errorId, presenterCode: PRESENTER_B_CODE, message: 'not yours' })
+      presenterB.emit('presenter:sendMessage', { errorId, presenterCode: PRESENTER_B_CODE, text: 'not yours either' })
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+      const report = room.errorReports.find(e => e.id === errorId)!
+      expect(report.status).toBe('open')
+      expect(report.thread).toEqual([])
+      expect(roomB.errorReports).toEqual([])
+    })
+
+    it('the /dashboard HTTP route is gated per room', async () => {
+      // No room parameter → the boot session, exactly as before 032a.
+      expect((await fetch(`${url}/dashboard?code=${TEST_PRESENTER_CODE}`)).status).toBe(200)
+
+      // Room B needs room B's code; room A's is a 401 there, and vice versa.
+      expect((await fetch(`${url}/dashboard?roomCode=${ROOM_B_CODE}&code=${PRESENTER_B_CODE}`)).status).toBe(200)
+      expect((await fetch(`${url}/dashboard?roomCode=${ROOM_B_CODE}&code=${TEST_PRESENTER_CODE}`)).status).toBe(401)
+      expect((await fetch(`${url}/dashboard?roomCode=${TEST_ROOM_CODE}&code=${PRESENTER_B_CODE}`)).status).toBe(401)
+
+      // An unknown room is a 401 with the same body as a wrong code — a
+      // caller learns nothing about which rooms exist, and there is no path
+      // where an unresolvable room means "let it through".
+      const unknown = await fetch(`${url}/dashboard?roomCode=no-such-room&code=${TEST_PRESENTER_CODE}`)
+      expect(unknown.status).toBe(401)
+      expect(await unknown.text()).toContain('Presenter code required')
+    })
+
+    it('screenshot uploads land in their own room\'s feed and are served from its own directory', async () => {
+      const inB = await connectClientInRoom(ROOM_B_CODE)
+      const { participantId } = await joinRoomB(inB, 'Bob') as { participantId: string }
+
+      const form = new FormData()
+      form.set('participantId', participantId)
+      form.set('stepId', 'install-deps')
+      form.set('screenshot', new Blob([ONE_PIXEL_PNG], { type: 'image/png' }), 'shot.png')
+
+      const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
+      expect(response.status).toBe(201)
+      const body = await response.json() as { id: string, screenshotUrl: string }
+
+      // The report is in room B's feed, and room A's is untouched.
+      expect(roomB.errorReports.map(e => e.id)).toEqual([body.id])
+      expect(room.errorReports).toEqual([])
+
+      // The served path carries room B's own uploads directory name — the
+      // server-generated `mkdtemp` suffix, never the room code, so serving a
+      // screenshot leaks no credential.
+      expect(body.screenshotUrl).toBe(`/uploads/${roomB.uploadsDirName}/${body.screenshotUrl.split('/').pop()}`)
+      expect(body.screenshotUrl).not.toContain(ROOM_B_CODE)
+      const image = await fetch(`${url}${body.screenshotUrl}`)
+      expect(image.status).toBe(200)
+      expect(Buffer.from(await image.arrayBuffer())).toEqual(ONE_PIXEL_PNG)
+
+      // The same filename under the *other* room's directory is a 404 — the
+      // per-room directories are real isolation, not just a naming scheme.
+      const filename = body.screenshotUrl.split('/').pop()
+      const crossRoom = await fetch(`${url}/uploads/${room.uploadsDirName}/${filename}`)
+      expect(crossRoom.status).toBe(404)
+    })
+
+    it('rejects an /uploads request naming a directory that is not a live room, or a bad filename inside a real one', async () => {
+      // The room segment is matched against live rooms' own `uploadsDirName`
+      // rather than merely pattern-checked, so a directory belonging to no
+      // session — or to one that has been destroyed — is a 404 rather than a
+      // filesystem probe.
+      const unknownRoom = await fetch(`${url}/uploads/room-nonexistent/4b2f9c3a-1e6d-4a8b-9f2a-0c1d2e3f4a5b.png`)
+      expect(unknownRoom.status).toBe(404)
+
+      // A real room directory, but a filename that doesn't match the
+      // server's own `${randomUUID()}.${ext}` naming scheme — rejected by
+      // `resolveUploadPath` before sirv ever touches the filesystem.
+      const badFilename = await fetch(`${url}/uploads/${roomB.uploadsDirName}/not-a-uuid.png`)
+      expect(badFilename.status).toBe(404)
+
+      const destroyedRoom = server.createSession().room
+      server.destroySession(destroyedRoom.roomCode)
+      const gone = await fetch(`${url}/uploads/${destroyedRoom.uploadsDirName}/4b2f9c3a-1e6d-4a8b-9f2a-0c1d2e3f4a5b.png`)
+      expect(gone.status).toBe(404)
+    })
+
+    it('an upload whose room directory has vanished fails cleanly instead of recording a report pointing at nothing', async () => {
+      const inB = await connectClientInRoom(ROOM_B_CODE)
+      const { participantId } = await joinRoomB(inB, 'Bob') as { participantId: string }
+
+      // Removing the room's uploads directory out from under the handler is
+      // the only practical way to make the staging→room `rename` fail. What
+      // matters is the *shape* of the failure: no report is appended, so the
+      // dashboard never renders a broken screenshot thumbnail.
+      rmSync(roomB.uploadsDir, { recursive: true, force: true })
+
+      const form = new FormData()
+      form.set('participantId', participantId)
+      form.set('stepId', 'install-deps')
+      form.set('screenshot', new Blob([ONE_PIXEL_PNG], { type: 'image/png' }), 'shot.png')
+
+      const response = await fetch(`${url}/api/screenshot`, { method: 'POST', body: form })
+
+      expect(response.status).toBe(500)
+      expect(await response.text()).toContain('could not store the uploaded screenshot')
+      expect(roomB.errorReports).toEqual([])
+    })
+
+    // Plan 032a wires the `dashboard:home` room and its broadcast so 032b can
+    // build the cross-room home view without reopening this refactor. What's
+    // asserted here is the seam itself: the payload shape, and that creating
+    // or destroying a session is what moves it. See `HOME_DASHBOARD_ROOM`'s
+    // own doc comment for why nothing *joins* that room yet — the credential
+    // gating a cross-room view is deliberately 032b's decision, and until it
+    // exists the room is empty and the broadcast is a no-op on the wire.
+    describe('dashboard:home feed (the 032b seam)', () => {
+      it('summarizes every live session without leaking any presenter code', () => {
+        const { sessions } = buildHomeUpdate()
+
+        expect(sessions.map(s => s.roomCode).sort()).toEqual([ROOM_B_CODE, TEST_ROOM_CODE].sort())
+        // A summary, not the rooms themselves — no presenter codes, no
+        // participant names, no help-request text. One subscription must not
+        // be equivalent to N dashboards.
+        expect(JSON.stringify(sessions)).not.toContain(TEST_PRESENTER_CODE)
+        expect(JSON.stringify(sessions)).not.toContain(PRESENTER_B_CODE)
+        expect(Object.keys(sessions[0]).sort()).toEqual([
+          'connectedCount',
+          'createdAt',
+          'currentSlideIndex',
+          'currentStepId',
+          'deckUrl',
+          'openHelpRequestCount',
+          'participantCount',
+          'roomCode',
+        ])
+      })
+
+      it('reflects roster and help-request activity per session', async () => {
+        const inB = await connectClientInRoom(ROOM_B_CODE)
+        await joinRoomB(inB, 'Bob')
+        inB.emit('participant:error', { stepId: 'install-deps', text: 'broken' })
+        await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+        const summaryB = buildHomeUpdate().sessions.find(s => s.roomCode === ROOM_B_CODE)!
+        const summaryA = buildHomeUpdate().sessions.find(s => s.roomCode === TEST_ROOM_CODE)!
+
+        expect(summaryB.participantCount).toBe(1)
+        expect(summaryB.connectedCount).toBe(1)
+        expect(summaryB.openHelpRequestCount).toBe(1)
+        expect(summaryA.participantCount).toBe(0)
+        expect(summaryA.openHelpRequestCount).toBe(0)
+      })
+
+      it('creating and destroying a session through the server\'s own seam moves the feed', () => {
+        const { roomCode } = server.createSession({ deckUrl: 'http://another-deck.test' })
+
+        expect(buildHomeUpdate().sessions.map(s => s.roomCode)).toContain(roomCode)
+        expect(buildHomeUpdate().sessions.find(s => s.roomCode === roomCode)?.deckUrl).toBe('http://another-deck.test')
+
+        expect(server.destroySession(roomCode)).toBe(true)
+        expect(buildHomeUpdate().sessions.map(s => s.roomCode)).not.toContain(roomCode)
+        // Destroying one leaves the others alone.
+        expect(buildHomeUpdate().sessions.map(s => s.roomCode).sort()).toEqual([ROOM_B_CODE, TEST_ROOM_CODE].sort())
+        expect(server.destroySession(roomCode)).toBe(false)
+      })
+
+      it('a new session inherits the server\'s deck URL unless the caller overrides it', () => {
+        const { room: inherited } = server.createSession()
+
+        expect(inherited.deckUrl).toBe(DEFAULT_DECK_URL)
+      })
     })
   })
 })

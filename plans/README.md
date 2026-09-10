@@ -168,6 +168,11 @@ for the full PR-ready writeup. Multi-session concurrency, an in-app
 session-setup/lobby flow, and a practice-mode slide remain proposed but
 unimplemented — see
 [`plans/031-muan-companion-session-lifecycle-proposal.md`](./031-muan-companion-session-lifecycle-proposal.md).
+A further proposal builds on 031's multi-session groundwork to turn the
+server into a presentation launcher — a dashboard listing Slidev decks it
+can start itself, plus a connect-key flow for decks started elsewhere to
+register into the same dashboard — see
+[`plans/032-muan-companion-presentation-launcher-proposal.md`](./032-muan-companion-presentation-launcher-proposal.md).
 
 ## Direction findings (not planned here — options for the maintainer)
 

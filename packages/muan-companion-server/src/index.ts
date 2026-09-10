@@ -1,7 +1,8 @@
 import process from 'node:process'
-import { buildJoinUrl, createMuanCompanionServer, DEFAULT_DECK_URL } from './server'
+import { killAllSpawnedDecks, MAX_CONCURRENT_SPAWNED_DECKS } from './deckLauncher'
+import { buildJoinUrl, createMuanCompanionServer, DEFAULT_DECK_URL, DEFAULT_SERVER_PORT } from './server'
 
-const PORT = Number(process.env.PORT ?? 3710)
+const PORT = Number(process.env.PORT ?? DEFAULT_SERVER_PORT)
 
 // Plan 031a: previously an unset code meant "fail closed until an operator
 // configures one" — every join/presenter action/dashboard-open rejected
@@ -52,6 +53,36 @@ const presentationsDir = process.env.SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR || 
 // working link rather than an obviously-broken one — see `DEFAULT_DECK_URL`'s
 // own doc comment in `server.ts` for why the literal lives there, not here.
 const deckUrl = process.env.SLIDEV_MUAN_COMPANION_DECK_URL ?? DEFAULT_DECK_URL
+// Plan 032c. Where *this* server is reachable from a participant's browser —
+// injected into every server-launched deck as
+// `VITE_SLIDEV_MUAN_COMPANION_SERVER_URL`, and the origin a launched deck's own
+// URL is built from. Unset falls back to `http://localhost:<PORT>` (resolved
+// inside `createMuanCompanionServer`, see its `publicUrl` option), which is the
+// same deliberately-local-but-well-formed posture `DEFAULT_DECK_URL` already
+// takes. `|| undefined` for the same reason as every other read in this file.
+const publicUrl = process.env.SLIDEV_MUAN_COMPANION_PUBLIC_URL || undefined
+// Plan 032c's resource cap (plan 032's Security notes: "Cap concurrent spawned
+// sessions (a config value, not a magic number)"). `Number.isFinite` +
+// positivity check rather than a bare `Number(...)`: an unparseable or
+// nonsensical value (`abc`, `0`, `-1`) must fall back to the documented
+// default, not silently become `NaN` — which every `>=` comparison against
+// would be false for, i.e. no cap at all, which is the one outcome this value
+// exists to prevent.
+const maxSpawnedDecksFromEnv = Number(process.env.SLIDEV_MUAN_COMPANION_MAX_SPAWNED_DECKS)
+const maxSpawnedDecks = Number.isFinite(maxSpawnedDecksFromEnv) && maxSpawnedDecksFromEnv > 0
+  ? Math.floor(maxSpawnedDecksFromEnv)
+  : MAX_CONCURRENT_SPAWNED_DECKS
+// Whether a server-launched deck binds to every interface (`--remote=`) rather
+// than `localhost`. Off unless explicitly opted into — see `buildSlidevArgs`
+// for why exposing a new port on every interface is an operator's decision to
+// make knowingly rather than a default to inherit. Only the exact string
+// `true` enables it: a half-set env var (`SLIDEV_MUAN_COMPANION_SPAWN_REMOTE=`,
+// or a leftover `false`) must not open a port.
+const spawnRemote = process.env.SLIDEV_MUAN_COMPANION_SPAWN_REMOTE === 'true'
+// An explicit path to the Slidev CLI, for a deployment that installs it
+// somewhere `resolveSlidevBinary`'s `node_modules/.bin` walk won't find. Almost
+// always unset; see that function for the resolution order.
+const slidevBinary = process.env.SLIDEV_MUAN_COMPANION_SLIDEV_BIN || undefined
 
 const { httpServer, bootSession, adminCode } = createMuanCompanionServer({
   origin: process.env.SLIDEV_MUAN_COMPANION_ORIGIN ?? '*',
@@ -60,7 +91,60 @@ const { httpServer, bootSession, adminCode } = createMuanCompanionServer({
   adminCode: adminCodeFromEnv || undefined,
   presentationsDir,
   deckUrl,
+  publicUrl,
+  deckLaunch: {
+    remote: spawnRemote,
+    slidevBinary,
+    maxConcurrent: maxSpawnedDecks,
+  },
 })
+
+/**
+ * Plan 032c / plan 032's Security notes: *"a spawned child survives its parent
+ * unless explicitly killed on shutdown — wire `SIGTERM`/`SIGINT` handlers in
+ * `index.ts` to kill every tracked child before exiting, or a server restart
+ * leaves zombie `slidev dev` processes bound to ports the new server instance
+ * then can't reuse."*
+ *
+ * This file had no shutdown handling at all before 032c (the process simply
+ * died on its signal, which was correct when it owned nothing but sockets), so
+ * this is new rather than an extension of something existing.
+ *
+ * Three deliberate choices a reviewer should check:
+ *
+ * - **`once`, not `on`.** A second `SIGINT` (an impatient operator hitting
+ *   Ctrl-C again) must reach Node's default handler and kill this process
+ *   outright, rather than re-entering a shutdown that is evidently already
+ *   stuck.
+ * - **`process.exit` is required.** Registering *any* handler for these
+ *   signals suppresses Node's default terminate-on-signal behavior, so a
+ *   handler that only cleaned up would leave the server running after Ctrl-C —
+ *   a strictly worse outcome than the zombie children this is here to prevent.
+ *   `128 + signum` is the conventional shell exit status for "killed by signal
+ *   N", so `pnpm`/Docker/systemd read this the same way they read an
+ *   unhandled signal.
+ * - **No wait for the children to die.** `killAllSpawnedDecks` signals and
+ *   returns. Waiting would mean an async shutdown with its own timeout, and it
+ *   would buy nothing: `SIGTERM` is delivered by the kernel the moment it is
+ *   sent, and it does not need this process to stay alive to be acted on.
+ *   (`killAllSpawnedDecks` also arms a `SIGKILL` escalation, which is the part
+ *   that genuinely cannot survive this process — accepted, because a child
+ *   that ignores `SIGTERM` is a deck whose own code installed a handler, and
+ *   reparenting to init with a SIGTERM already delivered is as far as this
+ *   server's responsibility reasonably goes.)
+ */
+function shutdown(signal: 'SIGTERM' | 'SIGINT', signalNumber: number) {
+  const killed = killAllSpawnedDecks()
+  if (killed > 0) {
+    // eslint-disable-next-line no-console -- deliberate shutdown log for a CLI-run server process, see the startup logs below.
+    console.log(`[muan-companion-server] ${signal}: stopping ${killed} spawned deck${killed === 1 ? '' : 's'}`)
+  }
+  httpServer.close()
+  process.exit(128 + signalNumber)
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM', 15))
+process.once('SIGINT', () => shutdown('SIGINT', 2))
 
 // Read back off the session that was actually created rather than off
 // locally-computed values (plan 032a): whichever of the two codes came from
@@ -126,6 +210,15 @@ httpServer.listen(PORT, () => {
     // server behaves exactly as it did before 032b.
     // eslint-disable-next-line no-console -- deliberate startup log, see above.
     console.log(`[muan-companion-server] Scanning for presentations in: ${presentationsDir}`)
+    // Plan 032c. Printed only alongside the line above, for the same reason it
+    // is gated: a deployment that never configured a discovery root can never
+    // launch anything, so its launcher settings are noise. Both values are
+    // ones an operator needs to be able to see without reading the source —
+    // the cap is what a "refusing to launch" error will be measured against,
+    // and whether spawned decks are reachable from other devices is the single
+    // most likely thing to be wrong about a first Flow-A attempt.
+    // eslint-disable-next-line no-console -- deliberate startup log, see above.
+    console.log(`[muan-companion-server] Deck launcher: max ${maxSpawnedDecks} concurrent, spawned decks bound to ${spawnRemote ? 'all interfaces (--remote)' : 'localhost only (set SLIDEV_MUAN_COMPANION_SPAWN_REMOTE=true for LAN access)'}`)
   }
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
   console.log(`[muan-companion-server] Append ?code=${presenterCode} to your own /presenter/N deck URL.`)

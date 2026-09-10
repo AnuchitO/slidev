@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { CreateSessionOptions, CreateSessionResult } from './session'
-import { Buffer } from 'node:buffer'
 import { isValidAdminCode } from './adminAuth'
+import { parseJsonObject, readBody, respondJson, suppliedAdminCode } from './apiHttp'
 import {
   clearFailedAttempts,
   consumeConnectKey,
@@ -34,23 +34,6 @@ const MAX_REGISTER_BODY_BYTES = 4096
  */
 const MAX_DECK_URL_LENGTH = 2048
 
-/**
- * The name of the request header carrying the cross-room admin code
- * (`adminAuth.ts`).
- *
- * A header is offered *alongside* the `?code=` query param `requireDashboardCode`
- * already uses, rather than replacing it, because these two routes have a
- * different caller than `/dashboard` does. `/dashboard` is a URL an operator
- * navigates a browser to, so the credential has to live in the URL — there is
- * nowhere else to put it. These are `fetch`/`curl` calls, where a header is
- * the better carrier: query strings land in access logs, proxy logs, browser
- * history, and `Referer` headers, none of which a long-lived process-wide
- * admin code should be sprinkled through. The query param is still accepted
- * so a plain `curl "$URL/api/connect-key?code=..."` works with no flags,
- * matching this endpoint's requirement to be usable without any UI.
- */
-const ADMIN_CODE_HEADER = 'x-muan-companion-admin-code'
-
 export interface CreateRegistrationRoutesOptions {
   /**
    * The process-wide admin code (`adminAuth.ts`). Gates `POST /api/connect-key`.
@@ -71,10 +54,6 @@ export interface CreateRegistrationRoutesOptions {
   buildJoinUrl: (deckUrl: string, roomCode: string) => string | undefined
   /** Builds the presenter-facing URL — `server.ts`'s `buildPresenterUrl`. */
   buildPresenterUrl: (deckUrl: string, presenterCode: string) => string
-}
-
-function respondJson(res: ServerResponse, status: number, body: unknown) {
-  res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
 }
 
 /**
@@ -98,55 +77,6 @@ function respondJson(res: ServerResponse, status: number, body: unknown) {
  */
 const REGISTRATION_FAILED_BODY = { error: 'registration failed' }
 
-/**
- * Reads a request body as UTF-8 text, refusing anything over
- * `MAX_REGISTER_BODY_BYTES`. Resolves `undefined` on any failure (too large,
- * transport error) — callers treat that identically to "unparseable", so no
- * failure mode here becomes a distinguishable response.
- */
-function readBody(req: IncomingMessage): Promise<string | undefined> {
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = []
-    let total = 0
-    let settled = false
-
-    function settle(value: string | undefined) {
-      if (settled)
-        return
-      settled = true
-      resolve(value)
-    }
-
-    req.on('data', (chunk: Buffer) => {
-      total += chunk.length
-      if (total > MAX_REGISTER_BODY_BYTES) {
-        // Over the cap: drop everything buffered so far and stop accumulating,
-        // so allocation is genuinely bounded by `MAX_REGISTER_BODY_BYTES` and
-        // not merely reported on afterwards.
-        //
-        // Then `resume()` — drain and discard the rest — rather than
-        // `destroy()`. Destroying the request here tears the socket down
-        // before the caller has written its 400, so the client sees a
-        // connection reset instead of the uniform rejection every other
-        // failure produces; that difference is itself a distinguishable
-        // signal, which is exactly what `REGISTRATION_FAILED_BODY` exists to
-        // avoid. Draining is the same treatment `screenshotUpload.ts` gives an
-        // unsupported file part, and it costs nothing: nothing is buffered, and
-        // Node closes the connection itself once the response ends without the
-        // request having been fully consumed.
-        chunks.length = 0
-        settle(undefined)
-        req.resume()
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => settle(Buffer.concat(chunks).toString('utf8')))
-    req.on('error', () => settle(undefined))
-    req.on('aborted', () => settle(undefined))
-  })
-}
-
 interface RegisterRequest {
   connectKey: string
   deckUrl: string
@@ -158,7 +88,8 @@ interface RegisterRequest {
  *
  * Strict about types, not just presence: `JSON.parse` will happily hand back
  * a number, an array, `null`, or an object whose `connectKey` is an object.
- * Every one of those is rejected here rather than being coerced downstream —
+ * Every one of those is rejected here (the container by `parseJsonObject`, the
+ * two fields below) rather than being coerced downstream —
  * `consumeConnectKey` taking a non-string would compare against map keys in
  * ways nobody reviewed, and a non-string `deckUrl` reaching `new URL()` would
  * be stringified into something that might even parse. Untrusted input from a
@@ -166,18 +97,10 @@ interface RegisterRequest {
  * checked to its exact expected shape, once, here.
  */
 function parseRegisterBody(raw: string | undefined): RegisterRequest | undefined {
-  if (raw === undefined)
+  const parsed = parseJsonObject(raw)
+  if (!parsed)
     return undefined
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  }
-  catch {
-    return undefined
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
-    return undefined
-  const { connectKey, deckUrl } = parsed as Record<string, unknown>
+  const { connectKey, deckUrl } = parsed
   if (typeof connectKey !== 'string' || typeof deckUrl !== 'string')
     return undefined
   return { connectKey, deckUrl }
@@ -242,25 +165,6 @@ export function normalizeDeckUrl(value: string): string | undefined {
   if (url.hash)
     return undefined
   return url.href.replace(/\/+$/, '')
-}
-
-/**
- * Reads the admin credential off a request — header first (see
- * `ADMIN_CODE_HEADER`), `?code=` query param as the curl-friendly fallback.
- * Returns `undefined` when neither is present, which `isValidAdminCode`
- * rejects.
- *
- * A duplicated header (Node joins repeats into a comma-separated string, or
- * hands back an array) is read as-is and will simply fail the constant-time
- * compare — no attempt to pick "the right one" out of an ambiguous request.
- */
-function suppliedAdminCode(req: IncomingMessage, url: URL): string | undefined {
-  const header = req.headers[ADMIN_CODE_HEADER]
-  if (typeof header === 'string')
-    return header
-  if (Array.isArray(header))
-    return header.join(',')
-  return url.searchParams.get('code') ?? undefined
 }
 
 /**
@@ -354,7 +258,7 @@ async function handleRegister(
     respondJson(res, 400, REGISTRATION_FAILED_BODY)
   }
 
-  const body = parseRegisterBody(await readBody(req))
+  const body = parseRegisterBody(await readBody(req, MAX_REGISTER_BODY_BYTES))
   if (!body) {
     reject()
     return

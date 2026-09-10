@@ -36,7 +36,12 @@ SLIDEV_MUAN_COMPANION_ROOM_CODE=<pick-one> SLIDEV_MUAN_COMPANION_PRESENTER_CODE=
 Starts an HTTP + Socket.io server listening on `:3710` (override with the
 `PORT` env var). `SLIDEV_MUAN_COMPANION_ORIGIN` sets the CORS origin allowed to
 connect (defaults to `*`). The instructor dashboard is served by the same
-process at `/dashboard` (see "Dashboard" below).
+process at `/dashboard` (see "Dashboard" below), and the cross-room home
+view at `/home` (see "Home view (plan 032b)"). Two optional env vars belong
+to that home view: `SLIDEV_MUAN_COMPANION_ADMIN_CODE` (its credential —
+generated and logged at startup if unset) and
+`SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR` (opt-in deck discovery — unset
+means the presentation list is simply empty).
 
 `SLIDEV_MUAN_COMPANION_ROOM_CODE` and `SLIDEV_MUAN_COMPANION_PRESENTER_CODE` (see "Auth" below) — if
 either is unset, `index.ts` generates a fresh one (`src/codeGeneration.ts`,
@@ -50,7 +55,11 @@ requirement that an operator invent the value themselves.
 ## Auth (plan 029 / PRD §12)
 
 Two separate, operator-chosen secrets, checked with a constant-time compare
-(`src/auth.ts`) so a wrong guess doesn't leak timing information:
+(`src/auth.ts`) so a wrong guess doesn't leak timing information. (Plan 032b
+adds a **third**, `SLIDEV_MUAN_COMPANION_ADMIN_CODE`, for cross-room
+operator actions — see "Home view (plan 032b)" below. It uses the same
+comparison primitive, is never accepted by any of the per-room gates listed
+here, and none of them changed to accommodate it.)
 
 - **`SLIDEV_MUAN_COMPANION_ROOM_CODE`** — low-privilege. Required in `participant:join
 { name, roomCode }` for a **fresh** join or a resume attempt whose
@@ -383,12 +392,127 @@ rather than by a separate internal id (`plans/031-...`'s Q2 recommendation).
   `slide:changed` to `participants:${roomCode}`, instead of one global
   dashboard room and a process-wide `io.emit`. A wrong-room payload is never
   sent at all, rather than sent and filtered.
-- **`dashboard:home`.** A room reserved for a future cross-room home view
-  listing every live session (plan 032b); `buildHomeUpdate()` is its payload
-  builder and creating/destroying a session is what pushes it. **Nothing
-  joins that room yet, on purpose** — its payload lists every live room code,
-  so a cross-room view is strictly more privileged than any single
-  dashboard, and the credential gating it is 032b's decision to make.
+- **`dashboard:home`.** The cross-room feed backing the home view;
+  `buildHomeUpdate()` is its payload builder and creating/destroying a
+  session is what pushes it. 032a wired the room and left it deliberately
+  unjoinable, because its payload lists every live room code — see "Home
+  view" below for the credential 032b introduced to gate it.
+
+## Home view (plan 032b)
+
+A second static page at **`/home`**, one level above the per-session
+`/dashboard`: it lists every live session on this server plus the Slidev
+decks the server can find on disk. Read-only in this milestone — it starts
+no processes (that's 032c) and its "Present" buttons are visibly disabled
+and labelled as such rather than being fake affordances.
+
+### `SLIDEV_MUAN_COMPANION_ADMIN_CODE` — the cross-room credential
+
+A **third** secret, alongside the room and presenter codes, and deliberately
+not a reuse of either (`src/adminAuth.ts`):
+
+- The room and presenter codes are scoped to **one workshop**. The home
+  view isn't: its session list necessarily carries every live room's code,
+  and a room code is the participant-level credential for its session. So
+  gating `/home` on any single room's presenter code would let that room's
+  presenter enumerate every _other_ workshop on the same server. A
+  cross-room view is strictly more privileged than any one dashboard and
+  must not be reachable with less.
+- The comparison is `auth.ts`'s constant-time `isValidCode`, unchanged and
+  reused rather than reimplemented. The credential is new; how a secret is
+  checked is not.
+- **Unset means generated**, exactly like the two session codes (plan
+  031a's posture): `index.ts` logs it at startup, noting whether it came
+  from the env var or was generated. Set the env var for a stable `/home`
+  bookmark across restarts.
+- It gates `/home`, the `home:join` socket event, and
+  `GET /api/presentations` today; per plan 032 it will also gate the deck
+  launcher (032c) and connect-key minting (032d). It confers **nothing**
+  inside any single room — it is not accepted by `dashboard:join`, by any
+  `presenter:*` event, by `participant:join`, or by the `/dashboard` HTTP
+  route. Nothing about the existing per-room gates changed; 032b adds
+  surface above them.
+
+### `SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR` — deck discovery (opt-in)
+
+Root directory scanned for presentable decks (`src/presentations.ts`).
+**No default**: unset means the presentation list is simply empty and this
+whole feature is a no-op, so every deployment that predates 032b behaves
+identically. A root that doesn't exist or isn't readable is treated the same
+way — an empty list, never a startup crash or a failed request.
+
+Each **immediate subdirectory** counts as one presentation if it has:
+
+1. a `slides.md` (Slidev's own default entry deck — the one file a folder
+   needs for `slidev dev` in it to work at all), **and**
+2. the companion addon actually configured, via either `slides.md`'s
+   frontmatter `addons:` list (block or inline form; the short
+   `muan-companion` and full `slidev-addon-muan-companion` spellings both
+   match) or a dependency in the folder's `package.json`.
+
+The addon check exists so folders that _can't_ sync don't show up as falsely
+presentable — a deck without the addon would launch fine and then silently
+never appear in any session, which is only diagnosable by noticing that
+nothing happens. What is deliberately **not** checked: whether the addon
+resolves on disk, its version, or Slidev-version compatibility — those have
+real answers only at spawn time (032c), and discovery's job is to filter out
+the obviously-unpresentable, not to guarantee a successful launch.
+
+Dotfiles, `node_modules`, plain files, nested subdirectories, and
+**symlinked directories** are skipped. The symlink exclusion is deliberate:
+a symlink's target can be anywhere on the host, which would quietly turn
+"one configured directory" into "that directory plus wherever its symlinks
+point" — and 032c will `spawn` inside whatever discovery returns.
+
+- **Id** = the subdirectory's basename. Unique by construction (a directory
+  can't hold two entries of the same name, and only immediate children are
+  scanned), stable across restarts and across machines that mount the deck
+  tree at different absolute paths — which a hash of the absolute path
+  would not be.
+- **Title** = frontmatter `title:` if present, else the folder name.
+- **The absolute path never crosses the wire.** `GET /api/presentations`
+  returns id + title only; the path is dropped inside `presentations.ts`,
+  one layer below the route. Going the other way, `resolvePresentationDir`
+  (the seam 032c launches from) resolves an id by **exact match against a
+  freshly scanned listing**, never by `join(root, id)` — so a traversal id
+  resolves to nothing, with no normalization step to get wrong, because
+  there is no path arithmetic at all.
+
+### Wire surface
+
+- **`home:join { adminCode }`** → `{ ok: true, sessions: [...] }` with an
+  immediate snapshot (mirroring `dashboard:join`), or `{ ok: false }` and no
+  join. The only thing that ever joins `dashboard:home`. Subsequent changes
+  arrive as `home:update` broadcasts on session create/destroy.
+- **`home:dashboardUrl { adminCode, roomCode }`** → `{ ok: true, url }`, the
+  `/dashboard?code=…&roomCode=…` link for one session. This exists because
+  `home:update` deliberately carries **no presenter codes** and a working
+  dashboard link needs one. An admin-code holder is already entitled to
+  every room's presenter code, so withholding them isn't a boundary — but
+  putting N of them in a feed that re-broadcasts on every session
+  create/destroy is standing exposure with no benefit. One code, fetched on
+  an explicit click, is a fraction of that; the page navigates straight to
+  the URL and never renders the code into the DOM. The admin code is
+  re-checked per event rather than trusting the earlier `home:join`, the
+  same way every `presenter:*` event re-checks its own code.
+- **`GET /api/presentations?code=<adminCode>`** → an object with a
+  `presentations` array of `{ id, title }`. Gated by a `requireAdminCode`
+  middleware mounted _ahead_ of
+  the handler, so an unauthenticated request triggers no filesystem access
+  at all — not even a `readdir` of the configured root.
+- **`GET /home?code=<adminCode>`** → the page, served by the same `sirv` +
+  gate + CSP shape as `/dashboard`, with the same no-build-step posture
+  (one HTML file, inline `<style>`/`<script>`, no framework).
+
+### What the page shows
+
+Presentations (disabled "Present" affordances, labelled "coming soon"), live
+sessions (room code, deck URL, participant/connected/needs-attention counts,
+current slide, and an "Open dashboard" action), and a "Connect a deck"
+panel. That last panel **feature-detects** `POST /api/connect-key` — 032d
+builds it in a parallel workstream and it may not be deployed in a given
+build — and shows a clear "not available yet" state rather than a button
+that 404s.
 
 ## Real gap found: multi-tab presence (follow-up fix)
 

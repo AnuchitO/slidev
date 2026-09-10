@@ -26,6 +26,25 @@ const PORT = Number(process.env.PORT ?? 3710)
 // verbatim and `auth.ts` would then reject every credential against.
 const roomCodeFromEnv = process.env.SLIDEV_MUAN_COMPANION_ROOM_CODE
 const presenterCodeFromEnv = process.env.SLIDEV_MUAN_COMPANION_PRESENTER_CODE
+// Plan 032b's third credential — the cross-room *operator* one, gating
+// `/home`, `home:join` and `GET /api/presentations` (and, per plan 032, the
+// deck launcher and connect-key minting later). Read exactly like the two
+// above, `|| undefined` included, and for exactly the same reason: an
+// explicitly-set-but-empty env var is treated as unset by every other code
+// here, and quietly making this one the exception would be a trap. Where the
+// generation happens differs — `createSession` owns a *session's* codes,
+// while this one belongs to the process, so `createMuanCompanionServer`
+// resolves it (see its `adminCode` option) — but what this file decides is
+// the same in all three cases: supply an env var if there is one, otherwise
+// nothing.
+const adminCodeFromEnv = process.env.SLIDEV_MUAN_COMPANION_ADMIN_CODE
+// Opt-in root directory scanned for presentable decks (plan 032b). No
+// default, deliberately: guessing a directory would either find nothing
+// (noise) or find decks the operator never meant to expose (worse). Unset
+// means the presentation list is empty everywhere it appears and this whole
+// feature is a no-op — see `presentations.ts` for what a subdirectory has to
+// contain to be listed.
+const presentationsDir = process.env.SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR || undefined
 // Where participants should actually load the deck from — a *different*
 // process/port than this one (this server is only the companion sync
 // backend; see the package README). Defaults to Slidev's own default `dev`
@@ -34,10 +53,12 @@ const presenterCodeFromEnv = process.env.SLIDEV_MUAN_COMPANION_PRESENTER_CODE
 // own doc comment in `server.ts` for why the literal lives there, not here.
 const deckUrl = process.env.SLIDEV_MUAN_COMPANION_DECK_URL ?? DEFAULT_DECK_URL
 
-const { httpServer, bootSession } = createMuanCompanionServer({
+const { httpServer, bootSession, adminCode } = createMuanCompanionServer({
   origin: process.env.SLIDEV_MUAN_COMPANION_ORIGIN ?? '*',
   roomCode: roomCodeFromEnv || undefined,
   presenterCode: presenterCodeFromEnv || undefined,
+  adminCode: adminCodeFromEnv || undefined,
+  presentationsDir,
   deckUrl,
 })
 
@@ -74,8 +95,33 @@ httpServer.listen(PORT, () => {
   console.log(`[muan-companion-server] Room code (give to participants): ${roomCode}${roomCodeFromEnv ? '' : ' (auto-generated — set SLIDEV_MUAN_COMPANION_ROOM_CODE for a fixed one)'}`)
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
   console.log(`[muan-companion-server] Presenter code (yours only): ${presenterCode}${presenterCodeFromEnv ? '' : ' (auto-generated — set SLIDEV_MUAN_COMPANION_PRESENTER_CODE for a fixed one)'}`)
+  // Plan 032b's cross-room operator credential, logged in the same shape as
+  // the two above (same prefix, same "generated vs. env var" note) — a
+  // generated one changes every restart, and an operator who wants a stable
+  // `/home` bookmark needs to know to set the env var. Read back off the
+  // server rather than off `adminCodeFromEnv`, for the same reason the two
+  // session codes are read off `bootSession`: whichever came from generation
+  // is only known once the server has resolved it, and one source means the
+  // log can't drift from what's actually enforced.
+  // eslint-disable-next-line no-console -- deliberate startup log, see above.
+  console.log(`[muan-companion-server] Admin code (server operator, all rooms): ${adminCode}${adminCodeFromEnv ? '' : ' (auto-generated — set SLIDEV_MUAN_COMPANION_ADMIN_CODE for a fixed one)'}`)
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
   console.log(`[muan-companion-server] Dashboard: http://localhost:${PORT}/dashboard?code=${presenterCode}`)
+  // The cross-room home view (plan 032b): every live session, plus the
+  // discovered presentation list when
+  // `SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR` is set. Logged unconditionally
+  // — the session list half is useful whether or not discovery is
+  // configured, so this isn't gated on `presentationsDir` the way the line
+  // below it is.
+  // eslint-disable-next-line no-console -- deliberate startup log, see above.
+  console.log(`[muan-companion-server] Home (all sessions): http://localhost:${PORT}/home?code=${adminCode}`)
+  if (presentationsDir) {
+    // Only when the operator actually opted in — a line about an unset
+    // feature is noise, and the whole point of the unset case is that this
+    // server behaves exactly as it did before 032b.
+    // eslint-disable-next-line no-console -- deliberate startup log, see above.
+    console.log(`[muan-companion-server] Scanning for presentations in: ${presentationsDir}`)
+  }
   // eslint-disable-next-line no-console -- deliberate startup log, see above.
   console.log(`[muan-companion-server] Append ?code=${presenterCode} to your own /presenter/N deck URL.`)
   // Same `buildJoinUrl` the dashboard's own `dashboard:join` ack uses (see

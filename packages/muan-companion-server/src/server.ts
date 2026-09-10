@@ -11,8 +11,11 @@ import { join } from 'pathe'
 import QRCode from 'qrcode'
 import sirv from 'sirv'
 import { Server as SocketIOServer } from 'socket.io'
+import { isValidAdminCode } from './adminAuth'
 import { isValidPresenterCode, isValidRoomCode } from './auth'
+import { generateCode } from './codeGeneration'
 import { HEARTBEAT_INTERVAL_MS, sweepStaleParticipants } from './presence'
+import { listPresentations } from './presentations'
 import { createScreenshotUploadHandler } from './screenshotUpload'
 import {
   addErrorReport,
@@ -87,6 +90,40 @@ export interface CreateMuanCompanionServerOptions {
    * to supply one just to exercise unrelated behavior.
    */
   deckUrl?: string
+  /**
+   * The **cross-room operator credential** (plan 032b) — see `adminAuth.ts`
+   * for why it exists as a third secret rather than a reuse of either
+   * per-room code. Gates `/home`, `home:join`, and `GET /api/presentations`
+   * today, and (per plan 032) the deck launcher and connect-key minting
+   * later.
+   *
+   * `undefined` means **generate one**, exactly as `roomCode`/`presenterCode`
+   * do at `createSession` (plan 031a's posture): a server started with no
+   * configuration at all still ends up with a real, unguessable admin
+   * credential that `index.ts` prints at startup, rather than an empty string
+   * that `isValidAdminCode` would reject every request against — which would
+   * leave `/home` permanently 401ing with no way for the operator to tell a
+   * misconfiguration apart from a bug. An explicitly-set env var always wins,
+   * and an explicit empty string is still honored verbatim (and still fails
+   * closed) for a caller that genuinely wants the feature bolted shut.
+   */
+  adminCode?: string
+  /**
+   * Root directory scanned for presentable Slidev decks (plan 032b's Flow-A
+   * discovery — `SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR`). Each immediate
+   * subdirectory containing a `slides.md` with the companion addon
+   * configured is one Presentation; see `presentations.ts` for exactly what
+   * is checked and why.
+   *
+   * **Unset is not an error** — it means "this deployment hasn't opted into
+   * discovery", and the presentation list is simply empty everywhere it
+   * appears. Every deployment that predates 032b keeps behaving identically.
+   *
+   * This is configuration and *never* client input: no request can influence
+   * which directory is scanned, and no response ever carries a path out of
+   * it (see `Presentation`'s own doc comment).
+   */
+  presentationsDir?: string
 }
 
 /**
@@ -137,6 +174,16 @@ export interface MuanCompanionServer {
    * assume it already knows what they are.
    */
   bootSession: CreateSessionResult
+  /**
+   * The cross-room admin credential this server is actually enforcing —
+   * whatever `options.adminCode` supplied, or the one generated for it when
+   * that was `undefined` (plan 032b). Exposed for exactly the same reason
+   * `bootSession` is: a server constructed without one gets a *generated*
+   * credential, so `index.ts`'s startup log can no longer assume it knows
+   * what the value is, and reading it back off the server is what keeps the
+   * printed code from ever drifting from the enforced one.
+   */
+  adminCode: string
   /**
    * Plan 032a's seam for 032b (the presentation-launcher UI) and 032d:
    * stands up an additional, fully isolated session on this same running
@@ -281,20 +328,35 @@ function dashboardRoomFor(roomCode: string): string {
  * created or destroyed, instead of polling or being rebuilt on every
  * `state:update`.
  *
- * **Nothing joins this room yet, deliberately.** Wiring the room and its
- * broadcast now is what lets 032b subscribe without reopening this
- * refactor — but adding the `socket.join(HOME_DASHBOARD_ROOM)` handler is
- * 032b's job *and* 032b's security decision, because `buildHomeUpdate`'s
- * payload necessarily carries every live room's code (that's what a
- * session list is), and a room code is the participant-level credential for
- * its session. Whatever credential gates that join, it must be at least as
- * strong as the per-room presenter code that gates `dashboard:join` today —
- * a cross-room view is strictly more privileged than any single room's
- * dashboard, so it must not be reachable with less. Until then this room is
- * always empty and `broadcastHomeUpdate` is a no-op on the wire, which is
- * the correct fail-closed default for a feed with no gate written yet.
+ * Plan 032a left this room deliberately unjoinable, because
+ * `buildHomeUpdate`'s payload necessarily carries every live room's code
+ * (that's what a session list is), a room code is the participant-level
+ * credential for its session, and no credential existed that was *at least
+ * as strong as* a per-room presenter code without being scoped to one room.
+ * A cross-room view is strictly more privileged than any single room's
+ * dashboard, so it must not be reachable with less.
+ *
+ * **032b answers that with the admin code** (`adminAuth.ts`): the
+ * `home:join` handler below is the only thing that ever calls
+ * `socket.join(HOME_DASHBOARD_ROOM)`, and it does so only after
+ * `isValidAdminCode` passes. Nothing about the per-room gates changed — the
+ * admin code is new surface layered above them, never an alternative way in
+ * to any single room's dashboard or `presenter:*` events.
  */
 export const HOME_DASHBOARD_ROOM = 'dashboard:home'
+
+/**
+ * Length of an auto-generated admin code (plan 032b). Same 10 characters as
+ * `PRESENTER_CODE_LENGTH` (`session.ts`), deliberately — this credential
+ * is _at least_ as privileged as a presenter code (it enumerates every room
+ * and, from 032c, launches processes on the host), so it must not have less
+ * entropy than the weakest thing it outranks. Not imported from `session.ts`
+ * despite matching its value today: that constant is documented as the length
+ * of a *session's* presenter code, and tying an unrelated credential's
+ * entropy to it would silently re-length this one if a future review changed
+ * that for session-specific reasons.
+ */
+const ADMIN_CODE_LENGTH = 10
 
 /** One row of the `home:update` feed — a live session, summarized. */
 export interface HomeSessionSummary {
@@ -339,11 +401,62 @@ function broadcastHomeUpdate(io: SocketIOServer) {
   io.to(HOME_DASHBOARD_ROOM).emit('home:update', buildHomeUpdate())
 }
 
+/**
+ * The `home:join` ack (plan 032b) — `{ ok: false }` on a bad/missing admin
+ * code, otherwise `ok` plus the same `sessions` array a `home:update`
+ * carries, so the joining page renders immediately instead of waiting for
+ * the next session create/destroy. Exported and shaped as a spread of
+ * `buildHomeUpdate()`'s return type rather than a hand-copied `sessions`
+ * field, so the snapshot in the ack and the payload in the broadcast are the
+ * same type by construction and cannot drift.
+ */
+export interface HomeJoinAck extends Partial<ReturnType<typeof buildHomeUpdate>> {
+  ok: boolean
+}
+
+/**
+ * The `home:dashboardUrl` ack (plan 032b) — see that handler's own comment
+ * for why a per-room dashboard link is fetched on demand instead of being
+ * folded into the `home:update` feed. `url` is present iff `ok`.
+ */
+export interface HomeDashboardUrlAck {
+  ok: boolean
+  url?: string
+}
+
+/**
+ * The per-session dashboard URL for one room, in the exact shape
+ * `requireDashboardCode`/`roomOfRequest` expect to read back: `?code=` is
+ * the *presenter* code (that route's own credential — the admin code is not
+ * accepted there and must not be), and `?roomCode=` selects which room's
+ * presenter code is checked (032a's `ROOM_CODE_QUERY_PARAM`, defaulted to
+ * the boot session when absent, which is why an older link with no room
+ * parameter still works).
+ *
+ * Root-relative rather than absolute: the home page and the dashboard are
+ * served by this same process on the same origin, so there is no host to
+ * compute — and computing one would mean trusting a `Host` header, which is
+ * client-controlled.
+ */
+function dashboardUrlFor(room: RoomState): string {
+  return `/dashboard?code=${encodeURIComponent(room.presenterCode)}&roomCode=${encodeURIComponent(room.roomCode)}`
+}
+
 // The dashboard (plan 027 Step 3) is served as a small static page by this
 // same process — same origin as the Socket.io server, so no CORS
 // configuration is needed for it. See this package's README for why (option
 // 1 of the two considered in the plan).
 const DASHBOARD_PUBLIC_DIR = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'public', 'dashboard')
+
+/**
+ * The cross-room home view (plan 032b), served exactly the way
+ * `/dashboard` is — same `sirv` mount, same CSP, same `?code=` gate, just a
+ * different credential (the admin code) and a different directory. Written
+ * with the same no-build-step posture as the dashboard page: one HTML file
+ * with inline `<style>`/`<script>` and no framework, so there is nothing to
+ * compile before this package can serve it.
+ */
+const HOME_PUBLIC_DIR = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'public', 'home')
 
 /**
  * The query-string / handshake-query parameter a client uses to say which
@@ -383,15 +496,21 @@ const DASHBOARD_PUBLIC_DIR = join(fileURLToPath(new URL('.', import.meta.url)), 
 const ROOM_CODE_QUERY_PARAM = 'roomCode'
 
 /**
- * A `Content-Security-Policy` for `/dashboard` specifically (not applied
- * globally — `/uploads` serves participant-supplied image bytes and
+ * A `Content-Security-Policy` for this package's two static pages —
+ * `/dashboard` and (plan 032b) `/home` — specifically, not applied
+ * globally (`/uploads` serves participant-supplied image bytes and
  * `/api/screenshot` returns plain JSON, neither of which executes script or
  * benefits from a policy scoped to *this* page's own known-safe resource
- * list). `public/dashboard/index.html` inlines its own `<style>`/`<script>`
- * (no build step — see this package's README) and loads exactly one
- * same-origin script, Socket.io's own client bundle
- * (`/socket.io/socket.io.js`, served by Socket.io itself, not sirv) — this
- * policy is written to permit precisely that and nothing else external:
+ * list). `public/dashboard/index.html` and `public/home/index.html` both
+ * inline their own `<style>`/`<script>` (no build step — see this package's
+ * README) and load exactly one same-origin script, Socket.io's own client
+ * bundle (`/socket.io/socket.io.js`, served by Socket.io itself, not sirv) —
+ * this policy is written to permit precisely that and nothing else external.
+ * One policy for both pages rather than a second near-copy for `/home`:
+ * their resource needs are identical (the home page's `fetch`es to
+ * `/api/presentations` and, when 032d lands, `/api/connect-key` are
+ * same-origin and already covered by `connect-src 'self'`), and two
+ * separately-maintained policies is how one of them quietly gets weaker.
  *
  * - `'unsafe-inline'` on `script-src`/`style-src` is required for the page's
  *   existing inline `<script>`/`<style>` to keep running at all (there's no
@@ -419,7 +538,7 @@ const ROOM_CODE_QUERY_PARAM = 'roomCode'
  *   has no plugin content and no `<base>`/form use; locking these down is
  *   free hardening with no functional cost.
  */
-function dashboardContentSecurityPolicy() {
+function staticPageContentSecurityPolicy() {
   const directives = [
     'default-src \'self\'',
     'script-src \'self\' \'unsafe-inline\'',
@@ -476,6 +595,42 @@ function requireDashboardCode(resolveRoomFromRequest: (req: IncomingMessage) => 
 }
 
 /**
+ * `requireDashboardCode`'s sibling for the **cross-room** routes plan 032b
+ * adds (`/home`, `GET /api/presentations`), gating on the admin code
+ * (`adminAuth.ts`) instead of a room's presenter code.
+ *
+ * Deliberately a separate function rather than a generalization of
+ * `requireDashboardCode` over "which credential". The two differ in more
+ * than the comparison: this one has no room to resolve at all (that's the
+ * point of a cross-room credential), and its rejection body names a
+ * different parameter for the operator to go find. Folding them together
+ * would mean a middleware that takes a resolver it sometimes ignores and a
+ * message it sometimes swaps — more moving parts guarding a *more*
+ * privileged surface, which is the wrong direction to trade. What is shared
+ * is the part that matters: the same `?code=` convention, the same
+ * check-before-any-data-access ordering (mounted ahead of `sirv` / ahead of
+ * any filesystem scan), the same 401-with-nothing-extra-revealed body, and
+ * the same fail-closed `isValidCode` primitive underneath.
+ *
+ * The body deliberately reveals nothing beyond how to authenticate: not
+ * whether an admin code is configured, not whether discovery is enabled, not
+ * how many presentations or sessions exist. A caller without the credential
+ * learns only that one is required.
+ */
+function requireAdminCode(adminCode: string) {
+  return (req: IncomingMessage, res: ServerResponse, next: () => void) => {
+    const url = new URL(req.url ?? '/', 'http://internal')
+    if (isValidAdminCode(adminCode, url.searchParams.get('code') ?? undefined)) {
+      next()
+      return
+    }
+    res.statusCode = 401
+    res.setHeader('content-type', 'text/plain; charset=utf-8')
+    res.end('Admin code required (append ?code=<adminCode> to this URL).')
+  }
+}
+
+/**
  * Builds the sync server's http+Socket.io instances without starting to
  * listen — kept separate from `index.ts`'s entrypoint so tests can drive it
  * against an ephemeral port, and so 027+ can extend the event handling here
@@ -483,6 +638,17 @@ function requireDashboardCode(resolveRoomFromRequest: (req: IncomingMessage) => 
  */
 export function createMuanCompanionServer(options: CreateMuanCompanionServerOptions = {}): MuanCompanionServer {
   const deckUrl = options.deckUrl ?? DEFAULT_DECK_URL
+
+  // Plan 032b: the cross-room admin credential, resolved once for the life
+  // of the process. `undefined` means "generate one", the same posture
+  // `createSession` applies to a session's own two codes — see
+  // `CreateMuanCompanionServerOptions.adminCode` for why an unset credential
+  // must become a real generated secret rather than an empty string that
+  // rejects everything. `??`, not `||`: an explicit empty string is honored
+  // verbatim and fails closed, matching `createSession`'s treatment of an
+  // explicit empty room code (the caller who passes `''` is asking for a
+  // surface nobody can reach, and that is a legitimate thing to ask for).
+  const adminCode = options.adminCode ?? generateCode(ADMIN_CODE_LENGTH)
 
   // Plan 032a: the boot session goes through the *same* `createSession` that
   // 032b/032d will call at runtime — there is deliberately no second,
@@ -693,9 +859,47 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     return getRoom(url.searchParams.get(ROOM_CODE_QUERY_PARAM) ?? defaultRoomCode)
   }
 
-  app.use('/dashboard', dashboardContentSecurityPolicy())
+  app.use('/dashboard', staticPageContentSecurityPolicy())
   app.use('/dashboard', requireDashboardCode(roomOfRequest))
   app.use('/dashboard', sirv(DASHBOARD_PUBLIC_DIR, { single: true, dev: true, etag: true }))
+
+  // Plan 032b's cross-room home view. Mounted in exactly the same three-step
+  // shape as `/dashboard` directly above — CSP, then credential, then
+  // `sirv` — so the two pages are trivially comparable and neither can
+  // acquire a gate the other quietly lacks. The only difference is which
+  // credential the middle step checks.
+  app.use('/home', staticPageContentSecurityPolicy())
+  app.use('/home', requireAdminCode(adminCode))
+  app.use('/home', sirv(HOME_PUBLIC_DIR, { single: true, dev: true, etag: true }))
+
+  // `GET /api/presentations` — the discovered deck list, admin-gated.
+  //
+  // The gate is mounted as its own middleware *ahead* of the handler, not
+  // checked inside it, for the same reason `requireDashboardCode` sits ahead
+  // of `sirv`: no filesystem access of any kind (not even the `readdirSync`
+  // of the configured root) happens on an unauthenticated request. An
+  // attacker without the admin code cannot use this route to learn whether
+  // the discovery directory exists, how long a scan of it takes, or anything
+  // else about the host's disk.
+  //
+  // The response carries `listPresentations`' projection — id and title
+  // only. The absolute path of every deck is dropped inside
+  // `presentations.ts` (see `Presentation`'s doc comment), one layer below
+  // this handler, so a future edit here cannot accidentally serialize it.
+  app.use('/api/presentations', requireAdminCode(adminCode))
+  app.use('/api/presentations', (req, res, next) => {
+    // Anything other than a plain GET falls through to whatever else may
+    // handle it (today: nothing, so connect's own 404). This route is
+    // read-only by construction — 032c's launch action is a *different*,
+    // state-changing endpoint and must not be reachable by POSTing here.
+    if (req.method !== 'GET') {
+      next()
+      return
+    }
+    res.statusCode = 200
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    res.end(JSON.stringify({ presentations: listPresentations(options.presentationsDir) }))
+  })
 
   // Staging directory for in-flight screenshot uploads (plan 032a). The
   // per-*room* directories every accepted upload actually lands in are
@@ -1372,6 +1576,95 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
   }
 
   /**
+   * The cross-room home view's Socket.io entry point (plan 032b) — the
+   * thing that finally gives `broadcastHomeUpdate` real subscribers, and
+   * the _only_ place `HOME_DASHBOARD_ROOM` is ever joined.
+   *
+   * Modelled on `registerDashboardHandler` above, deliberately down to the
+   * details: an `{ ok: false }` ack with no join on failure (not a silent
+   * no-op, not a disconnect — the page needs to render "wrong code" rather
+   * than hang), and an immediate snapshot folded into the success ack so a
+   * freshly-opened home tab renders the current session list without waiting
+   * for the next create/destroy. Like `dashboard:join`, it does not go
+   * through `requirePresenterCode`: the credential is different *and* the
+   * rejection shape is different.
+   *
+   * What is deliberately **not** shared with `dashboard:join` is the
+   * credential itself. A room's presenter code opens that room's dashboard
+   * and nothing else; it is worthless here. The admin code opens this view
+   * and confers nothing inside any single room — it is not accepted by
+   * `dashboard:join`, by any `presenter:*` event, or by `participant:join`.
+   * Neither credential is a superset of the other on the wire, even though
+   * the admin code is the more privileged of the two in practice, because
+   * every existing gate is left exactly as it was: 032b adds surface, it
+   * does not widen anything.
+   */
+  function registerHomeHandler(socket: Socket) {
+    // The payload is read with `?.` rather than destructured behind a `= {}`
+    // default. A default parameter only fires for `undefined`, and a client
+    // that emits `socket.emit('home:join', null, ack)` — which is exactly
+    // what a Socket.io client sends for an explicitly-`undefined` payload,
+    // since `null` is what survives the JSON round-trip — would otherwise
+    // throw a `TypeError` *inside* the listener. Socket.io does not catch a
+    // listener's synchronous throw, so that surfaces as a process-level
+    // uncaught exception: any socket, with no credential at all, could stop
+    // the server. Reading defensively is the whole fix, and it costs a
+    // question mark.
+    socket.on('home:join', (payload: { adminCode?: string } | null | undefined, ack?: (result: HomeJoinAck) => void) => {
+      if (!isValidAdminCode(adminCode, payload?.adminCode)) {
+        ack?.({ ok: false })
+        return
+      }
+      socket.join(HOME_DASHBOARD_ROOM)
+      ack?.({ ok: true, ...buildHomeUpdate() })
+    })
+
+    // On-demand, per-room dashboard link for the home view's "open this
+    // session's dashboard" action.
+    //
+    // **Why this exists at all**: `buildHomeUpdate`'s payload deliberately
+    // carries no presenter codes (032a's decision, and its test pins it
+    // down), but a working `/dashboard?code=…&roomCode=…` link needs one.
+    // Rather than weaken the broadcast, the code is fetched *only when the
+    // operator actually clicks a session*, through this separate,
+    // individually-authenticated event.
+    //
+    // **Why that's the right trade**: an admin-code holder is already
+    // entitled to every room's presenter code — this credential outranks
+    // them all, and 032c will let it start and stop the very sessions those
+    // codes belong to — so withholding the codes from them is not a
+    // security boundary. What *is* worth avoiding is putting N presenter
+    // codes into a feed that re-broadcasts on every session create/destroy,
+    // where they accumulate in every subscriber's memory, devtools network
+    // log, and any proxy in between for the whole life of the page. One code,
+    // on an explicit action, is a fraction of that standing exposure for the
+    // same functionality. The home page correspondingly never renders the
+    // code into the DOM — it navigates straight to the returned URL (see
+    // `public/home/index.html`).
+    //
+    // The admin code is re-checked here rather than trusting the socket's
+    // earlier `home:join`, matching how every `presenter:*` event re-checks
+    // its own code on every payload instead of trusting `dashboard:join`.
+    // Same `?.`-not-destructuring posture as `home:join` above, for the same
+    // reason — see its comment.
+    socket.on('home:dashboardUrl', (payload: { adminCode?: string, roomCode?: string } | null | undefined, ack?: (result: HomeDashboardUrlAck) => void) => {
+      if (!isValidAdminCode(adminCode, payload?.adminCode)) {
+        ack?.({ ok: false })
+        return
+      }
+      const room = getRoom(payload?.roomCode)
+      // An unknown/destroyed room acks the same `{ ok: false }` as a bad
+      // credential — the established "the two failures are deliberately
+      // indistinguishable" posture of every other gate in this file.
+      if (!room) {
+        ack?.({ ok: false })
+        return
+      }
+      ack?.({ ok: true, url: dashboardUrlFor(room) })
+    })
+  }
+
+  /**
    * Every socket in one session's *participant* broadcast room. Plan 032a
    * introduced this alongside `dashboardRoomFor`: `slide:changed` used to go
    * out via a bare `io.emit` (every socket in the process), which was
@@ -1426,6 +1719,13 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     registerPresenceHandlers(socket)
     registerKickHandlers(socket)
     registerDashboardHandler(socket)
+    // Plan 032b. Registered for every socket, exactly like the per-room
+    // handlers above — the handler's own admin-code gate is what decides who
+    // gets anything out of it, not which sockets it happens to be attached
+    // to. Notably it needs no resolved room: the whole point of the home
+    // view is that it isn't scoped to one, so a socket that connected with
+    // no (or an unknown) room hint can still use it.
+    registerHomeHandler(socket)
   })
 
   // Backstop for a *hung* connection that never fires a clean `disconnect`
@@ -1465,6 +1765,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
     httpServer,
     io,
     bootSession,
+    adminCode,
     createSession: (sessionOptions: CreateSessionOptions = {}) => {
       const created = createSession({ deckUrl, ...sessionOptions })
       broadcastHomeUpdate(io)

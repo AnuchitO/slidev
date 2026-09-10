@@ -15,9 +15,11 @@ through
 [`plans/030-workshop-tracker-m5-hardening.md`](../../plans/030-workshop-tracker-m5-hardening.md),
 [`plans/prd-workshop-tracking.md`](../../plans/prd-workshop-tracking.md),
 and [`plans/pr-proposal-muan-companion.md`](../../plans/pr-proposal-muan-companion.md)
-(the full current-state writeup) for scope and history. Multi-session
-concurrency, an in-app session-setup/lobby flow, and a practice-mode slide
-remain proposed but unimplemented — see
+(the full current-state writeup) for scope and history. Plan **032a** adds
+single-process **multi-room** support on top of that — several concurrent,
+fully isolated sessions in one server — see "Multi-room" below. The
+cross-room home view that lists them, an in-app session-setup/lobby flow,
+and a practice-mode slide remain proposed but unimplemented — see
 [`plans/031-muan-companion-session-lifecycle-proposal.md`](../../plans/031-muan-companion-session-lifecycle-proposal.md).
 
 This package is **private** — it's not published, it's the workshop
@@ -327,13 +329,19 @@ no ack to report an error back through.
   since nothing in the existing `socket.io`/`connect`/`sirv` dependency
   footprint covers file uploads. Responds `201 { id, screenshotUrl }` on
   success.
-- `GET /uploads/:filename` — serves an uploaded screenshot back. Every file
-  is written under a **session-scoped `mkdtemp`-ed directory** (a fresh
-  temp dir per server instance/process, not a fixed path in the repo) with
-  a server-generated `${randomUUID()}.${ext}` name — the multipart client
-  `filename` field is never used to construct a path, so there's nothing
-  for a crafted `../`-laden client filename to traverse with on the write
-  side. On the read side, `src/uploads.ts`'s `resolveUploadPath` rejects
+- `GET /uploads/:sessionDir/:filename` — serves an uploaded screenshot back.
+  Every file is written under a **session-scoped `mkdtemp`-ed directory**
+  (as of plan 032a, one per live session rather than one per server
+  instance/process — see "Multi-room" below; still never a fixed path in
+  the repo) with a server-generated `${randomUUID()}.${ext}` name — the
+  multipart client `filename` field is never used to construct a path, so
+  there's nothing for a crafted `../`-laden client filename to traverse
+  with on the write side. The `:sessionDir` segment is likewise
+  server-generated (the `mkdtemp` suffix, **never** the room code, which
+  can come from an operator's env var and is a credential besides), and is
+  matched against live sessions' own directory names — a segment naming no
+  live session is a 404, not a filesystem probe. On the read side,
+  `src/uploads.ts`'s `resolveUploadPath` rejects
   any request whose filename doesn't match that exact
   `uuid.(png|jpg|webp)` shape _before_ `sirv` ever touches the filesystem —
   defense-in-depth on top of `sirv`'s own path normalization, mirroring the
@@ -343,6 +351,44 @@ no ack to report an error back through.
   requirement in the PRD for cross-restart persistence (§4 non-goals), so
   none was built; flagged as a 030 hardening candidate if disk usage over a
   long session turns out to matter.
+
+## Multi-room (plan 032a)
+
+One process can hold **several concurrent, fully isolated workshop
+sessions**. Every piece of per-workshop state (`session`, `participants`,
+`stepStatus`, `errorReports`, `pendingConnections`, the join-link QR cache,
+the uploads directory) lives on a `RoomState` in `src/session.ts`'s
+`Map<roomCode, RoomState>` — keyed by the **room code itself**, deliberately
+rather than by a separate internal id (`plans/031-...`'s Q2 recommendation).
+
+- **Creating a session.** `createSession()` (`src/session.ts`) is the only
+  way a session comes into existence, boot-time one included: `index.ts` →
+  `createMuanCompanionServer` → `createSession`. Codes not supplied by the
+  caller are generated (plan 031a's posture, now applied uniformly); an
+  already-taken room code throws rather than replacing or merging. A running
+  server exposes `createSession`/`destroySession` for launching and ending
+  further sessions at runtime.
+- **Which session is a socket in?** A Socket.io handshake query parameter,
+  `?roomCode=…` — the same parameter name the participant join link already
+  uses — read once at connection time onto `socket.data.roomCode` (mirroring
+  how `socket.data.participantId` is set once at join). A connection that
+  supplies none lands in the server's boot session, which is what keeps every
+  pre-032a client (the addon, the dashboard page) working unchanged. The hint
+  **is not a credential**: it only selects which session's auth config the
+  existing gates check against. `participant:join` still validates the room
+  code, and every `presenter:*` event, `dashboard:join`, and the `/dashboard`
+  HTTP route still require _that session's_ presenter code — so one
+  workshop's codes are worthless against another's.
+- **Broadcasts.** `state:update` goes to `dashboard:${roomCode}` and
+  `slide:changed` to `participants:${roomCode}`, instead of one global
+  dashboard room and a process-wide `io.emit`. A wrong-room payload is never
+  sent at all, rather than sent and filtered.
+- **`dashboard:home`.** A room reserved for a future cross-room home view
+  listing every live session (plan 032b); `buildHomeUpdate()` is its payload
+  builder and creating/destroying a session is what pushes it. **Nothing
+  joins that room yet, on purpose** — its payload lists every live room code,
+  so a cross-room view is strictly more privileged than any single
+  dashboard, and the credential gating it is 032b's decision to make.
 
 ## Real gap found: multi-tab presence (follow-up fix)
 
@@ -453,8 +499,14 @@ full event contract above: room-scoped `state:update`, both auth-rejection
 paths (wrong/missing room code, wrong/missing presenter code on each of
 `presenter:setSlide`/`presenter:setStep`/`presenter:resolveError`/
 `dashboard:join`), the presence events, and the `POST /api/screenshot` /
-`GET /uploads/:filename` contract (valid upload, unknown `participantId`,
-missing/oversized/unsupported-type file, and path-traversal rejection). It
+`GET /uploads/:sessionDir/:filename` contract (valid upload, unknown
+`participantId`, missing/oversized/unsupported-type file, and
+path-traversal rejection), plus plan 032a's multi-room isolation over real
+sockets (two concurrent sessions in one process: neither dashboard sees the
+other's roster/pending connections/help requests, neither room's presenter
+code works against the other, slide moves don't cross, resume tokens don't
+cross, and uploads land in — and are only servable from — their own
+session's directory). It
 also covers the multi-tab presence fix above directly: two sockets joined as
 the same participant, closing the second one leaves them `connected` (and
 doesn't even broadcast), only closing the _last_ one flips them `closed`;

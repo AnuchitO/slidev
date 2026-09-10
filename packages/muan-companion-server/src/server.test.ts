@@ -3,8 +3,10 @@ import type { Socket as ClientSocket } from 'socket.io-client'
 import type { DashboardJoinAck, MuanCompanionServer } from './server'
 import type { RoomState } from './session'
 import { Buffer } from 'node:buffer'
-import { rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { connect as netConnect } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join as joinPath } from 'pathe'
 import { io as ioClient } from 'socket.io-client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { buildHomeUpdate, createMuanCompanionServer, DEFAULT_DECK_URL } from './server'
@@ -32,6 +34,12 @@ const ONE_PIXEL_PNG = Buffer.from(
 // fail loudly rather than silently pass.
 const TEST_ROOM_CODE = 'room-secret'
 const TEST_PRESENTER_CODE = 'presenter-secret'
+// Plan 032b's third, cross-room credential (`adminAuth.ts`). Deliberately a
+// third distinct string for the same reason the two above are distinct from
+// each other: a test that reached the home view with a *presenter* code, or
+// a room's dashboard with the admin code, must fail loudly rather than
+// silently pass.
+const TEST_ADMIN_CODE = 'admin-secret'
 
 describe('createMuanCompanionServer', () => {
   let server: MuanCompanionServer
@@ -510,6 +518,248 @@ describe('createMuanCompanionServer', () => {
       expect(response.status).toBe(200)
       const body = await response.text()
       expect(body).toContain('<title>')
+    })
+  })
+
+  // Plan 032b: the cross-room home view — the admin credential, the
+  // `home:join` gate that finally gives `HOME_DASHBOARD_ROOM` real
+  // subscribers, the presentation list, and the `/home` page itself.
+  describe('home dashboard (plan 032b)', () => {
+    // A temp directory tree standing in for
+    // `SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR`. `presentations.test.ts`
+    // covers what does and doesn't count as a deck exhaustively; what's
+    // exercised here is only that the route is gated and that its response
+    // is the id+title projection, so one valid deck and one invalid folder
+    // is enough.
+    let presentationsDir: string
+
+    beforeEach(async () => {
+      // `joinPath`, not `join` — the socket-join helper above shadows the
+      // module-level import of `pathe`'s `join` inside this describe block.
+      presentationsDir = mkdtempSync(joinPath(tmpdir(), 'muan-home-test-'))
+      mkdirSync(joinPath(presentationsDir, 'intro'), { recursive: true })
+      writeFileSync(
+        joinPath(presentationsDir, 'intro', 'slides.md'),
+        '---\ntitle: Intro to Vue\naddons:\n  - muan-companion\n---\n',
+      )
+      // No `slides.md` — must never appear in the list.
+      mkdirSync(joinPath(presentationsDir, 'not-a-deck'), { recursive: true })
+
+      await stopServer()
+      await startServer({
+        roomCode: TEST_ROOM_CODE,
+        presenterCode: TEST_PRESENTER_CODE,
+        adminCode: TEST_ADMIN_CODE,
+        presentationsDir,
+      })
+    })
+
+    afterEach(() => {
+      rmSync(presentationsDir, { recursive: true, force: true })
+    })
+
+    describe('home:join (admin-code gating)', () => {
+      it('acks ok with an immediate session snapshot for a valid admin code', async () => {
+        const home = await connectClient()
+
+        const ack = await emitWithAck<{ ok: boolean, sessions?: { roomCode: string }[] }>(
+          home,
+          'home:join',
+          { adminCode: TEST_ADMIN_CODE },
+        )
+
+        expect(ack.ok).toBe(true)
+        // The snapshot mirrors `dashboard:join`'s: render immediately, don't
+        // wait for the next create/destroy.
+        expect(ack.sessions?.map(s => s.roomCode)).toEqual([TEST_ROOM_CODE])
+      })
+
+      it('acks { ok: false } and does not join for a wrong admin code', async () => {
+        const home = await connectClient()
+
+        const ack = await emitWithAck<{ ok: boolean, sessions?: unknown }>(
+          home,
+          'home:join',
+          { adminCode: 'not-the-admin-code' },
+        )
+
+        expect(ack).toEqual({ ok: false })
+
+        // Prove the *join* didn't happen, not just that the ack said no: a
+        // later broadcast must not reach this socket.
+        let received = false
+        home.on('home:update', () => {
+          received = true
+        })
+        server.createSession()
+        await new Promise<void>(resolve => setTimeout(resolve, 50))
+        expect(received).toBe(false)
+      })
+
+      it('acks { ok: false } for a missing admin code and for an empty payload', async () => {
+        const home = await connectClient()
+
+        expect(await emitWithAck(home, 'home:join', {})).toEqual({ ok: false })
+        expect(await emitWithAck(home, 'home:join', undefined)).toEqual({ ok: false })
+      })
+
+      it('does not accept a presenter code, and dashboard:join does not accept the admin code', async () => {
+        // The two credentials are not substitutes in either direction —
+        // 032b adds surface, it does not widen any existing gate.
+        const home = await connectClient()
+        expect(await emitWithAck(home, 'home:join', { adminCode: TEST_PRESENTER_CODE })).toEqual({ ok: false })
+
+        const dashboard = await connectClient()
+        const ack = await emitWithAck<DashboardJoinAck>(dashboard, 'dashboard:join', { presenterCode: TEST_ADMIN_CODE })
+        expect(ack.ok).toBe(false)
+      })
+
+      it('a server with no admin code configured generates one, and only that one works', async () => {
+        await stopServer()
+        await startServer({ roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE, presentationsDir })
+
+        const generated = server.adminCode
+        expect(generated).toBeTruthy()
+        expect(generated).toHaveLength(10)
+        expect(generated).not.toBe(TEST_ADMIN_CODE)
+
+        const home = await connectClient()
+        expect(await emitWithAck<{ ok: boolean }>(home, 'home:join', { adminCode: generated })).toMatchObject({ ok: true })
+      })
+
+      it('a server constructed with an explicitly empty admin code is permanently unreachable', async () => {
+        // Fail-closed: an empty configured code is honored verbatim and
+        // satisfied by nothing — including "nothing supplied".
+        await stopServer()
+        await startServer({ roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE, adminCode: '' })
+
+        const home = await connectClient()
+        expect(await emitWithAck(home, 'home:join', { adminCode: '' })).toEqual({ ok: false })
+        expect(await emitWithAck(home, 'home:join', {})).toEqual({ ok: false })
+        expect((await fetch(`${url}/home?code=`)).status).toBe(401)
+      })
+    })
+
+    describe('home:update broadcasts', () => {
+      it('reaches a joined home socket when a session is created and when it is destroyed', async () => {
+        const home = await connectClient()
+        await emitWithAck(home, 'home:join', { adminCode: TEST_ADMIN_CODE })
+
+        const created = waitFor<{ sessions: { roomCode: string }[] }>(home, 'home:update')
+        const extra = server.createSession()
+        expect((await created).sessions.map(s => s.roomCode).sort())
+          .toEqual([TEST_ROOM_CODE, extra.roomCode].sort())
+
+        const destroyed = waitFor<{ sessions: { roomCode: string }[] }>(home, 'home:update')
+        server.destroySession(extra.roomCode)
+        expect((await destroyed).sessions.map(s => s.roomCode)).toEqual([TEST_ROOM_CODE])
+      })
+
+      it('never carries a presenter code, even for a subscriber holding the admin code', async () => {
+        const home = await connectClient()
+        await emitWithAck(home, 'home:join', { adminCode: TEST_ADMIN_CODE })
+
+        const update = waitFor<unknown>(home, 'home:update')
+        server.createSession({ presenterCode: 'a-secret-presenter-code' })
+
+        const payload = JSON.stringify(await update)
+        expect(payload).not.toContain('a-secret-presenter-code')
+        expect(payload).not.toContain(TEST_PRESENTER_CODE)
+      })
+    })
+
+    describe('home:dashboardUrl (per-session link, on demand)', () => {
+      it('returns a working /dashboard URL for a live room, given the admin code', async () => {
+        const home = await connectClient()
+        await emitWithAck(home, 'home:join', { adminCode: TEST_ADMIN_CODE })
+
+        const ack = await emitWithAck<{ ok: boolean, url?: string }>(
+          home,
+          'home:dashboardUrl',
+          { adminCode: TEST_ADMIN_CODE, roomCode: TEST_ROOM_CODE },
+        )
+
+        expect(ack.ok).toBe(true)
+        expect(ack.url).toBe(`/dashboard?code=${encodeURIComponent(TEST_PRESENTER_CODE)}&roomCode=${encodeURIComponent(TEST_ROOM_CODE)}`)
+        // The point of the link is that it actually opens the dashboard.
+        expect((await fetch(`${url}${ack.url}`)).status).toBe(200)
+      })
+
+      it('re-checks the admin code per event rather than trusting an earlier home:join', async () => {
+        const home = await connectClient()
+        await emitWithAck(home, 'home:join', { adminCode: TEST_ADMIN_CODE })
+
+        expect(await emitWithAck(home, 'home:dashboardUrl', { roomCode: TEST_ROOM_CODE })).toEqual({ ok: false })
+        expect(await emitWithAck(home, 'home:dashboardUrl', { adminCode: 'wrong', roomCode: TEST_ROOM_CODE })).toEqual({ ok: false })
+      })
+
+      it('acks { ok: false } for an unknown room, indistinguishably from a bad credential', async () => {
+        const home = await connectClient()
+
+        expect(await emitWithAck(home, 'home:dashboardUrl', { adminCode: TEST_ADMIN_CODE, roomCode: 'no-such-room' })).toEqual({ ok: false })
+        expect(await emitWithAck(home, 'home:dashboardUrl', { adminCode: TEST_ADMIN_CODE })).toEqual({ ok: false })
+      })
+    })
+
+    describe('the /api/presentations route (admin-gated)', () => {
+      it('is rejected with 401 when the code is missing or wrong', async () => {
+        const missing = await fetch(`${url}/api/presentations`)
+        expect(missing.status).toBe(401)
+        expect(await missing.text()).toContain('Admin code required')
+
+        expect((await fetch(`${url}/api/presentations?code=wrong`)).status).toBe(401)
+        // A room's presenter code is not an admin code.
+        expect((await fetch(`${url}/api/presentations?code=${TEST_PRESENTER_CODE}`)).status).toBe(401)
+      })
+
+      it('returns the discovered decks as id + title only, never a path', async () => {
+        const response = await fetch(`${url}/api/presentations?code=${TEST_ADMIN_CODE}`)
+
+        expect(response.status).toBe(200)
+        const body = await response.json() as { presentations: { id: string, title: string }[] }
+        expect(body.presentations).toEqual([{ id: 'intro', title: 'Intro to Vue' }])
+        // The operator's directory layout must never cross the wire.
+        expect(JSON.stringify(body)).not.toContain(presentationsDir)
+      })
+
+      it('returns an empty list, not an error, when no presentations directory is configured', async () => {
+        // The opt-in property: a deployment that never sets the env var
+        // behaves exactly as it did before 032b.
+        await stopServer()
+        await startServer({ roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE, adminCode: TEST_ADMIN_CODE })
+
+        const response = await fetch(`${url}/api/presentations?code=${TEST_ADMIN_CODE}`)
+
+        expect(response.status).toBe(200)
+        expect(await response.json()).toEqual({ presentations: [] })
+      })
+    })
+
+    describe('/home HTTP route', () => {
+      it('is rejected with 401 without the admin code, and served with it', async () => {
+        const missing = await fetch(`${url}/home`)
+        expect(missing.status).toBe(401)
+        expect(await missing.text()).toContain('Admin code required')
+
+        expect((await fetch(`${url}/home?code=${TEST_PRESENTER_CODE}`)).status).toBe(401)
+
+        const served = await fetch(`${url}/home?code=${TEST_ADMIN_CODE}`)
+        expect(served.status).toBe(200)
+        expect(await served.text()).toContain('<title>')
+      })
+
+      it('carries the same CSP and baseline security headers as /dashboard', async () => {
+        const response = await fetch(`${url}/home?code=${TEST_ADMIN_CODE}`)
+
+        expect(response.headers.get('content-security-policy')).toContain('default-src \'self\'')
+        expect(response.headers.get('content-security-policy')).toContain('frame-ancestors \'none\'')
+        expect(response.headers.get('x-content-type-options')).toBe('nosniff')
+        expect(response.headers.get('x-frame-options')).toBe('DENY')
+      })
+
+      it('the admin code does not open any room\'s /dashboard', async () => {
+        expect((await fetch(`${url}/dashboard?code=${TEST_ADMIN_CODE}`)).status).toBe(401)
+      })
     })
   })
 

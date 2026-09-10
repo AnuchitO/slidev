@@ -41,7 +41,9 @@ view at `/home` (see "Home view (plan 032b)"). Two optional env vars belong
 to that home view: `SLIDEV_MUAN_COMPANION_ADMIN_CODE` (its credential —
 generated and logged at startup if unset) and
 `SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR` (opt-in deck discovery — unset
-means the presentation list is simply empty).
+means the presentation list is simply empty). Four more configure the deck
+launcher those discovered decks are started with — see "Deck launcher (plan
+032c)" for the table.
 
 `SLIDEV_MUAN_COMPANION_ROOM_CODE` and `SLIDEV_MUAN_COMPANION_PRESENTER_CODE` (see "Auth" below) — if
 either is unset, `index.ts` generates a fresh one (`src/codeGeneration.ts`,
@@ -402,9 +404,8 @@ rather than by a separate internal id (`plans/031-...`'s Q2 recommendation).
 
 A second static page at **`/home`**, one level above the per-session
 `/dashboard`: it lists every live session on this server plus the Slidev
-decks the server can find on disk. Read-only in this milestone — it starts
-no processes (that's 032c) and its "Present" buttons are visibly disabled
-and labelled as such rather than being fake affordances.
+decks the server can find on disk. 032b built it read-only; plan 032c (below)
+made its "Present" and "Stop" buttons live.
 
 ### `SLIDEV_MUAN_COMPANION_ADMIN_CODE` — the cross-room credential
 
@@ -425,9 +426,10 @@ not a reuse of either (`src/adminAuth.ts`):
   031a's posture): `index.ts` logs it at startup, noting whether it came
   from the env var or was generated. Set the env var for a stable `/home`
   bookmark across restarts.
-- It gates `/home`, the `home:join` socket event, and
-  `GET /api/presentations` today; per plan 032 it will also gate the deck
-  launcher (032c) and connect-key minting (032d). It confers **nothing**
+- It gates `/home`, the `home:join` socket event,
+  `GET /api/presentations`, the deck launcher (`POST /api/launch`,
+  `POST /api/stop` — 032c) and connect-key minting
+  (`POST /api/connect-key` — 032d). It confers **nothing**
   inside any single room — it is not accepted by `dashboard:join`, by any
   `presenter:*` event, by `participant:join`, or by the `/dashboard` HTTP
   route. Nothing about the existing per-room gates changed; 032b adds
@@ -506,13 +508,137 @@ point" — and 032c will `spawn` inside whatever discovery returns.
 
 ### What the page shows
 
-Presentations (disabled "Present" affordances, labelled "coming soon"), live
-sessions (room code, deck URL, participant/connected/needs-attention counts,
-current slide, and an "Open dashboard" action), and a "Connect a deck"
+Presentations (each with a live **Present** button — 032c), live sessions
+(room code, deck URL, participant/connected/needs-attention counts, current
+slide, and **Open dashboard** / **Stop** actions), and a "Connect a deck"
 panel. That last panel **feature-detects** `POST /api/connect-key` — 032d
-builds it in a parallel workstream and it may not be deployed in a given
+built it in a parallel workstream and it may not be deployed in a given
 build — and shows a clear "not available yet" state rather than a button
 that 404s.
+
+## Deck launcher (plan 032c)
+
+Flow A: the operator picks a discovered presentation on `/home` and clicks
+Present; the server starts `slidev` for that folder itself, waits for it to
+come up, mints a session for it exactly like every other session, and hands
+back the presenter and participant URLs. Stop tears it down again.
+
+> **This surface spawns operating-system processes in response to an HTTP
+> request, and it needs its own security review** (plan 032's sequencing
+> table gives that its own row, 032e, alongside 032d's connect-key
+> bootstrap). Everything below is written to be checked, not trusted.
+
+### Wire surface
+
+- **`POST /api/launch`** with `{ presentationId }` → `201` and
+  `{ roomCode, presenterCode, presenterUrl, participantUrl }` — field for
+  field the same shape `POST /api/register` returns, because both answer the
+  same question and `/home` consumes them with the same code path.
+  - `404 { error: 'unknown presentation' }` for an id that doesn't resolve —
+    **with no spawn attempted**. Also the answer when discovery isn't
+    configured at all.
+  - `503 { reason: 'at-capacity' }` past the concurrency cap.
+  - `502 { reason: 'timeout' | 'exited-early' | 'spawn-failed' }` for a deck
+    that wouldn't start, carrying the tail of the child's own output.
+- **`POST /api/stop`** with `{ roomCode }` → `200 { stopped: true, hadProcess }`.
+  `hadProcess: false` is an ordinary answer, not an error: a Flow-B session
+  (032d) is a deck this server didn't start, so there is nothing of ours to
+  kill — the session is destroyed and the operator's own `slidev` is left
+  alone. `404` for an unknown room.
+- Both are **admin-gated**, credential in the
+  `x-muan-companion-admin-code` header or `?code=`, checked before the body
+  is read, before the filesystem is touched, and before anything is spawned.
+- Flat paths with the subject in the body, not `/api/presentations/:id/launch`:
+  it matches every other JSON route here (there is no path parameter anywhere
+  in this server), it keeps identifiers out of access logs, and it avoids
+  living under the `/api/presentations` prefix whose `requireAdminCode` mount
+  reads only `?code=`.
+
+### How the deck is actually started
+
+- **`child_process.spawn`, never `exec`, never a shell string.** Command and
+  arguments are separate argv entries and there is no `shell` option — the
+  injectable `SpawnDeckProcess` type doesn't even have one to pass.
+- **The directory comes only from `resolvePresentationDir`.** The launcher
+  never sees an id; the route resolves it, and an unresolvable id 404s before
+  any spawn. There is no `join(root, id)` anywhere in the feature.
+- **Argv is flags only — there is no `slidev dev` subcommand.** The CLI's dev
+  server is its _default_ command (`packages/slidev/node/cli.ts`); a literal
+  `dev` would be parsed as the `[entry]` deck file. So:
+  `--port=<allocated> --open=false --log=warn` (plus `--remote=` when opted
+  in). `--open=false` as one token, not `--open false` — yargs would read the
+  spaced form as a bare flag plus a positional, and that positional is the
+  entry file.
+- **The binary is the deck's own.** `resolveSlidevBinary` walks
+  `node_modules/.bin/slidev` from the deck folder up to the filesystem root —
+  the same resolution a shell running `pnpm exec slidev` in that folder
+  performs — so a deck pinned to an older Slidev isn't started by a newer
+  binary. Falls back to `PATH`, which yields a clean `ENOENT` (reported as
+  `spawn-failed`) rather than a mystery timeout.
+  `SLIDEV_MUAN_COMPANION_SLIDEV_BIN` overrides all of it. Not Windows-capable
+  (`slidev.CMD` needs `shell: true`, which this deliberately never uses).
+- **Ports are kernel-assigned.** Bind `:0`, read the port back, close, pass it
+  to `--port=`. Two launches back-to-back cannot collide. The TOCTOU window
+  between closing the probe and the child binding is real and **accepted**:
+  it's the same approach the rest of this ecosystem uses, and `--port=` makes
+  the CLI set Vite's `strictPort`, so a lost race fails loudly into the
+  captured output instead of silently listening somewhere else.
+- **Readiness is an HTTP poll**, not stdout scraping: any HTTP response on
+  the allocated port means ready. Vite's "ready" line is ANSI-formatted,
+  version-dependent, and suppressed entirely at `--log=warn` — tying launch
+  success to its wording would make a routine Slidev upgrade break every
+  launch. 30s timeout (a cold dependency-optimizer run is genuinely slow),
+  and the probe aborts early if the child exits, so a broken deck fails in
+  milliseconds rather than after the full wait.
+- **stdout and stderr are captured** into a 4 KiB ring-buffered tail, which
+  is what a failed launch reports. Both streams are consumed (not just
+  stderr) because an unread pipe eventually blocks the child.
+
+### Environment
+
+| Variable                                  | Default                  | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SLIDEV_MUAN_COMPANION_PUBLIC_URL`        | `http://localhost:$PORT` | Where _this_ server is reachable **from a participant's browser**. Injected into every spawned deck as `VITE_SLIDEV_MUAN_COMPANION_SERVER_URL`, which is how the addon finds its way back with no change to `client.ts`. Vite inlines `VITE_*` into the _browser_ bundle, so this must be the externally-reachable URL, not something loopback-derived. Its scheme+host is also the origin a launched deck's own URL is built from (child's port substituted). The localhost default is the same deliberately-local-but-well-formed posture as `SLIDEV_MUAN_COMPANION_DECK_URL`. |
+| `SLIDEV_MUAN_COMPANION_MAX_SPAWNED_DECKS` | `4`                      | Concurrency cap, counting launches still waiting on readiness. Past it, `POST /api/launch` returns 503 rather than degrading silently. 4 is sized to what a Vite dev server costs (a few hundred MB each) on the 2 GB class of host this ships to. A non-numeric or non-positive value falls back to the default rather than becoming `NaN` — which every `>=` would be false for, i.e. no cap at all.                                                                                                                                                                           |
+| `SLIDEV_MUAN_COMPANION_SPAWN_REMOTE`      | unset (off)              | `true` adds `--remote=` so spawned decks bind every interface instead of `localhost`. **A real workshop needs this on** — the participant URL is only reachable from other devices if the deck listens on a reachable interface — but "a dashboard click silently opens a port on every interface" is an operator's decision to make knowingly. Only the exact string `true` enables it.                                                                                                                                                                                         |
+| `SLIDEV_MUAN_COMPANION_SLIDEV_BIN`        | unset                    | Explicit CLI path; see above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+
+### Lifecycle
+
+Every child is tracked in a module-level registry keyed by its session's room
+code (plus a holding set for launches that have spawned but don't have a
+session yet — those count against the cap and are killable too).
+
+- **Crash/kill-from-outside** → the child's `exit` tears down its session
+  through the _same_ `destroySession` + `home:update` broadcast pairing a
+  deliberate stop uses, so an open `/home` sees the row disappear either way.
+  Plan 032: "don't leave a Session pointing at a dead process."
+- **Stop** → `SIGTERM`, escalating to `SIGKILL` after 5s, then destroy the
+  session. A deliberate stop is flagged so its own `exit` isn't mistaken for
+  a crash.
+- **`SIGTERM`/`SIGINT`** → `index.ts` kills every tracked child before
+  exiting, so a restart doesn't leave zombie `slidev` processes holding ports
+  the new instance can't reuse. `process.once`, so a second Ctrl-C still hits
+  Node's default handler; `process.exit(128 + signum)`, because registering
+  any handler suppresses the default terminate-on-signal and a
+  cleanup-only handler would leave the server running.
+
+### What this does _not_ do
+
+**Launching a deck is arbitrary code execution by design, not by accident.**
+A Slidev deck is a Vite project: `vite.config.ts`, `setup/*.ts`, a local
+theme and npm dependencies all run as this server's user the moment `slidev`
+starts. Nothing here sandboxes that, and nothing could without a
+container/user boundary this package doesn't own. The real trust boundary is
+**the discovery root plus the admin code** — an operator who points
+`SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR` at a directory someone else can
+write to has handed that person code execution on this host.
+
+Flow A also assumes the spawned deck's port is directly reachable at the same
+host as this server. A deployment terminating TLS at a reverse proxy will get
+a deck URL of `https://proxy-host:<ephemeral port>` that the proxy isn't
+forwarding; use Flow B (032d) there, where the operator supplies the deck's
+real URL.
 
 ## Real gap found: multi-tab presence (follow-up fix)
 

@@ -144,6 +144,33 @@ participant). Both packages now sit at 99%/100% statement coverage
 (174 + 50 = 224 tests total). Full details in each package's own README
 and git history.
 
+**Post-ship: presentation launcher, multi-room, and connect-key registration
+(plan 032, built on 031's Q2 "Option B").** The single-global-session
+limitation listed below as a known risk is now substantially narrowed. The
+server can hold several concurrent, fully isolated workshop sessions in one
+process (`session.ts`'s singletons re-keyed into `Map<roomCode, RoomState>` —
+one room's presenter code, participants, step status, error feed, and
+uploads directory are now provably unreachable from any other room, covered
+by dedicated cross-room-isolation tests). On top of that, a new cross-room
+**admin credential** (distinct from any room's presenter code) gates a new
+`/home` dashboard that lists every live session at a glance, plus two ways
+to get a deck into that list without hand-wiring env vars: **Flow A**, where
+the server itself discovers Slidev decks under a configured directory and
+spawns one as a child process when the operator clicks Present (readiness-
+probed, output-captured, capped at a configurable concurrency limit, torn
+down cleanly on crash or an explicit Stop); and **Flow B**, where a deck
+already running elsewhere (the operator's own laptop, say) registers itself
+into the same dashboard using a one-time, five-minute connect key minted
+from `/home` — no server-side process to manage for that case. A dedicated
+adversarial security-review pass targeted specifically at these two new
+surfaces (the connect-key bootstrap and the deck-spawning endpoint, both
+explicitly the highest-risk additions in this batch) turned up no actionable
+HIGH/MEDIUM findings. See
+[`plans/032-muan-companion-presentation-launcher-proposal.md`](./032-muan-companion-presentation-launcher-proposal.md)
+for the full design writeup. Multi-session concurrency is accordingly
+removed from "Explicitly deferred" below; what's *still* deferred from 031
+is the in-app lobby/waiting-room and practice-mode slide (031's Q3/Q4).
+
 **On the rename:** partway through this work the project was renamed from
 "workshop-tracker" to "muan-companion" (packages, env vars, localStorage keys,
 CSS class prefixes, and a follow-up pass that also dropped a redundant
@@ -200,28 +227,36 @@ something to discover piecemeal in a lockfile diff.
 
 ## Testing
 
-Run just now against this branch:
+Re-run against this branch's current tip, after plan 032 landed:
 
 ```
-$ pnpm --filter muan-companion-server test -- --run
- Test Files  7 passed (7)
-      Tests  174 passed (174)
+$ pnpm --filter muan-companion-server test
+ Test Files  11 passed (11)
+      Tests  344 passed (344)
 
-$ pnpm --filter slidev-addon-muan-companion test -- --run
- Test Files  9 passed (9)
-      Tests  50 passed (50)
+$ pnpm --filter slidev-addon-muan-companion test
+ Test Files  10 passed (10)
+      Tests  63 passed (63)
 
-$ pnpm eslint packages/muan-companion-server packages/addon-muan-companion
+$ pnpm --filter muan-companion-server build
+✔ Build complete
+
+$ npx eslint packages/muan-companion-server packages/addon-muan-companion --cache
 (no output — clean)
 
-$ pnpm verify   # build + typecheck + lint + test, run at the repo root
-(all green — 465/465 tests across the entire monorepo, confirming no
-conflict with existing Slidev functionality, not just this branch's own)
+$ npx vue-tsc --noEmit
+(no output — clean)
 ```
 
-224 tests pass across both packages (99.0%/100% statement coverage
-respectively), no lint findings, zero regressions against Slidev's own
-core test suite.
+407 tests pass across both packages, no lint findings, no type errors.
+The multi-room re-keying (plan 032a) added dedicated cross-room-isolation
+coverage (a wrong room's dashboard/presenter code/resume token/help-request
+id never reaches another room's state); the deck launcher (032c) tests
+port allocation, readiness timeout, the concurrency cap, and a crashed
+child correctly tearing its session down, via an injectable spawn function
+rather than a real `slidev` process; the connect-key flow (032d) tests
+single-use/TTL expiry and that every failure reason (expired, reused,
+never-existed, malformed body) produces the identical response.
 
 `packages/muan-companion-server/src/server.test.ts` spins up real
 `socket.io-client` connections and real multipart `fetch()` requests against
@@ -253,17 +288,17 @@ are added.
 
 ## Explicitly deferred / non-goals honored from the PRD
 
-- **Multi-session / multi-room concurrency** — PRD §4 non-goal and §14 open
-  question. This ships a single global session by design; see
-  [`plans/031-muan-companion-session-lifecycle-proposal.md`](./031-muan-companion-session-lifecycle-proposal.md)
-  for a proposed direction (in-app code generation with a real setup
-  bootstrap, a presenter-configurable "waiting room" lobby before Start
-  Presenting, true single-process multi-room support, and a practice-mode
-  slide) — none of it implemented yet, pending a scope/priority decision.
+- **In-app lobby/waiting-room and a skippable practice-mode slide** — 031's
+  Q3/Q4, proposed but not yet built. See
+  [`plans/031-muan-companion-session-lifecycle-proposal.md`](./031-muan-companion-session-lifecycle-proposal.md).
 - **Cross-restart state persistence** — PRD §4/§9/§14 accept in-memory-only
-  state for v1; this branch does not add a database or durable store.
+  state for v1; this branch does not add a database or durable store. A
+  restarted server has no sessions for a previously-issued connect key or
+  spawned-deck handle to reattach to either (plan 032).
 - **Grading / scoring / certification** — out of scope per PRD §4, not
   touched here.
+- **Remote-host deck launching.** Plan 032's Flow A spawns decks only on the
+  sync server's own machine/filesystem — no SSH-to-another-host support.
 
 ## Known limitations / risks for a reviewer to weigh
 
@@ -279,15 +314,21 @@ are added.
   the presenter to regenerate one from within the app without a restart. No
   per-participant tokens either — the room code is one shared secret for
   everyone.
-- **Single global session only.** The server supports exactly one active
-  workshop at a time; it can't run two independent concurrent sessions off
-  one process yet (see "multi-session concurrency" above).
 - **LAN-workshop-appropriate auth, not SaaS-grade.** No rate-limiting on
-  join/presenter-code attempts, and no TLS is provided by the server itself
-  (run behind a TLS-terminating proxy for any non-`localhost` deployment).
-  This is a documented, deliberate scope boundary, not an oversight — see
-  `packages/muan-companion-server/README.md`'s "Auth" section for the full
-  threat model.
+  join/presenter-code attempts (the one exception is `POST /api/register`'s
+  connect-key endpoint, which is rate-limited — see plan 032), and no TLS is
+  provided by the server itself (run behind a TLS-terminating proxy for any
+  non-`localhost` deployment). This is a documented, deliberate scope
+  boundary, not an oversight — see `packages/muan-companion-server/README.md`'s
+  "Auth" section for the full threat model.
+- **Launching a deck is arbitrary code execution by design (plan 032, Flow
+  A).** A Slidev deck is a Vite project — its `vite.config.ts`/`setup/*.ts`
+  run as this server's own user the moment a spawned deck starts. The real
+  trust boundary is the discovery root directory plus the admin code, not
+  anything the launcher itself can sandbox; an operator who points the
+  discovery directory at a location others can write to has handed them
+  code execution on the host. Documented explicitly in `deckLauncher.ts`'s
+  own header comment for exactly this reason.
 - **Kicking a participant isn't banning them.** "Remove" deletes their
   roster record (so a mere reconnect can't silently resume them), but
   anyone who still holds the room code can rejoin as a brand-new

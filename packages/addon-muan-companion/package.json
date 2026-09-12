@@ -1,0 +1,27 @@
+{
+  "name": "slidev-addon-muan-companion",
+  "type": "module",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Slidev addon: syncs the presenter's current slide to every connected participant (M1 of the workshop-tracking initiative)",
+  "keywords": [
+    "slidev-addon",
+    "slidev"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "@slidev/client": "workspace:*",
+    "@slidev/types": "workspace:*",
+    "@vitest/coverage-v8": "4.1.10",
+    "jsdom": "^30.0.1",
+    "vitest": "catalog:dev",
+    "vue": "catalog:frontend",
+    "vue-router": "catalog:frontend"
+  }
+}

@@ -102,6 +102,78 @@ hardening intent.
 - **Global-install E2E disabled in `smoke.yml`** — a documented pnpm-v11
   limitation, not a defect.
 
+## Workshop Tracking initiative (026-030)
+
+Generated on 2026-08-26 against commit `a8d8ff71`, from a PRD supplied by the
+owner (AnuchitO) rather than from a read-only audit — see
+[`plans/prd-workshop-tracking.md`](./prd-workshop-tracking.md) for the full
+source doc. Unlike the audit-driven plans above, these five are strictly
+sequential milestones of one feature (turning Slidev into a live, tracked
+client–server workshop tool: slide sync, step acknowledgment, error
+reporting, presence, auth/resilience) — cherry-picking out of order isn't
+meaningful the way it is for the hardening plans above.
+
+| Plan | Title | Priority | Effort | Risk | Depends on | Status |
+|------|-------|----------|--------|------|------------|--------|
+| 026 | M1 — Slide sync (addon + sync server skeleton) | P1 | M | MED | — | DONE |
+| 027 | M2 — Participant identity + step tracking | P1 | M-L | MED | 026 | DONE |
+| 028 | M3 — Error reporting (text + screenshot) | P2 | M | MED | 027 | DONE |
+| 029 | M4 — Presence tracking + presenter/dashboard auth | P2 | M | MED | 027 | DONE |
+| 030 | M5 — Reconnect/resume + load testing + hardening | P3 | M | LOW-MED | 026, 027, 028, 029 | DONE |
+
+**Dependency notes**: 026 → 027 is a hard sequence (027 needs 026's
+transport). 028 and 029 both depend on 027 but not on each other — they can
+be built in either order or in parallel by different sessions, since error
+reporting and presence/auth touch different parts of the server and addon.
+030 depends on all four since it hardens reconnect + load + auth across the
+whole stack and performs the PRD's final end-to-end acceptance pass.
+
+**Known, deliberately deferred security gap — now fully closed**: 026-028
+shipped with presenter actions and the dashboard route unauthenticated by
+design (documented inline as `NOTE(security)` comments each plan
+introduces). 029 closed this for every surface that existed in its own
+worktree at the time it landed (`presenter:setSlide`, `presenter:setStep`,
+`participant:join`, `dashboard:join`, and the `/dashboard` HTTP route — see
+that package's README for the mechanism). 029 was implemented concurrently
+with 028 in a separate worktree and couldn't see 028's `presenter:resolveError`
+event — its own plan file flagged this as a merge-order caveat requiring a
+post-merge `NOTE(security)` grep. That merge has now happened: 028 and 029
+were reconciled together (see the merge commit on `feat/workshop-tracker`),
+`presenter:resolveError` is gated behind the same presenter-credential check
+as every other `presenter:*` handler, and `grep -rn "NOTE(security)"` across
+`packages/` returns nothing outside historical plan documents. Do not
+reintroduce an ungated `presenter:*`/dashboard-facing handler without
+updating this note.
+
+**Initiative complete (030 landed)**: M1-M5 are all done — slide sync, step
+tracking, error reporting (text + screenshot), presence, presenter/room-code
+auth, participant reconnect/resume, and load-verified performance (50-100
+concurrent participants, both measured latencies under ~11ms against the
+PRD's ~1s target — see `packages/muan-companion-server/scripts/load-test-results.md`,
+re-runnable via `pnpm --filter muan-companion-server load-test`). Every
+PRD §15 acceptance bullet has been walked live against the full stack
+(sync server + demo deck + dashboard, run as persistent dev processes, not
+a `slidev build` export). This is the whole tracked-feature-set status, not
+just five plan files checked off. (Package/env-var/CSS names were later
+renamed workshop-tracker → muan-companion — a pure text substitution, no
+behavior change; this note and the historical plan files below keep
+whichever name was current when each was written.)
+
+**Post-ship follow-ups**: a Material Design UI pass + a redesign of error
+reporting into a two-way "Ask for Help" flow (confirm/reopen, presenter↔
+participant messaging), a shareable join link + QR code on the dashboard,
+and self-generating room/presenter codes have all since landed on top of
+030 — see [`plans/pr-proposal-muan-companion.md`](./pr-proposal-muan-companion.md)
+for the full PR-ready writeup. Multi-session concurrency, an in-app
+session-setup/lobby flow, and a practice-mode slide remain proposed but
+unimplemented — see
+[`plans/031-muan-companion-session-lifecycle-proposal.md`](./031-muan-companion-session-lifecycle-proposal.md).
+A further proposal builds on 031's multi-session groundwork to turn the
+server into a presentation launcher — a dashboard listing Slidev decks it
+can start itself, plus a connect-key flow for decks started elsewhere to
+register into the same dashboard — see
+[`plans/032-muan-companion-presentation-launcher-proposal.md`](./032-muan-companion-presentation-launcher-proposal.md).
+
 ## Direction findings (not planned here — options for the maintainer)
 
 Surfaced during the audit but out of the "fix" set; each is grounded in repo

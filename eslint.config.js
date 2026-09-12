@@ -32,6 +32,13 @@ export default antfu({
       'packages/create-app/template/package.json',
       // VSCE and OVSX do not support pnpm catalog when reading `@types/vscode`'s version.
       'packages/vscode/package.json',
+      // socket.io / socket.io-client aren't in the shared catalog yet (plan
+      // 026: deliberately pinned as direct versions in these two new
+      // packages — see plans/026-workshop-tracker-m1-slide-sync.md's
+      // "Current state" — adding them to the catalog is a separate decision
+      // for the maintainer, out of scope for that plan).
+      'packages/muan-companion-server/package.json',
+      'packages/addon-muan-companion/package.json',
     ],
   })
   .remove('antfu/markdown/rules')

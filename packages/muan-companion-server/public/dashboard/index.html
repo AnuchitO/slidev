@@ -1,0 +1,1209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Muan Companion — Dashboard</title>
+<!--
+  Auth (plan 029 / PRD §12): the HTTP GET for this page itself is gated by
+  `server.ts`'s `requireDashboardCode` middleware on a `?code=` query param
+  (a 401 is returned before this HTML is ever served if it's missing/wrong —
+  see that function's own comment for why a query param over HTTP Basic).
+  The *same* code is read back out of `location.search` below and sent as
+  `presenterCode` on the `dashboard:join` socket event, which is gated
+  server-side by the identical presenter-credential check `presenter:*`
+  events use — opening the dashboard is exactly as privileged as moving
+  everyone's slide. One credential, one place it lives (the URL the operator
+  hands out), never embedded in this file itself.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0b0d12;
+    --panel: #11141b;
+    --border: #262b36;
+    --text: #e6e9ef;
+    --muted: #8b93a7;
+    --idle: #4b5262;
+    --copied: #c9930f;
+    --done: #2fa86b;
+    --offline: #6b2f3a;
+    --error: #f28b82;
+    --presence-visible: #2fa86b;
+    --presence-hidden: #c9930f;
+    --presence-closed: #6b2f3a;
+
+    /*
+     * Error-reporting design tokens (Google-style / Material redesign,
+     * scoped to the "Help requests" section — see `.error-reports` below;
+     * the class/id names throughout this section still say "error" rather
+     * than "help-request" — they predate the "Ask for Help" kind/status
+     * redesign and renaming every one of them is a larger diff than the
+     * actual behavior change warrants, since none of them are user-visible
+     * copy). The same small token set (radius scale, elevation shadows,
+     * semantic color roles, type stack) is applied identically in the
+     * participant widget (`ErrorReportWidget.vue`'s scoped `<style>`), which
+     * is how the two surfaces read as one design system despite being
+     * unable to share an actual stylesheet. Surface color intentionally
+     * stays `--panel` (this page's existing card background) rather than
+     * copying the widget's own surface token — this section still has to
+     * nest inside the *unchanged* rest of the dashboard (table, counts,
+     * codes panel), while the widget floats over arbitrary slide content
+     * and needed its own elevated surface.
+     *
+     * `--wt-warning` is kept defined even though this file's own markup no
+     * longer references it directly (the section heading icon moved to a
+     * neutral "conversation" glyph in `--wt-primary` now that the section
+     * covers both `problem` and `question` kinds, not just warnings) — it
+     * stays part of the shared token contract with the widget described
+     * above, and status/kind colors below intentionally reuse the existing
+     * `--error`/`--wt-primary`/`--wt-success` roles rather than reaching for
+     * it, per this redesign's instruction to reuse established roles
+     * instead of inventing new ones.
+     */
+    --wt-primary: #8ab4f8;
+    --wt-on-primary: #062e6f;
+    --wt-warning: #fdd663;
+    --wt-success: #81c995;
+    --wt-radius-sm: 8px;
+    --wt-radius-md: 16px;
+    --wt-radius-full: 999px;
+    --wt-elevation-1: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px 1px rgba(0, 0, 0, 0.15);
+    --wt-elevation-2: 0 1px 2px rgba(0, 0, 0, 0.3), 0 2px 6px 2px rgba(0, 0, 0, 0.15);
+    --wt-font: 'Google Sans', Roboto, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 28px 0 10px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  .counts {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  .count {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    min-width: 120px;
+  }
+  .count .n { font-size: 22px; font-weight: 600; display: block; }
+  .count .l { color: var(--muted); font-size: 12px; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  th { color: var(--muted); font-weight: 500; }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    color: #0b0d12;
+    font-weight: 600;
+  }
+  .badge.idle { background: var(--idle); color: #e6e9ef; }
+  .badge.copied { background: var(--copied); }
+  .badge.done { background: var(--done); }
+  .badge.offline { background: var(--offline); color: #e6e9ef; }
+  .badge.presence-visible { background: var(--presence-visible); }
+  .badge.presence-hidden { background: var(--presence-hidden); }
+  .badge.presence-closed { background: var(--presence-closed); color: #e6e9ef; }
+  /* `pending` (someone's socket connected, `participant:connecting` fired,
+     but they haven't submitted the join form yet — see the render
+     function's own comment) reuses the neutral `--idle` tone rather than a
+     new color: it's not a status worth alarming over, just "not resolved
+     into a real participant yet". */
+  .badge.pending { background: var(--idle); color: #e6e9ef; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; }
+  .conn { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .conn.live { color: var(--done); }
+  .pending-name { color: var(--muted); font-style: italic; }
+  /* "Remove" — the presenter's kick action per roster row. Deliberately the
+     page's only *destructive*-toned button (the `--error` role, otherwise
+     reserved for the help-request feed's "needs attention" state) — this is
+     the one action on this page that ends someone's connection, and it
+     should read as consequential, not blend in with the neutral
+     `.code-copy`-style buttons elsewhere. */
+  .kick-button {
+    background: none;
+    border: 1px solid var(--error);
+    border-radius: 4px;
+    color: var(--error);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 8px;
+  }
+  .kick-button:hover { background: rgba(242, 139, 130, 0.12); }
+
+  .status-cell {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .step-elapsed {
+    font-size: 11px;
+    color: var(--muted);
+  }
+  /* Nudges the instructor toward checking in — plain "copied" gets no
+     special color, but sitting there for a while (thresholds below) does. */
+  .step-elapsed.stuck-warn { color: var(--copied); }
+  .step-elapsed.stuck-alert { color: var(--error); font-weight: 600; }
+
+  .codes-panel {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+    padding: 10px 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  .codes-panel .code-item { display: flex; align-items: center; gap: 6px; }
+  .codes-panel .code-label { color: var(--muted); }
+  .codes-panel code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+  .code-copy {
+    background: none;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: 4px;
+    color: inherit;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 1px 6px;
+  }
+
+  /*
+   * "Share this workshop" — deliberately a *separate*, much bigger surface
+   * from `.codes-panel` above rather than an extra row bolted onto it: that
+   * panel is a small reference the instructor glances at ("what was the
+   * code again"), while this one is meant to be projected/screen-shared to
+   * an entire room of participants standing across it trying to scan a
+   * phone camera at it, so every dimension here (QR size, link font size,
+   * padding) is sized for "readable from the back of the room," not for a
+   * compact settings-style row. Placed ahead of `.counts` in the markup
+   * below — "get everyone in the room" is the very first thing an
+   * instructor does at the start of a session, before there's anything in
+   * the counts/table worth looking at yet.
+   */
+  .share-panel {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+    padding: 20px 24px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--wt-radius-md);
+    box-shadow: var(--wt-elevation-1);
+  }
+  .share-qr {
+    /* White padding around the QR image regardless of the page's dark theme
+       — a QR reader needs real light-on-dark contrast at its quiet zone, and
+       this page's own `--panel`/`--bg` are both dark, which a raw
+       `<img>` with a transparent PNG background would sit directly on top
+       of. `QRCode.toDataURL`'s default PNG background is white, so this
+       just makes sure nothing here fights that. */
+    flex: 0 0 auto;
+    width: 176px;
+    height: 176px;
+    padding: 10px;
+    background: #fff;
+    border-radius: var(--wt-radius-sm);
+    display: block;
+  }
+  .share-info {
+    flex: 1 1 320px;
+    min-width: 0;
+  }
+  .share-panel h2 {
+    margin: 0 0 4px;
+    font-size: 18px;
+  }
+  .share-hint {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .share-link-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .share-link {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--wt-primary);
+    text-decoration: none;
+    word-break: break-all;
+    padding: 6px 10px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: var(--wt-radius-sm);
+  }
+  .share-link:hover { text-decoration: underline; }
+  /*
+   * `.code-copy` itself (size, border, cursor) is reused as-is from the
+   * small codes-panel above — same visual language, this button just needs
+   * to be a bit more clickable at this panel's larger scale.
+   */
+  .share-link-row .code-copy {
+    font-size: 13px;
+    padding: 5px 12px;
+  }
+
+  /*
+   * "Help requests" section only — see the `--wt-*` token comment in
+   * `:root` above. `.error-reports` opts this section into the shared
+   * Material type stack without touching the rest of the page's typography.
+   */
+  .error-reports {
+    font-family: var(--wt-font);
+  }
+  .error-reports h2 {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .error-reports h2 .wt-icon {
+    /* Was `--wt-warning` pre-redesign, back when this section only ever
+       held error reports. Now that a card can equally be a plain
+       `question`, a single warning-colored heading icon would misrepresent
+       half the feed as alarming when it isn't — `--wt-primary` reads as
+       neutral "here's the conversation", matching the chat-bubble glyph
+       swapped in below (see the `<h2>` markup's own comment). */
+    color: var(--wt-primary);
+  }
+  .wt-icon {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    display: block;
+  }
+  .error-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .error-card {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    /* Default left-border color is the "needs attention" red — correct for
+       both `open` and `reopened` (the two statuses that get no override
+       below), which is exactly the pairing the redesign wants: `reopened`
+       reads with the same urgency as a fresh `open` report at the
+       card-border level, distinguished instead by the status chip inside
+       (see `.status-chip.status-reopened` below) rather than by a whole
+       separate color that would compete with the red/blue/green semantic
+       roles this file otherwise reuses. */
+    border-left: 3px solid var(--error);
+    border-radius: var(--wt-radius-md);
+    padding: 12px 14px;
+    box-shadow: var(--wt-elevation-1);
+  }
+  .error-card.awaiting {
+    /* `awaiting_confirmation`: already actioned by the presenter, not yet
+       final — blue (the same `--wt-primary` role as the resolve button
+       always used) reads as "in flight" without the dimmed/muted treatment
+       `.resolved` gets below, since this isn't done yet and shouldn't look
+       like it's faded out of relevance. */
+    border-left-color: var(--wt-primary);
+  }
+  .error-card.resolved {
+    opacity: 0.6;
+    border-left-color: var(--idle);
+    box-shadow: none;
+  }
+  .error-thumb {
+    flex: 0 0 auto;
+    width: 72px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: var(--wt-radius-sm);
+    border: 1px solid var(--border);
+    cursor: zoom-in;
+    background: #000;
+  }
+  .error-body {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .error-meta {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  /*
+   * `kind-tag` (problem vs. question) is deliberately left uncolored
+   * (`--muted`, same as the rest of `.error-meta`) rather than given its own
+   * semantic color — color is reserved for `.status-chip` below, which is
+   * the thing that actually needs to grab the instructor's eye. Two colored
+   * chips side by side (kind *and* status) would fight for attention and
+   * make it harder to scan a row of cards for "which ones are red" at a
+   * glance; shape (a distinct icon) is enough to tell problem and question
+   * apart once you're already reading a given card.
+   */
+  .kind-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .kind-tag .wt-icon { width: 13px; height: 13px; }
+  /*
+   * `status-chip`: the one colored badge per card, reusing the existing
+   * `--error`/`--wt-primary`/`--wt-success` role tokens (not new colors —
+   * per this redesign's brief) so a card's color always means the same
+   * thing it already means everywhere else on this page (red = needs you,
+   * blue = in progress, green = done). `open` and `reopened` intentionally
+   * share the red role — see `.error-card`'s own comment above for why
+   * "came back" is communicated by icon/label instead of a fourth color.
+   */
+  .status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: var(--wt-radius-full);
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .status-chip .wt-icon { width: 12px; height: 12px; }
+  .status-chip.status-open,
+  .status-chip.status-reopened {
+    background: rgba(242, 139, 130, 0.16);
+    color: var(--error);
+  }
+  .status-chip.status-awaiting {
+    background: rgba(138, 180, 248, 0.16);
+    color: var(--wt-primary);
+  }
+  .status-chip.status-resolved {
+    background: rgba(129, 201, 149, 0.16);
+    color: var(--wt-success);
+  }
+  .error-meta .name { color: var(--text); font-weight: 600; }
+  .error-text {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  /*
+   * The back-and-forth thread (`ErrorReport.thread`), rendered as a compact
+   * chat strip below the original submission. Alignment carries the
+   * from/participant distinction (presenter messages hug the right edge,
+   * "You:"; participant messages hug the left, their name as the label) —
+   * chosen over a color-only distinction because it's legible even at this
+   * font size and matches the familiar messaging-app convention instructors
+   * already have muscle memory for, without spending another semantic color
+   * that `.status-chip` above needs to keep meaning one thing.
+   */
+  .thread {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 8px 0;
+  }
+  .thread-msg {
+    max-width: 85%;
+    padding: 5px 9px;
+    border-radius: var(--wt-radius-sm);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .thread-msg-presenter {
+    align-self: flex-end;
+    background: rgba(138, 180, 248, 0.14);
+  }
+  .thread-msg-participant {
+    align-self: flex-start;
+    background: rgba(255, 255, 255, 0.05);
+  }
+  .thread-msg-label {
+    font-weight: 600;
+    color: var(--muted);
+    margin-right: 4px;
+  }
+  /*
+   * Composer: one shared textarea per non-resolved card feeding both the
+   * plain "Send" reply and (open/reopened only) "Send & mark resolved" —
+   * see the `composer` builder in the script for the input-count tradeoff
+   * this was chosen over. Full-width under the thread rather than the old
+   * fixed-width `.resolve-message` sitting in a side column: a thread reply
+   * is often longer than the old one-line "optional message", and a
+   * multi-line `<textarea>` reads better spanning the card than squeezed
+   * into a 170px column.
+   */
+  .composer {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .composer-input {
+    width: 100%;
+    min-height: 32px;
+    max-height: 140px;
+    resize: vertical;
+    padding: 6px 9px;
+    border-radius: var(--wt-radius-sm);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+  }
+  .composer-input:focus {
+    outline: none;
+    border: 2px solid var(--wt-primary);
+    padding: 5px 8px;
+  }
+  .composer-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  /* Sits where the resolve button would otherwise be for an
+     `awaiting_confirmation` card — there's nothing left to "mark resolved"
+     (the presenter already did; the ball is in the participant's court) —
+     `margin-right: auto` pins it to the opposite side from the remaining
+     Send button rather than leaving an empty gap. */
+  .awaiting-note {
+    font-size: 11px;
+    color: var(--muted);
+    font-style: italic;
+    margin-right: auto;
+  }
+  .resolve-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    border-radius: var(--wt-radius-full);
+    border: none;
+    background: var(--wt-primary);
+    color: var(--wt-on-primary);
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+    font-size: 12px;
+  }
+  .resolve-button .wt-icon { width: 13px; height: 13px; }
+  .send-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    border-radius: var(--wt-radius-full);
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+    font-size: 12px;
+  }
+  .send-button .wt-icon { width: 13px; height: 13px; }
+  .resolve-button:disabled,
+  .send-button:disabled {
+    cursor: default;
+    opacity: 0.38;
+  }
+
+  .lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 2000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.8);
+    cursor: zoom-out;
+  }
+  .lightbox img {
+    max-width: 90vw;
+    max-height: 90vh;
+    border-radius: var(--wt-radius-sm);
+    box-shadow: var(--wt-elevation-2), 0 10px 40px rgba(0, 0, 0, 0.6);
+  }
+</style>
+</head>
+<body>
+  <h1>Muan Companion — Instructor Dashboard</h1>
+  <p class="sub">Participant roster, presence, current-step status, and help requests. Requires the presenter code (see this file's source).</p>
+  <p class="conn" id="conn">connecting…</p>
+
+  <!--
+    "Share this workshop" — the join link + QR code, meant to be shown to
+    the whole room (projector/screen-share), not just glanced at by the
+    instructor the way `#codes-panel` below is. Placed ahead of `.counts`:
+    getting people into the room is the first thing an instructor does at
+    the start of a session, before the counts/table have anything in them
+    worth looking at.
+
+    Hidden until `dashboard:join`'s ack actually supplies a `joinUrl` —
+    exactly the same "nothing valid to show yet" gate `#codes-panel` uses,
+    for the same reason: `buildJoinUrl` (`server.ts`) returns `undefined`
+    whenever no room code is configured, and a QR code encoding "undefined"
+    would be actively misleading rather than merely empty.
+  -->
+  <div class="share-panel" id="share-panel" hidden>
+    <img class="share-qr" id="share-qr" alt="QR code to join this workshop" />
+    <div class="share-info">
+      <h2>Share this workshop</h2>
+      <p class="share-hint">Scan the QR code, or share the link below (Teams, Zoom chat, Slack…) so participants can join directly — no need to type the room code by hand.</p>
+      <div class="share-link-row">
+        <a class="share-link" id="share-link" target="_blank" rel="noopener"></a>
+        <button type="button" class="code-copy" data-copy-target="share-link">copy link</button>
+      </div>
+    </div>
+  </div>
+
+  <!--
+    "How does the presenter find out the room/presenter codes" — this panel
+    is the answer once the dashboard is open (the other is index.ts's
+    startup log). Safe to show here specifically: reaching this panel at all
+    already proved this viewer holds the presenter code (see
+    `requireDashboardCode`/`dashboard:join`'s gate), so echoing both codes
+    back doesn't hand anything to someone who couldn't already get here.
+  -->
+  <div class="codes-panel" id="codes-panel" hidden>
+    <div class="code-item">
+      <span class="code-label">Room code (for participants):</span>
+      <code id="code-room"></code>
+      <button type="button" class="code-copy" data-copy-target="code-room">copy</button>
+    </div>
+    <div class="code-item">
+      <span class="code-label">Presenter code (yours only):</span>
+      <code id="code-presenter"></code>
+      <button type="button" class="code-copy" data-copy-target="code-presenter">copy</button>
+    </div>
+  </div>
+
+  <div class="counts">
+    <div class="count"><span class="n" id="count-joined">0</span><span class="l">joined</span></div>
+    <div class="count"><span class="n" id="count-viewing">0</span><span class="l">viewing now</span></div>
+    <div class="count"><span class="n" id="count-done">0</span><span class="l">done this step</span></div>
+    <div class="count"><span class="n" id="count-slide">–</span><span class="l">current slide</span></div>
+    <div class="count"><span class="n" id="count-step">–</span><span class="l">current stepId</span></div>
+    <!--
+      Renamed from "open errors" (the old bare `resolved: boolean` era) to
+      "needs attention" — the redesign's four-status machine has two
+      not-yet-final-but-not-actionable-right-now states (`resolved` is
+      final; `awaiting_confirmation` is already actioned and just waiting on
+      the participant), so "not resolved" alone would wrongly count a report
+      the presenter already replied to as still needing them to do
+      something. See `renderErrors`'s `NEEDS_ATTENTION` set below for the
+      exact definition this tile mirrors.
+    -->
+    <div class="count"><span class="n" id="count-errors">0</span><span class="l">needs attention</span></div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Participant</th>
+        <th>Presence</th>
+        <th>Status (current step)</th>
+        <th>Joined at</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <!--
+    PRD §11/§15's "never joined" presence state has no row here by design —
+    there's no roster of expected participants in this single-session model
+    (PRD §14 leaves multi-session/invite-list scope open), so "never joined"
+    is represented by simple absence from this table, distinguishable from
+    an explicit "closed" row (plan 029 Step 3) for someone who *did* join
+    and later left/dropped.
+  -->
+  <p class="empty" id="empty" hidden>No participants have joined yet.</p>
+
+  <!--
+    Renamed "Error reports" → "Help requests" (Ask for Help redesign):
+    the feed below now interleaves `kind: 'problem'` reports (the original
+    error-report flow) with `kind: 'question'` asks, and "error reports"
+    stopped describing half the cards in it. The heading icon changed to a
+    neutral chat-bubble glyph for the same reason the warning triangle no
+    longer colors it (see `.error-reports h2 .wt-icon`'s comment) — a
+    question arriving isn't an error condition. `.error-reports`/`error-feed`
+    class and id names are kept as-is (see the `:root` token comment above)
+    since they're internal, not shown to anyone.
+  -->
+  <section class="error-reports">
+    <h2><svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z" /></svg>Help requests</h2>
+    <div class="error-feed" id="error-feed"></div>
+    <p class="empty" id="errors-empty" hidden>No help requests yet.</p>
+  </section>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const presenterCode = new URLSearchParams(location.search).get('code') || undefined
+
+    const socket = io()
+    const connEl = document.getElementById('conn')
+    const rowsEl = document.getElementById('rows')
+    const emptyEl = document.getElementById('empty')
+    const errorFeedEl = document.getElementById('error-feed')
+    const errorsEmptyEl = document.getElementById('errors-empty')
+    const codesPanelEl = document.getElementById('codes-panel')
+    const codeRoomEl = document.getElementById('code-room')
+    const codePresenterEl = document.getElementById('code-presenter')
+    const sharePanelEl = document.getElementById('share-panel')
+    const shareLinkEl = document.getElementById('share-link')
+    const shareQrEl = document.getElementById('share-qr')
+    // The five `.count` tiles — looked up once here (same reasoning as
+    // every other cached element above) rather than re-querying the DOM by
+    // id on every single `render()` call, which used to happen on every
+    // `state:update` plus every 5s elapsed-time tick.
+    const countSlideEl = document.getElementById('count-slide')
+    const countStepEl = document.getElementById('count-step')
+    const countJoinedEl = document.getElementById('count-joined')
+    const countViewingEl = document.getElementById('count-viewing')
+    const countDoneEl = document.getElementById('count-done')
+    const countErrorsEl = document.getElementById('count-errors')
+
+    // Inline Material-style icons (see the token/icon comment in `:root`
+    // above) — the same glyphs `ErrorReportWidget.vue` uses, kept as plain
+    // strings here since this page's error cards are built via
+    // `innerHTML`, not a component template.
+    const ICON_WARNING = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>'
+    const ICON_CHECK = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>'
+    const ICON_SEND = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"/></svg>'
+    // Added by the "Ask for Help" redesign — `kind: 'question'` cards get
+    // their own glyph (a question mark in a circle, Material's "help"
+    // icon) rather than reusing `ICON_WARNING`, which would visually claim
+    // every card in the feed is an error/warning even when it's just a
+    // participant asking something (see the `kind-tag`/`status-chip` split
+    // in the CSS comment above for why kind and status get separate icons
+    // at all).
+    const ICON_QUESTION = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z"/></svg>'
+    // `awaiting_confirmation` status icon — a clock/hourglass reads as
+    // "waiting on someone else" at a glance, distinct from both the
+    // attention-needed triangle and the done checkmark.
+    const ICON_SCHEDULE = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm.5 5H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg>'
+    // `reopened` status icon — an "undo" arrow, so a report that bounced
+    // back after the presenter thought it was handled reads as "this came
+    // back" rather than being indistinguishable from a report that was
+    // never touched (both share the same red `status-chip` color — see its
+    // CSS comment — so the icon is what actually carries "came back" vs.
+    // "never handled").
+    const ICON_UNDO = '<svg class="wt-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg>'
+
+    // One lookup per axis (kind, status) rather than inline ternary chains
+    // in the card-building loop below — both axes are closed enums fixed by
+    // the server contract (`HelpRequestKind`/`HelpRequestStatus` in
+    // session.ts), so a plain object keyed by the exact server string is
+    // simpler to read and to extend than nested conditionals, and a typo'd
+    // key just falls through to the `?? KIND_META.problem` / `?? STATUS_META.open`
+    // default below instead of throwing.
+    const KIND_META = {
+      problem: { label: 'Problem', icon: ICON_WARNING },
+      question: { label: 'Question', icon: ICON_QUESTION },
+    }
+    const STATUS_META = {
+      open: { label: 'Needs attention', cls: 'status-open', icon: ICON_WARNING },
+      reopened: { label: 'Reopened', cls: 'status-reopened', icon: ICON_UNDO },
+      awaiting_confirmation: { label: 'Awaiting confirmation', cls: 'status-awaiting', icon: ICON_SCHEDULE },
+      resolved: { label: 'Resolved', cls: 'status-resolved', icon: ICON_CHECK },
+    }
+
+    // Cached so the elapsed-time ticker (below) can re-render without
+    // waiting for the next server-pushed `state:update` — "how long since
+    // Copy" needs to keep advancing between pushes, not just jump on each
+    // new event.
+    let lastState = null
+
+    socket.on('connect', () => {
+      socket.emit('dashboard:join', { presenterCode }, (result) => {
+        if (result && result.ok === false) {
+          connEl.textContent = 'presenter code rejected — append ?code=<presenterCode> to this page\'s URL and reload'
+          connEl.classList.remove('live')
+          socket.disconnect()
+          return
+        }
+        connEl.textContent = 'live'
+        connEl.classList.add('live')
+        if (result && result.roomCode) {
+          codeRoomEl.textContent = result.roomCode
+          codePresenterEl.textContent = result.presenterCode
+          codesPanelEl.hidden = false
+        }
+        // The shareable join link + QR code (see `#share-panel`'s own HTML
+        // comment for why this is a separate, bigger panel from
+        // `#codes-panel` above). `joinUrl`/`joinQrDataUrl` are only present
+        // on the ack when `server.ts`'s `buildJoinUrl` found a room code
+        // configured — same "nothing valid to show" gate as the codes panel
+        // just above, so this stays hidden rather than rendering a broken
+        // link/QR when there's nothing to point it at.
+        if (result && result.joinUrl) {
+          shareLinkEl.textContent = result.joinUrl
+          shareLinkEl.href = result.joinUrl
+          shareQrEl.src = result.joinQrDataUrl
+          sharePanelEl.hidden = false
+        }
+      })
+    })
+    socket.on('disconnect', () => {
+      connEl.textContent = 'disconnected — retrying…'
+      connEl.classList.remove('live')
+    })
+
+    // One shared handler for every `.code-copy` button on the page —
+    // `#codes-panel`'s two small copy buttons and `#share-panel`'s "copy
+    // link" button all use the identical class/`data-copy-target` contract
+    // (copy the target element's `textContent`, flash "copied!" for
+    // 1.2s), so this is registered on `document` once rather than
+    // duplicating the same listener body per panel.
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('.code-copy')
+      if (!button)
+        return
+      const value = document.getElementById(button.dataset.copyTarget).textContent
+      navigator.clipboard?.writeText(value).then(() => {
+        const original = button.textContent
+        button.textContent = 'copied!'
+        setTimeout(() => { button.textContent = original }, 1200)
+      })
+    })
+
+    // Returns the full stepStatus entry (state + updatedAt), not just the
+    // state string — the caller needs updatedAt to render "how long since
+    // Copy" (see `renderStatusCell` below). Falls back to a synthetic
+    // 'idle' entry with no meaningful updatedAt when there's no record yet.
+    function statusFor(stepStatus, participantId, stepId) {
+      return stepStatus.find(s => s.participantId === participantId && s.stepId === stepId)
+        ?? { state: 'idle', updatedAt: undefined }
+    }
+
+    // "Time since Copy" as a check-in signal (feature follow-up after
+    // initial testing): only meaningful while a participant is sitting in
+    // 'copied' — i.e. they've acknowledged the command but haven't clicked
+    // Done yet, which is exactly the "might be stuck, worth a check-in"
+    // state the instructor wants a nudge about. 'done'/'idle' don't render
+    // a timer — there's nothing actionable about "how long ago they
+    // finished".
+    const STUCK_WARN_MS = 60_000 // 1 minute
+    const STUCK_ALERT_MS = 180_000 // 3 minutes
+    function formatElapsed(ms) {
+      const totalSeconds = Math.floor(ms / 1000)
+      if (totalSeconds < 60)
+        return `${totalSeconds}s`
+      const minutes = Math.floor(totalSeconds / 60)
+      const seconds = totalSeconds % 60
+      return `${minutes}m ${seconds}s`
+    }
+    function renderStatusCell(entry) {
+      const badge = `<span class="badge ${entry.state}">${entry.state}</span>`
+      if (entry.state !== 'copied' || entry.updatedAt == null)
+        return `<span class="status-cell">${badge}</span>`
+      const elapsedMs = Date.now() - entry.updatedAt
+      const cls = elapsedMs >= STUCK_ALERT_MS ? 'stuck-alert' : elapsedMs >= STUCK_WARN_MS ? 'stuck-warn' : ''
+      return `<span class="status-cell">${badge}<span class="step-elapsed ${cls}">${formatElapsed(elapsedMs)} ago</span></span>`
+    }
+
+    // Presence column (plan 029 Step 3, PRD §11/§15): three of the four
+    // states it distinguishes render here per-row ("never joined" is
+    // absence from the table entirely — see the HTML comment above). Driven
+    // by `visibility` (not the raw `connected` flag alone) so "away" (tab
+    // backgrounded, socket still live) reads differently from "closed"
+    // (socket actually gone, via a clean disconnect or the staleness sweep).
+    function presenceFor(p) {
+      if (!p.connected || p.visibility === 'closed')
+        return { label: 'closed', cls: 'presence-closed' }
+      if (p.visibility === 'hidden')
+        return { label: 'away', cls: 'presence-hidden' }
+      return { label: 'viewing now', cls: 'presence-visible' }
+    }
+
+    // The five `.count` tiles at the top of the page — split out of
+    // `render` below purely for readability (it was doing "update the
+    // tiles" and "rebuild the roster table" in one long function body); the
+    // data these tiles summarize (`presenceFor`/`statusFor` over the same
+    // `participants`/`stepStatus` arrays `render` already has) is otherwise
+    // unrelated to how a roster row's markup gets built.
+    function renderCounts({ currentSlideIndex, currentStepId, participants, stepStatus }) {
+      countSlideEl.textContent = currentSlideIndex
+      countStepEl.textContent = currentStepId
+      countJoinedEl.textContent = participants.length
+      countViewingEl.textContent = participants.filter(
+        p => presenceFor(p).label === 'viewing now',
+      ).length
+
+      const doneCount = participants.filter(
+        p => statusFor(stepStatus, p.id, currentStepId).state === 'done',
+      ).length
+      countDoneEl.textContent = `${doneCount}/${participants.length}`
+    }
+
+    // One of the two roster-row shapes `render` interleaves below — a
+    // still-anonymous pending connection (`participant:connecting` fired,
+    // no `participant:join` yet). Returns markup, not a live `<tr>`, so
+    // `render` stays the one place actually touching the DOM tree.
+    function pendingRowHtml(c) {
+      return `
+        <td class="pending-name">Someone joining…</td>
+        <td><span class="badge pending">connecting</span></td>
+        <td>—</td>
+        <td>${new Date(c.connectedAt).toLocaleTimeString()}</td>
+        <td><button type="button" class="kick-button" data-action="kick-pending" data-socket-id="${escapeHtml(c.socketId)}">Remove</button></td>
+      `
+    }
+
+    // The other roster-row shape — a real, joined participant.
+    function participantRowHtml(p, stepStatus, currentStepId) {
+      const statusCell = p.connected
+        ? renderStatusCell(statusFor(stepStatus, p.id, currentStepId))
+        : `<span class="badge offline">offline</span>`
+      const presence = presenceFor(p)
+      return `
+        <td>${escapeHtml(p.name)}</td>
+        <td><span class="badge ${presence.cls}">${presence.label}</span></td>
+        <td>${statusCell}</td>
+        <td>${new Date(p.joinedAt).toLocaleTimeString()}</td>
+        <td><button type="button" class="kick-button" data-action="kick-participant" data-participant-id="${escapeHtml(p.id)}">Remove</button></td>
+      `
+    }
+
+    function render(state) {
+      lastState = state
+      const { currentStepId, participants, pendingConnections, stepStatus, errors } = state
+
+      renderCounts(state)
+
+      rowsEl.innerHTML = ''
+      emptyEl.hidden = participants.length > 0 || (pendingConnections || []).length > 0
+
+      // Pending connections (someone's browser is here, `participant:connecting`
+      // fired, but they haven't submitted the join form yet — see
+      // `server.ts`'s own comment on why this exists at all) render in the
+      // *same* table, interleaved with real participants by connection/join
+      // time, rather than a separate section — the point of this feature is
+      // that a row appears the moment someone shows up and simply updates in
+      // place (anonymous → their name) once they join, not that anonymous
+      // visitors get a visually separate "waiting area". A discriminant
+      // (`kind`) is all that distinguishes the two shapes below.
+      const rows = [
+        ...participants.map(p => ({ kind: 'participant', at: p.joinedAt, data: p })),
+        ...(pendingConnections || []).map(c => ({ kind: 'pending', at: c.connectedAt, data: c })),
+      ].sort((a, b) => a.at - b.at)
+
+      for (const row of rows) {
+        const tr = document.createElement('tr')
+        tr.innerHTML = row.kind === 'pending'
+          ? pendingRowHtml(row.data)
+          : participantRowHtml(row.data, stepStatus, currentStepId)
+        rowsEl.appendChild(tr)
+      }
+
+      renderErrors(errors || [])
+    }
+
+    // One delegated listener for both "Remove" button variants (pending vs.
+    // joined) — same reasoning as `errorFeedEl`'s single delegated listener
+    // below: rows are rebuilt wholesale on every render, so binding to
+    // individual buttons would mean re-binding on every single `state:update`.
+    // No local optimistic removal here (unlike the error feed's composer
+    // input clearing) — the row disappears on the next `state:update`, which
+    // `presenter:kick*`'s own broadcast fires immediately after.
+    rowsEl.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-action]')
+      if (!button)
+        return
+      if (button.dataset.action === 'kick-pending') {
+        socket.emit('presenter:kickPendingConnection', { socketId: button.dataset.socketId, presenterCode })
+        return
+      }
+      if (button.dataset.action === 'kick-participant')
+        socket.emit('presenter:kickParticipant', { participantId: button.dataset.participantId, presenterCode })
+    })
+
+    // Keeps "Xm Ys ago" advancing between server pushes — `state:update`
+    // only fires on an actual change, but elapsed time obviously keeps
+    // moving regardless. Re-renders from the cached `lastState` rather than
+    // re-fetching anything; cheap enough at this scale (PRD's 50-100
+    // participant target) to just re-run the whole render.
+    setInterval(() => {
+      if (lastState)
+        render(lastState)
+    }, 5000)
+
+    // "Needs attention" = `open` + `reopened` — the confirm/reopen
+    // redesign's two non-final statuses that still require the instructor
+    // to actually do something (see `HelpRequestStatus`'s doc comment in
+    // session.ts). Replaces the old bare `!e.resolved` check, which would
+    // now wrongly count `awaiting_confirmation` reports too — those have
+    // already been actioned by the presenter and are just waiting on the
+    // participant's confirmation, not something to notice again yet.
+    const NEEDS_ATTENTION = new Set(['open', 'reopened'])
+
+    // Sort order (extends the old two-bucket "unresolved first, resolved
+    // last" to the four-status machine): needs-attention (`open`,
+    // `reopened`) first, then `awaiting_confirmation`, then `resolved` last
+    // — so the instructor scrolls from "do something" to "already done",
+    // never the other way round. `open` and `reopened` share a rank (0)
+    // rather than one being strictly before the other — see `.error-card`'s
+    // CSS comment for why that pairing is deliberate.
+    const STATUS_RANK = { open: 0, reopened: 0, awaiting_confirmation: 1, resolved: 2 }
+
+    // Within a rank, ordered by *most recently active* rather than by
+    // original submission time — a report someone just replied on (thread
+    // has a fresh `ts`) is more useful to see near the top than a report
+    // that's been sitting quietly since early in the session, even if the
+    // quiet one's original `ts` is numerically later. Falls back to the
+    // original submission `ts` for a report with an empty thread (nothing
+    // has happened since it was filed).
+    function lastActivity(e) {
+      return e.thread.length > 0 ? e.thread[e.thread.length - 1].ts : e.ts
+    }
+
+    // The `.awaiting`/`.resolved` card-border override — see `.error-card`'s
+    // own CSS comments for why exactly these two statuses (and no others)
+    // get one.
+    function errorCardClassName(e) {
+      if (e.status === 'resolved')
+        return 'error-card resolved'
+      if (e.status === 'awaiting_confirmation')
+        return 'error-card awaiting'
+      return 'error-card'
+    }
+
+    // The thread (`ErrorReport.thread`) is everything sent *after* the
+    // original submission — never re-derived from it, just rendered in
+    // order. Per-message timestamps are deliberately omitted (the original
+    // submission's timestamp is still shown in `.error-meta`) — a short
+    // back-and-forth reads fine without one, and adding one to every bubble
+    // was more clutter than the compact-chat-strip goal called for.
+    function threadHtml(e) {
+      if (e.thread.length === 0)
+        return ''
+      return `<div class="thread">${e.thread.map(m => `
+        <div class="thread-msg thread-msg-${m.from}">
+          <span class="thread-msg-label">${m.from === 'presenter' ? 'You' : escapeHtml(e.participantName)}:</span>
+          <span class="thread-msg-text">${escapeHtml(m.text)}</span>
+        </div>
+      `).join('')}</div>`
+    }
+
+    // No composer at all once `resolved` — that's the final state, and the
+    // read-only dimmed thread history above is all there is left to show
+    // (mirrors the pre-redesign file's "resolved cards have no input"
+    // treatment). `awaiting_confirmation` keeps the shared textarea and the
+    // plain "Send" button (a nudge/follow-up is still useful while waiting)
+    // but drops the resolve button — there's nothing left to "mark
+    // resolved": the presenter already did, and the ball is in the
+    // participant's court — replacing it with a small note so that absence
+    // reads as "waiting", not as a bug. `draftValue` is this one card's own
+    // saved textarea value (see `renderErrors`'s own comment on why it has
+    // to survive the wholesale rebuild every card goes through).
+    function composerHtml(e, draftValue) {
+      if (e.status === 'resolved')
+        return ''
+      const resolveOrWaitingHtml = e.status === 'awaiting_confirmation'
+        ? `<span class="awaiting-note">Waiting on ${escapeHtml(e.participantName)} to confirm…</span>`
+        : `<button type="button" class="resolve-button" data-action="resolve" data-error-id="${escapeHtml(e.id)}">${ICON_CHECK}<span>Send &amp; mark resolved</span></button>`
+      return `
+        <div class="composer">
+          <textarea
+            class="composer-input"
+            data-error-id="${escapeHtml(e.id)}"
+            rows="1"
+            placeholder="${e.kind === 'question' ? 'Answer their question…' : 'Reply…'}"
+          >${escapeHtml(draftValue || '')}</textarea>
+          <div class="composer-actions">
+            ${resolveOrWaitingHtml}
+            <button type="button" class="send-button" data-action="send" data-error-id="${escapeHtml(e.id)}">${ICON_SEND}<span>Send</span></button>
+          </div>
+        </div>
+      `
+    }
+
+    // One help-request card's full innerHTML — pulled out of `renderErrors`'s
+    // loop so that function reads as "preserve composer state, sort, build
+    // each card, restore composer state" rather than that plus every
+    // individual card field inline.
+    function errorCardHtml(e, draftValue) {
+      const thumb = e.screenshotUrl
+        ? `<img class="error-thumb" src="${escapeHtml(e.screenshotUrl)}" alt="screenshot from ${escapeHtml(e.participantName)}" data-full="${escapeHtml(e.screenshotUrl)}" />`
+        : ''
+      const kind = KIND_META[e.kind] ?? KIND_META.problem
+      const status = STATUS_META[e.status] ?? STATUS_META.open
+
+      return `
+        ${thumb}
+        <div class="error-body">
+          <div class="error-meta">
+            <span class="kind-tag">${kind.icon}<span>${kind.label}</span></span>
+            <span class="status-chip ${status.cls}">${status.icon}<span>${status.label}</span></span>
+            <span class="name">${escapeHtml(e.participantName)}</span>
+            <span>step: ${escapeHtml(e.stepId)}</span>
+            <span>${new Date(e.ts).toLocaleTimeString()}</span>
+          </div>
+          ${e.text ? `<p class="error-text">${escapeHtml(e.text)}</p>` : ''}
+          ${threadHtml(e)}
+          ${composerHtml(e, draftValue)}
+        </div>
+      `
+    }
+
+    function renderErrors(errors) {
+      countErrorsEl.textContent = errors.filter(e => NEEDS_ATTENTION.has(e.status)).length
+
+      // `renderErrors` re-runs on *every* `state:update` — including ones
+      // caused by an unrelated participant clicking Copy/Done elsewhere —
+      // plus every 5s from the elapsed-time ticker. A full `innerHTML` wipe
+      // would both erase whatever the instructor is mid-typing into a
+      // composer box *and* steal keyboard focus out of it (a brand new
+      // `<textarea>` element replaces the old one). Save each open
+      // textarea's value, and separately remember which one (if any) was
+      // actually focused plus its caret position, so both the text and the
+      // ability to keep typing survive the rebuild below.
+      //
+      // One shared `.composer-input` per card (feeding both the "Send" and
+      // "Send & mark resolved" buttons) rather than two separate fields —
+      // the pre-redesign version of this file only ever had one input to
+      // track per card, and going to *two* possible statuses-with-inputs
+      // would have meant this preservation logic tracking "which of up to
+      // two inputs on this card, if either, was focused", doubling its
+      // surface for a benefit (staging two different messages at once)
+      // nobody asked for. The tradeoff: the instructor can't compose a
+      // different "just replying" message from a "replying and resolving"
+      // one in the same pass — acceptable, since conceptually there's one
+      // thing being said either way, and the two buttons are just "say it"
+      // vs. "say it and also resolve".
+      const draftMessages = {}
+      for (const input of errorFeedEl.querySelectorAll('.composer-input'))
+        draftMessages[input.dataset.errorId] = input.value
+      const focused = document.activeElement
+      const focusedErrorId = focused?.classList?.contains('composer-input') ? focused.dataset.errorId : undefined
+      const focusedSelection = focusedErrorId ? [focused.selectionStart, focused.selectionEnd] : undefined
+
+      errorFeedEl.innerHTML = ''
+      errorsEmptyEl.hidden = errors.length > 0
+
+      const sorted = [...errors].sort((a, b) => {
+        const rankDiff = STATUS_RANK[a.status] - STATUS_RANK[b.status]
+        return rankDiff !== 0 ? rankDiff : lastActivity(b) - lastActivity(a)
+      })
+
+      for (const e of sorted) {
+        const card = document.createElement('div')
+        card.className = errorCardClassName(e)
+        card.innerHTML = errorCardHtml(e, draftMessages[e.id])
+        errorFeedEl.appendChild(card)
+      }
+
+      if (focusedErrorId) {
+        const restored = errorFeedEl.querySelector(`.composer-input[data-error-id="${CSS.escape(focusedErrorId)}"]`)
+        if (restored) {
+          restored.focus()
+          restored.setSelectionRange(...focusedSelection)
+        }
+      }
+    }
+
+    errorFeedEl.addEventListener('click', (event) => {
+      const thumb = event.target.closest('[data-full]')
+      if (thumb) {
+        openLightbox(thumb.dataset.full)
+        return
+      }
+
+      // Both card actions share one shared `.composer-input` per card (see
+      // its doc comment in `renderErrors`) — `data-action` on the button
+      // clicked is what tells them apart, not which input was used.
+      const button = event.target.closest('button[data-action]')
+      if (!button)
+        return
+      const errorId = button.dataset.errorId
+      const input = errorFeedEl.querySelector(`.composer-input[data-error-id="${CSS.escape(errorId)}"]`)
+      const text = input?.value.trim() || ''
+
+      if (button.dataset.action === 'resolve') {
+        // "Send & mark resolved": `message` stays optional here, same as
+        // the pre-redesign "optional message" input — `resolveErrorReport`
+        // (session.ts) treats a blank one as nothing to append, it doesn't
+        // require one. Clear the box the same way the plain "Send" branch
+        // below does — the card survives this action (it moves to
+        // `awaiting_confirmation`, which still has a composer), so without
+        // this the just-sent text would sit there looking like an unsent
+        // draft once `draftMessages` repopulates it on the next render.
+        button.disabled = true
+        if (input)
+          input.value = ''
+        socket.emit('presenter:resolveError', { errorId, presenterCode, message: text || undefined })
+        return
+      }
+
+      // Plain "Send": `addPresenterMessage` (session.ts) silently no-ops on
+      // a blank/whitespace-only message, so skip emitting one at all rather
+      // than firing an event that provably can't change anything. Clearing
+      // the textarea here (rather than waiting on the next `state:update`)
+      // is what makes the box read as "sent" immediately — the next
+      // `renderErrors` pass would otherwise re-populate it from
+      // `draftMessages` with the very text that was just sent.
+      if (!text)
+        return
+      button.disabled = true
+      if (input)
+        input.value = ''
+      socket.emit('presenter:sendMessage', { errorId, presenterCode, text })
+    })
+
+    function openLightbox(src) {
+      const overlay = document.createElement('div')
+      overlay.className = 'lightbox'
+      overlay.innerHTML = `<img src="${escapeHtml(src)}" alt="full-size screenshot" />`
+      overlay.addEventListener('click', () => overlay.remove())
+      document.body.appendChild(overlay)
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div')
+      div.textContent = str
+      return div.innerHTML
+    }
+
+    socket.on('state:update', render)
+  </script>
+</body>
+</html>

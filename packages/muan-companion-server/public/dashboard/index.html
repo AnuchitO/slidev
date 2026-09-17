@@ -199,6 +199,24 @@
     font-size: 11px;
     padding: 1px 6px;
   }
+  /*
+   * Bug found live: `.codes-panel`/`.share-panel` (below) both set `display`
+   * unconditionally, and a class selector's `display` has the same
+   * specificity as the browser's own default `[hidden] { display: none }`
+   * rule — a tie the *author* stylesheet always wins, regardless of source
+   * order, because it outranks the user-agent stylesheet's origin. The
+   * practical effect: setting `.hidden = true`/leaving the `hidden` attribute
+   * in the markup did nothing for either panel — both rendered immediately on
+   * page load, "—" placeholders and a broken (`src`-less) QR image and all,
+   * instead of staying invisible until `dashboard:join`'s ack actually has
+   * something to show. This restores `[hidden]`'s effect for the two panels
+   * that need it, without touching every other element on the page that
+   * relies on the (here, unbroken) default.
+   */
+  .codes-panel[hidden],
+  .share-panel[hidden] {
+    display: none;
+  }
 
   /*
    * "Share this workshop" — deliberately a *separate*, much bigger surface
@@ -768,9 +786,23 @@
     // new event.
     let lastState = null
 
+    // Set right before the deliberate `socket.disconnect()` below, on a
+    // rejected `dashboard:join` — a bug found live: that `disconnect()` call
+    // fires the `disconnect` handler further down *synchronously*, and that
+    // handler unconditionally overwrote whatever `connEl.textContent` had
+    // just been set to with the generic "disconnected — retrying…", so the
+    // specific "presenter code rejected" message (the one that actually
+    // explains what to do) was never visible for longer than a frame — an
+    // operator staring at this page only ever saw the generic text, forever,
+    // with no hint that reconnecting wasn't the fix. This flag lets the
+    // `disconnect` handler recognize "we did this on purpose, for a reason
+    // already on screen" and leave that message alone.
+    let rejected = false
+
     socket.on('connect', () => {
       socket.emit('dashboard:join', { presenterCode }, (result) => {
         if (result && result.ok === false) {
+          rejected = true
           connEl.textContent = 'presenter code rejected — append ?code=<presenterCode> to this page\'s URL and reload'
           connEl.classList.remove('live')
           socket.disconnect()
@@ -799,6 +831,8 @@
       })
     })
     socket.on('disconnect', () => {
+      if (rejected)
+        return
       connEl.textContent = 'disconnected — retrying…'
       connEl.classList.remove('live')
     })

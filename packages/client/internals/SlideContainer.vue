@@ -46,6 +46,30 @@ const height = computed(() => props.width ? props.width / slideAspect.value : co
 const scale = computed(() => {
   if (slideScale.value && !isPrintMode.value)
     return +slideScale.value
+  // `width`/`height` come from `useElementSize`'s `ResizeObserver`, which
+  // hasn't delivered a real measurement yet on the very first tick of every
+  // mount (they start at `0`) — and, critically, can stay at `0` far longer
+  // than "one tick" when this container's tab loads in the background
+  // (e.g. a `target="_blank"` link opened via "Open in new tab"): Chromium
+  // deprioritizes a hidden tab's rendering pipeline, so the observer's
+  // first real callback can be deferred until the tab is actually viewed.
+  // `Math.min(0 / slideWidth, 0 / slideHeight)` is `0`, and this value feeds
+  // straight into `.slidev-slide-content`'s `transform: ... scale(...)`
+  // (below) — a `scale(0)` collapses that element's *layout box* to a
+  // single point. Per the CSS spec, that `transform` also becomes the
+  // containing block for any descendant `position: fixed` element, so a
+  // full-viewport fixed overlay mounted as a Global Layer — e.g. the
+  // muan-companion addon's join screen — collapses right along with it to a
+  // real `0×0` box: every click on it hits whatever is underneath instead,
+  // even though nothing necessarily *looks* wrong (verified live —
+  // `slidev-addon-muan-companion`'s join screen was reachable by direct DOM
+  // manipulation the whole time, only pointer/keyboard input silently
+  // missed it). Falling back to `1` here — rather than the `0` a naive
+  // division produces — keeps the container at its unscaled native size
+  // (`slideWidth`×`slideHeight`) until the real measurement arrives, which
+  // is always a real, clickable, non-zero box.
+  if (!width.value || !height.value)
+    return 1
   return Math.min(width.value / slideWidth.value, height.value / slideHeight.value)
 })
 

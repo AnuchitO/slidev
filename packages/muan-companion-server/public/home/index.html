@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Muan Companion — Home</title>
+<!--
+  The cross-room home view (plan 032b). One level *above*
+  `public/dashboard/index.html`: that page shows one workshop's roster; this
+  one shows every live session on this server plus the presentations it has
+  discovered on disk.
+
+  Auth: the HTTP GET for this page is gated by `server.ts`'s
+  `requireAdminCode` middleware on a `?code=` query param (a 401 before this
+  HTML is ever served if it's missing/wrong), and the *same* code is read
+  back out of `location.search` below and sent as `adminCode` on `home:join`
+  and on every `/api/*` fetch. Exactly the pattern the dashboard page uses,
+  with a different credential — see `src/adminAuth.ts` for why a cross-room
+  view can't be gated on any single room's presenter code.
+
+  No build step, matching the dashboard page: one file, inline
+  `<style>`/`<script>`, no framework, one same-origin script tag for
+  Socket.io's own client bundle. The server's CSP for this route
+  (`staticPageContentSecurityPolicy` in `server.ts`) permits precisely that
+  and nothing external.
+-->
+<style>
+  /*
+   * The dashboard page's token set, verbatim, minus the roles this page has
+   * no use for (step-status colors, presence colors, the Material
+   * error-card tokens). Copied rather than shared because neither page has
+   * a build step and therefore neither can import a stylesheet the other
+   * owns — the same constraint that already made `ErrorReportWidget.vue`
+   * restate these tokens in its own scoped style. Keeping the *names* and
+   * *values* identical is what makes the two pages read as one product
+   * despite that.
+   */
+  :root {
+    color-scheme: light dark;
+    --bg: #0b0d12;
+    --panel: #11141b;
+    --border: #262b36;
+    --text: #e6e9ef;
+    --muted: #8b93a7;
+    --done: #2fa86b;
+    --error: #f28b82;
+    --wt-primary: #8ab4f8;
+    --wt-radius-sm: 8px;
+    --wt-radius-full: 999px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 28px 0 10px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  .conn { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .conn.live { color: var(--done); }
+  .conn.error { color: var(--error); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    vertical-align: middle;
+  }
+  th { color: var(--muted); font-weight: 500; }
+  tr:last-child td { border-bottom: none; }
+  code { font-size: 13px; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; }
+  .deck-url {
+    color: var(--muted);
+    font-size: 12px;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    vertical-align: bottom;
+  }
+  .count-pill {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: var(--wt-radius-full);
+    background: rgba(138, 180, 248, 0.14);
+    color: var(--wt-primary);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .count-pill.attention { background: rgba(242, 139, 130, 0.16); color: var(--error); }
+  .count-pill.zero { background: none; color: var(--muted); font-weight: 400; }
+  .action-button {
+    background: none;
+    border: 1px solid var(--wt-primary);
+    border-radius: 4px;
+    color: var(--wt-primary);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 3px 10px;
+  }
+  .action-button:hover:not(:disabled) { background: rgba(138, 180, 248, 0.12); }
+  /*
+   * Disabled affordances on this page are *honestly* disabled — a button
+   * mid-request ("Starting…", "Stopping…"), or the "Connect a deck" button
+   * when `/api/connect-key` isn't deployed. They are styled to read as
+   * unavailable at a glance rather than as ordinary buttons that happen not
+   * to respond, because a button that looks live and silently does nothing
+   * is the single most confusing state a half-built UI can be in.
+   */
+  .action-button:disabled {
+    border-color: var(--border);
+    color: var(--muted);
+    cursor: not-allowed;
+  }
+  /*
+   * "Stop" is the one destructive action on this page — it ends a live
+   * workshop, and for a server-launched deck it kills a running process. It
+   * gets the error token's color rather than the primary one so it never
+   * reads as the obvious thing to click next to "Open dashboard".
+   */
+  .action-button.danger { border-color: var(--error); color: var(--error); }
+  .action-button.danger:hover:not(:disabled) { background: rgba(242, 139, 130, 0.12); }
+  /*
+   * Where a launch's outcome lands, per row. `pre-wrap` because a failed
+   * launch renders the tail of the deck's own output, which is multi-line
+   * text that would otherwise collapse into one unreadable line.
+   */
+  .launch-result {
+    color: var(--muted);
+    font-size: 12px;
+    white-space: pre-wrap;
+    max-width: 520px;
+  }
+  .launch-result.error { color: var(--error); }
+  .launch-result a { color: var(--wt-primary); }
+  .note {
+    color: var(--muted);
+    font-size: 12px;
+    margin: 8px 0 0;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--wt-radius-sm);
+    padding: 14px 16px;
+  }
+  .panel h2 { margin-top: 0; }
+  .row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  /*
+   * The "Join" cell: the participant link as text (so it can be read/copied
+   * without opening it) plus its QR code once fetched. Column, not row,
+   * because the link text and an 80px-square image side by side would make
+   * this already-wide table wider still; stacking keeps the cell's own width
+   * to whichever of the two is wider.
+   */
+  .join-cell { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+  .join-link {
+    color: var(--wt-primary);
+    font-size: 12px;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .join-qr {
+    width: 72px;
+    height: 72px;
+    border-radius: 4px;
+    /* A visible plate behind the QR while it loads/if it never does — a PNG
+     * with white modules on transparent would otherwise be unreadable
+     * against this page's dark background. */
+    background: #fff;
+    padding: 2px;
+  }
+  .join-qr-placeholder {
+    width: 72px;
+    height: 72px;
+    border-radius: 4px;
+    border: 1px dashed var(--border);
+    color: var(--muted);
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 4px;
+  }
+</style>
+</head>
+<body>
+  <h1>Muan Companion — Home</h1>
+  <p class="sub">Every live session on this server, and the presentations it can find on disk. Requires the admin code.</p>
+  <p class="conn" id="conn">connecting…</p>
+
+  <h2>Presentations</h2>
+  <!--
+    Flow A's deck list (plan 032's "Presentation" concept: presentable, not
+    necessarily running). Populated by `GET /api/presentations`, which
+    returns id + title only — this page never learns, and therefore can
+    never display, where any of these live on the operator's filesystem.
+  -->
+  <table>
+    <thead>
+      <tr>
+        <th>Title</th>
+        <th>Id</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="presentation-rows"></tbody>
+  </table>
+  <p class="empty" id="presentations-empty" hidden></p>
+
+  <h2>Live sessions</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Room code</th>
+        <th>Presentation</th>
+        <th>Deck URL</th>
+        <th>Participants</th>
+        <th>Connected</th>
+        <th>Needs attention</th>
+        <th>Slide</th>
+        <th>Join</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="session-rows"></tbody>
+  </table>
+  <p class="empty" id="sessions-empty" hidden>No live sessions.</p>
+
+  <h2>Connect a deck</h2>
+  <div class="panel">
+    <p class="note" id="connect-note" style="margin-top: 0;">checking…</p>
+    <button type="button" class="action-button" id="connect-button" disabled>Generate connect key</button>
+    <p class="note" id="connect-result" hidden></p>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    // Same `?code=` the server's own `requireAdminCode` middleware just
+    // checked to serve this page — reused for the socket handshake and for
+    // every `/api/*` call below, so the operator only ever handles one URL.
+    const adminCode = new URLSearchParams(location.search).get('code') || undefined
+
+    const socket = io()
+    const connEl = document.getElementById('conn')
+    const presentationRowsEl = document.getElementById('presentation-rows')
+    const presentationsEmptyEl = document.getElementById('presentations-empty')
+    const sessionRowsEl = document.getElementById('session-rows')
+    const sessionsEmptyEl = document.getElementById('sessions-empty')
+    const connectNoteEl = document.getElementById('connect-note')
+    const connectButtonEl = document.getElementById('connect-button')
+    const connectResultEl = document.getElementById('connect-result')
+
+    socket.on('connect', () => {
+      // `home:join` is the *only* thing that puts a socket in the
+      // `dashboard:home` broadcast room (see `HOME_DASHBOARD_ROOM` in
+      // `server.ts`). Its ack carries an immediate snapshot of the session
+      // list, so the table below renders straight away rather than staying
+      // empty until some other session is created or destroyed.
+      socket.emit('home:join', { adminCode }, (result) => {
+        if (!result || !result.ok) {
+          // Same shape the dashboard page uses for a rejected
+          // `dashboard:join`: say so plainly and stop reconnecting, rather
+          // than retrying a credential that is not going to start working.
+          connEl.textContent = 'not authorized — check the ?code= in this URL'
+          connEl.classList.remove('live')
+          connEl.classList.add('error')
+          socket.disconnect()
+          return
+        }
+        connEl.textContent = 'live'
+        connEl.classList.add('live')
+        renderSessions(result.sessions || [])
+      })
+    })
+    socket.on('disconnect', () => {
+      connEl.textContent = 'disconnected — retrying…'
+      connEl.classList.remove('live')
+    })
+
+    // Live session create/destroy, pushed by `broadcastHomeUpdate`.
+    socket.on('home:update', payload => renderSessions(payload.sessions || []))
+
+    // roomCode -> data: URL, `null` for "asked and the server said no", or
+    // absent for "not asked yet". Keyed here (not re-derived from `session`)
+    // so a QR fetched for one `home:update` snapshot survives being rendered
+    // again by the next one, instead of re-fetching an unchanged room's QR
+    // (a real PNG encode, however cheap the server's own cache makes a
+    // *repeat* request) on every session create/destroy anywhere on the
+    // server.
+    const joinQrCache = new Map()
+
+    function renderSessions(sessions) {
+      sessionsEmptyEl.hidden = sessions.length > 0
+      sessionRowsEl.innerHTML = sessions.map(session => `
+        <tr>
+          <td><code>${escapeHtml(session.roomCode)}</code></td>
+          <td>${escapeHtml(session.presentationTitle || '—')}</td>
+          <td><span class="deck-url" title="${escapeHtml(session.deckUrl)}">${escapeHtml(session.deckUrl || '—')}</span></td>
+          <td>${countPill(session.participantCount)}</td>
+          <td>${countPill(session.connectedCount)}</td>
+          <td>${countPill(session.openHelpRequestCount, true)}</td>
+          <td>${escapeHtml(String(session.currentSlideIndex))}</td>
+          <td class="join-cell">
+            ${session.joinUrl
+              ? `<a class="join-link" href="${escapeHtml(session.joinUrl)}" target="_blank" rel="noopener" title="${escapeHtml(session.joinUrl)}">${escapeHtml(session.joinUrl)}</a>`
+              : '<span class="join-link">—</span>'}
+            ${session.joinUrl ? renderJoinQr(session.roomCode) : ''}
+          </td>
+          <td class="row-actions">
+            <button type="button" class="action-button" data-action="open-dashboard" data-room-code="${escapeHtml(session.roomCode)}">Open dashboard</button>
+            <button type="button" class="action-button danger" data-action="stop-session" data-room-code="${escapeHtml(session.roomCode)}">Stop</button>
+          </td>
+        </tr>
+      `).join('')
+
+      // Fetch (once, cached) the QR for any room this page hasn't asked for
+      // yet — not on every `home:update`, and not for a session with no join
+      // link to encode in the first place.
+      for (const session of sessions) {
+        if (session.joinUrl && !joinQrCache.has(session.roomCode))
+          fetchJoinQr(session.roomCode)
+      }
+    }
+
+    // Renders either the cached QR image, or a placeholder while it's
+    // in flight / if the server ever said no — same id on both, so
+    // `fetchJoinQr` below can swap one for the other with `outerHTML`
+    // without touching the rest of the row (an in-flight Stop/Open-dashboard
+    // click on the same row must not be reset by a QR arriving late).
+    function renderJoinQr(roomCode) {
+      const cached = joinQrCache.get(roomCode)
+      const id = `join-qr-${escapeHtml(roomCode)}`
+      if (cached)
+        return `<img class="join-qr" id="${id}" src="${cached}" alt="QR code to join this session" />`
+      return `<span class="join-qr-placeholder" id="${id}">${cached === null ? 'QR unavailable' : 'loading QR…'}</span>`
+    }
+
+    function fetchJoinQr(roomCode) {
+      socket.emit('home:joinQrDataUrl', { adminCode, roomCode }, (result) => {
+        joinQrCache.set(roomCode, (result && result.ok && result.qrDataUrl) || null)
+        const el = document.getElementById(`join-qr-${roomCode}`)
+        if (el)
+          el.outerHTML = renderJoinQr(roomCode)
+      })
+    }
+
+    // A zero reads as "nothing here", not as a highlighted number — and
+    // `attention` (open help requests) only turns red when there actually
+    // are some, mirroring the per-session dashboard's "needs attention"
+    // tile rather than inventing a second visual language for the same
+    // count.
+    function countPill(n, attention = false) {
+      const value = Number(n) || 0
+      const cls = value === 0 ? 'zero' : (attention ? 'attention' : '')
+      return `<span class="count-pill ${cls}">${value}</span>`
+    }
+
+    // "Open dashboard" deliberately fetches the link at click time instead
+    // of rendering an `<a href>` up front.
+    //
+    // The `home:update` feed carries **no presenter codes** by design (see
+    // `buildHomeUpdate` in `server.ts`) — but a working
+    // `/dashboard?code=…&roomCode=…` link needs one. Rather than widen that
+    // broadcast, the URL is requested for one room, on an explicit action,
+    // via the separately-authenticated `home:dashboardUrl` event, and then
+    // navigated to immediately. The code therefore never lands in this
+    // page's DOM, in an `href` a bystander could read off the status bar,
+    // or in anything the browser would keep for the life of the page.
+    //
+    // Bug found live: this used to be `location.href = result.url` — a
+    // same-tab navigation. With more than one live session, clicking "Open
+    // dashboard" on row A and then row B (before A's navigation actually
+    // finished — a `home:dashboardUrl` round trip is fast but not
+    // instant) meant the browser was already committed to A's document by
+    // the time B's ack arrived, so B's `location.href` assignment fired
+    // against a document already being torn down and did nothing. That reads
+    // as "every dashboard link goes to the same place" — it goes to whichever
+    // one was clicked *first*, no matter which row's button the operator
+    // actually pressed last. Opening in a **new tab** removes the whole race:
+    // each click gets its own tab regardless of ordering, matching what an
+    // operator managing several concurrent workshops actually wants anyway
+    // (compare dashboards side by side rather than losing `/home` each time).
+    // `noopener` for the same reason `<a target="_blank">` gets `rel="noopener"`
+    // elsewhere on this page — the opened dashboard should have no handle
+    // back to this admin-gated tab via `window.opener`.
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-action="open-dashboard"]')
+      if (!button)
+        return
+      button.disabled = true
+      socket.emit('home:dashboardUrl', { adminCode, roomCode: button.dataset.roomCode }, (result) => {
+        button.disabled = false
+        if (!result || !result.ok) {
+          // The session was destroyed between the last `home:update` and
+          // this click, or the credential stopped working. Either way there
+          // is nothing to open; the next `home:update` will drop the row.
+          button.textContent = 'unavailable'
+          return
+        }
+        window.open(result.url, '_blank', 'noopener')
+      })
+    })
+
+    // Plan 032c wired this up. The markup is exactly the contract 032b left
+    // behind (`data-action="present"`, `data-presentation-id`,
+    // `id="present-<id>"`); what changed is that the button is live and the
+    // "coming soon" title and the note paragraph under the table are gone.
+    //
+    // The presentation **id** is the only thing ever sent to the server. The
+    // deck's path is resolved server-side by `resolvePresentationDir` and
+    // never crosses the wire in either direction — this page has no way to
+    // name a directory even if it wanted to.
+    //
+    // The per-row `<span class="launch-result">` is where a launch's outcome
+    // lands: the returned URLs on success, the server's error on failure. A
+    // sibling of the button rather than a shared banner so two launches in
+    // flight at once can't overwrite each other's result.
+    function renderPresentations(presentations) {
+      presentationRowsEl.innerHTML = presentations.map(presentation => `
+        <tr>
+          <td>${escapeHtml(presentation.title)}</td>
+          <td><code>${escapeHtml(presentation.id)}</code></td>
+          <td class="row-actions">
+            <button
+              type="button"
+              class="action-button"
+              id="present-${escapeHtml(presentation.id)}"
+              data-action="present"
+              data-presentation-id="${escapeHtml(presentation.id)}"
+            >Present</button>
+            <span class="launch-result" id="launch-result-${escapeHtml(presentation.id)}"></span>
+          </td>
+        </tr>
+      `).join('')
+      presentationsEmptyEl.hidden = presentations.length > 0
+    }
+
+    // "Present" — the Flow A action. Delegated off `document` in the same
+    // shape as "Open dashboard" above, because both act on rows that are
+    // re-rendered wholesale and a per-row listener would be lost on the next
+    // render.
+    //
+    // The in-flight state is real and matters here in a way it doesn't for
+    // "Open dashboard": a cold `slidev` start runs Vite's dependency
+    // optimizer and can genuinely take tens of seconds (see
+    // `READINESS_TIMEOUT_MS`), so the button says "Starting…" and stays
+    // disabled for the whole wait rather than looking idle while a process
+    // boots. Disabling it is also what stops an impatient double-click from
+    // spending two of the server's four concurrency slots on the same deck.
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-action="present"]')
+      if (!button)
+        return
+      const presentationId = button.dataset.presentationId
+      const resultEl = document.getElementById(`launch-result-${presentationId}`)
+      button.disabled = true
+      button.textContent = 'Starting…'
+      resultEl.textContent = ''
+      resultEl.classList.remove('error')
+      postJson('/api/launch', { presentationId })
+        .then((body) => {
+          // The new session arrives in the Live sessions table on its own —
+          // `createSession` broadcasts `home:update`, which this page is
+          // already subscribed to — so there is nothing to render there. What
+          // this shows is the two things the broadcast deliberately does not
+          // carry: the presenter and participant URLs for the deck that was
+          // just started. Rendered rather than navigated to, because the
+          // operator who clicked Present is usually not the person who will
+          // present: they need to *hand these over*, and a navigation would
+          // take the URLs away from them.
+          resultEl.innerHTML = `
+            room <code>${escapeHtml(body.roomCode)}</code> ·
+            <a href="${escapeHtml(body.presenterUrl)}" target="_blank" rel="noopener">presenter</a> ·
+            <a href="${escapeHtml(body.participantUrl || '')}" target="_blank" rel="noopener">participants</a>
+          `
+        })
+        .catch((error) => {
+          // The server's own message, verbatim — for a deck that failed to
+          // start it carries the tail of the child's output, which is the
+          // whole point of capturing it (see `OUTPUT_TAIL_BYTES`). An
+          // operator debugging their own deck needs the real error, not
+          // "launch failed".
+          resultEl.textContent = error.message
+          resultEl.classList.add('error')
+        })
+        .finally(() => {
+          button.disabled = false
+          button.textContent = 'Present'
+        })
+    })
+
+    // "Stop" — ends a session, and kills its deck process if this server
+    // started one. For a Flow-B session (a deck that registered itself) there
+    // is no process of ours to kill and the operator's own `slidev` keeps
+    // running; the session simply goes away. The server tells us which of the
+    // two happened via `hadProcess`, and the confirmation below says so,
+    // because "did I just kill the presenter's dev server?" is a genuinely
+    // important thing for an operator to be sure about.
+    //
+    // No confirmation prompt: the row is re-rendered from the authoritative
+    // `home:update` either way, and a `confirm()` on a page this small would
+    // be the only modal in the product.
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-action="stop-session"]')
+      if (!button)
+        return
+      const roomCode = button.dataset.roomCode
+      button.disabled = true
+      button.textContent = 'Stopping…'
+      postJson('/api/stop', { roomCode })
+        .then((body) => {
+          // The row disappears with the next `home:update`, which the destroy
+          // has already triggered. Nothing to do but say what happened, for
+          // the fraction of a second before this button stops existing.
+          button.textContent = body.hadProcess ? 'Stopped' : 'Session ended'
+        })
+        .catch(() => {
+          // Most likely the session was already gone (another tab, or the
+          // deck crashed) — the next `home:update` drops the row regardless.
+          button.disabled = false
+          button.textContent = 'unavailable'
+        })
+    })
+
+    // The two `/api/*` POSTs this page makes, in one place.
+    //
+    // The admin code goes in the `x-muan-companion-admin-code` header rather
+    // than the query string (both are accepted — see `apiHttp.ts`): a query
+    // param lands in access logs and `Referer` headers, and unlike the page
+    // URL itself, these requests have somewhere better to put it.
+    //
+    // A non-2xx is turned into a rejected promise carrying the server's own
+    // `error` string, so both callers above can render the real reason
+    // instead of a generic failure.
+    function postJson(path, payload) {
+      return fetch(path, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-muan-companion-admin-code': adminCode || '',
+        },
+        body: JSON.stringify(payload),
+      }).then(async (response) => {
+        const body = await response.json().catch(() => ({}))
+        if (!response.ok)
+          throw new Error(body.error || `HTTP ${response.status}`)
+        return body
+      })
+    }
+
+    // Presentations are fetched once at load rather than pushed over the
+    // socket: the list changes when someone adds a folder on the server's
+    // disk, which is not an event this server watches for, and pretending
+    // otherwise with a live feed would imply a freshness it doesn't have.
+    // Reload the page to re-scan.
+    fetch(`/api/presentations?code=${encodeURIComponent(adminCode || '')}`)
+      .then((response) => {
+        if (!response.ok)
+          throw new Error(`HTTP ${response.status}`)
+        return response.json()
+      })
+      .then((body) => {
+        const presentations = body.presentations || []
+        presentationsEmptyEl.textContent = presentations.length
+          ? ''
+          : 'No presentations found. Set SLIDEV_MUAN_COMPANION_PRESENTATIONS_DIR to a directory whose subfolders each contain a slides.md with the muan-companion addon configured.'
+        renderPresentations(presentations)
+      })
+      .catch(() => {
+        presentationsEmptyEl.textContent = 'Could not load the presentation list.'
+        presentationsEmptyEl.hidden = false
+      })
+
+    // Flow B ("connect a deck the server didn't start") is plan 032d, built
+    // in a separate workstream that may or may not be deployed in the build
+    // serving this page. Rather than render a button that 404s when clicked
+    // — or omit the section entirely and leave an operator wondering where
+    // the documented feature went — the endpoint is **feature-detected**:
+    // ask for it once at load, and let the answer decide which of the two
+    // honest states this panel shows. A 404/405 (route absent) is the
+    // expected outcome today, not an error worth surfacing as a failure.
+    //
+    // Detection is a real `POST` rather than an `OPTIONS`/`HEAD` probe
+    // because this server answers every `OPTIONS` with a 204 from its global
+    // CORS middleware, which would report *every* path as present. A POST is
+    // what actually distinguishes "the route exists" from "connect fell
+    // through to its 404 handler". That makes detection indistinguishable
+    // from a first use, so the key it returns (when 032d *is* deployed) is
+    // displayed rather than discarded — minting one is idempotent from the
+    // operator's point of view (they get a key, single-use, short TTL) and
+    // throwing it away would be the more surprising behavior.
+    // The admin code travels in the header 032d's route actually reads
+    // (`apiHttp.ts`'s `ADMIN_CODE_HEADER`), not as a body field. 032b wrote
+    // this page against an endpoint that did not exist yet and guessed
+    // `{ adminCode }` in the body; 032d settled on header-or-`?code=`, and
+    // the two never met until 032c wired up the rest of this page's POSTs.
+    // Left as an explicit `fetch` rather than routed through `postJson`
+    // below because this call deliberately treats a 404/405 as a *success*
+    // (the route isn't deployed), which `postJson` would turn into a throw.
+    fetch('/api/connect-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-muan-companion-admin-code': adminCode || '' },
+    })
+      .then(async (response) => {
+        if (response.status === 404 || response.status === 405) {
+          connectNoteEl.textContent = 'Not available yet — connecting an already-running deck arrives in plan 032d.'
+          return
+        }
+        if (!response.ok) {
+          connectNoteEl.textContent = `Connect-key service returned HTTP ${response.status}.`
+          return
+        }
+        const body = await response.json()
+        connectNoteEl.textContent = 'Start your own deck with this key in SLIDEV_MUAN_COMPANION_CONNECT_KEY to have it show up above.'
+        connectButtonEl.disabled = false
+        showConnectKey(body)
+      })
+      .catch(() => {
+        connectNoteEl.textContent = 'Not available yet — connecting an already-running deck arrives in plan 032d.'
+      })
+
+    connectButtonEl.addEventListener('click', () => {
+      connectButtonEl.disabled = true
+      postJson('/api/connect-key', undefined)
+        .then(showConnectKey)
+        .catch(() => {
+          connectResultEl.textContent = 'Could not generate a connect key.'
+          connectResultEl.hidden = false
+        })
+        .finally(() => { connectButtonEl.disabled = false })
+    })
+
+    // Tolerant of the exact field name 032d settles on — this page is
+    // written against an endpoint that doesn't exist yet, so it reads
+    // whichever of the plausible key fields is present rather than assuming
+    // one and rendering "undefined" if the other was chosen.
+    function showConnectKey(body) {
+      const key = body && (body.connectKey || body.key)
+      if (!key)
+        return
+      connectResultEl.textContent = `Connect key: ${key}`
+      connectResultEl.hidden = false
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div')
+      div.textContent = str == null ? '' : String(str)
+      return div.innerHTML
+    }
+  </script>
+</body>
+</html>

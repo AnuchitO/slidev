@@ -1,0 +1,36 @@
+# .dockerignore for ../../Dockerfile's intended build context (the repo
+# root — see that file's header comment for why). Plain ".dockerignore"
+# files are only auto-applied by Docker/BuildKit when they sit at the
+# *build context's* root, or (BuildKit only) when renamed to match the
+# Dockerfile's context-relative path, e.g.
+# "packages/muan-companion-server/Dockerfile.dockerignore". This file
+# living here is for discoverability next to the Dockerfile it belongs to;
+# to make it actually take effect when building with `-f
+# packages/muan-companion-server/Dockerfile .` from the repo root, either
+# copy/symlink it to the repo root as ".dockerignore", or duplicate it as
+# "packages/muan-companion-server/Dockerfile.dockerignore" (same content,
+# BuildKit-only auto-pickup). See muan-companion.md "Docker" for the
+# verified build command and this caveat.
+
+.git
+.github
+node_modules
+**/node_modules
+**/dist
+**/dist-ssr
+.slidev
+.vite-inspect
+.nuxt
+.output
+*.local
+.env
+*.pdf
+*-export
+components.d.ts
+docs/.vitepress/cache
+cypress/downloads
+cypress/videos
+cypress/screenshots
+.DS_Store
+.eslintcache
+.idea

@@ -190,6 +190,7 @@
     <thead>
       <tr>
         <th>Room code</th>
+        <th>Presentation</th>
         <th>Deck URL</th>
         <th>Participants</th>
         <th>Connected</th>
@@ -261,6 +262,7 @@
       sessionRowsEl.innerHTML = sessions.map(session => `
         <tr>
           <td><code>${escapeHtml(session.roomCode)}</code></td>
+          <td>${escapeHtml(session.presentationTitle || '—')}</td>
           <td><span class="deck-url" title="${escapeHtml(session.deckUrl)}">${escapeHtml(session.deckUrl || '—')}</span></td>
           <td>${countPill(session.participantCount)}</td>
           <td>${countPill(session.connectedCount)}</td>

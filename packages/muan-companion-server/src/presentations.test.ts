@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'pathe'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { discoverPresentations, listPresentations, resolvePresentationDir } from './presentations'
+import { discoverPresentations, listPresentations, resolvePresentation, resolvePresentationDir } from './presentations'
 
 // A real temp directory tree per test rather than a mocked `node:fs`: the
 // whole point of this module is what it does against a real filesystem
@@ -263,6 +263,20 @@ addons:
 
     it('returns undefined when no root is configured at all', () => {
       expect(resolvePresentationDir(undefined, 'intro')).toBeUndefined()
+    })
+  })
+
+  describe('resolvePresentation (resolvePresentationDir\'s title-carrying superset)', () => {
+    it('resolves a discovered id to its id, title, and absolute directory', () => {
+      const dir = makeDeck('intro', WITH_ADDON_FRONTMATTER)
+
+      expect(resolvePresentation(root, 'intro')).toEqual({ id: 'intro', title: 'Intro to Vue', dir })
+    })
+
+    it('agrees with resolvePresentationDir on every id resolvePresentationDir rejects', () => {
+      makeDeck('intro', WITH_ADDON_FRONTMATTER)
+      for (const id of ['nope', undefined, '', '..', '../intro', 'intro/'])
+        expect(resolvePresentation(root, id)).toBeUndefined()
     })
   })
 })

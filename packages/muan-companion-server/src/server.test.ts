@@ -2793,6 +2793,7 @@ describe('createMuanCompanionServer', () => {
           'deckUrl',
           'openHelpRequestCount',
           'participantCount',
+          'presentationTitle',
           'roomCode',
         ])
       })

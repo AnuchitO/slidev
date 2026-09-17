@@ -10,7 +10,7 @@ import {
   launchPresentation,
   stopSpawnedDeck,
 } from './deckLauncher'
-import { resolvePresentationDir } from './presentations'
+import { resolvePresentation } from './presentations'
 
 const LAUNCH_ROUTE = '/api/launch'
 const STOP_ROUTE = '/api/stop'
@@ -178,15 +178,17 @@ async function handleLaunch(
     return
   }
 
-  // **The one path resolution in all of 032c.** `resolvePresentationDir` is an
+  // **The one path resolution in all of 032c.** `resolvePresentation` is an
   // exact-match lookup against a freshly-scanned configured root — the id is
   // compared against strings the filesystem itself just produced, so `..`, an
   // absolute path, a separator, or any percent-decoded traversal simply
   // matches nothing. There is deliberately no `join(root, id)` anywhere in this
   // feature; see that function's own doc comment for why the exact-match shape
-  // is the point rather than an implementation detail.
-  const presentationDir = resolvePresentationDir(options.presentationsDir, presentationId)
-  if (!presentationDir) {
+  // is the point rather than an implementation detail. Its `title` rides along
+  // with the resolved `dir` so the session created below can label itself for
+  // the home view without a second scan of the discovery root.
+  const presentation = resolvePresentation(options.presentationsDir, presentationId)
+  if (!presentation) {
     // 404 and **no spawn attempt** — this is the assertion the launch route's
     // test pins down. An unknown id is indistinguishable from a known id in a
     // deployment with discovery switched off, which is the correct amount of
@@ -201,7 +203,7 @@ async function handleLaunch(
   let deck: LaunchedDeck
   try {
     deck = await launchPresentation({
-      presentationDir,
+      presentationDir: presentation.dir,
       presentationId,
       serverUrl,
       remote: options.remote,
@@ -257,7 +259,7 @@ async function handleLaunch(
 
   let session: CreateSessionResult
   try {
-    session = options.createSession({ deckUrl })
+    session = options.createSession({ deckUrl, presentationTitle: presentation.title })
   }
   catch (error) {
     // `createSession` throws only on a duplicate room code, which for a

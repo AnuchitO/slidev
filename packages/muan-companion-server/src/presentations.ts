@@ -382,7 +382,21 @@ export function listPresentations(rootDir: string | undefined): Presentation[] {
  * invent a second.
  */
 export function resolvePresentationDir(rootDir: string | undefined, id: string | undefined): string | undefined {
+  return resolvePresentation(rootDir, id)?.dir
+}
+
+/**
+ * `resolvePresentationDir`'s superset: the same exact-match-against-a-fresh-
+ * scan lookup, but returning the whole discovered entry rather than just its
+ * `dir`. Added for the deck launcher's benefit (`deckLaunchRoutes.ts`), which
+ * needs the presentation's **title** too — to label the session it creates
+ * for the home view's "which deck is this" column — without a second scan of
+ * the discovery root alongside the one `resolvePresentationDir` already does.
+ * `resolvePresentationDir` is kept as a thin wrapper (rather than replaced)
+ * since every existing caller only ever wanted the path.
+ */
+export function resolvePresentation(rootDir: string | undefined, id: string | undefined): DiscoveredPresentation | undefined {
   if (!id)
     return undefined
-  return discoverPresentations(rootDir).find(presentation => presentation.id === id)?.dir
+  return discoverPresentations(rootDir).find(presentation => presentation.id === id)
 }

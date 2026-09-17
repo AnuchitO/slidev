@@ -24,7 +24,7 @@ import {
   SERVER_URL_ENV,
   spawnedDeckCount,
 } from './deckLauncher'
-import { createMuanCompanionServer } from './server'
+import { buildHomeUpdate, createMuanCompanionServer } from './server'
 import { getRoom, resetSessionStateForTests } from './session'
 
 // Plan 032c. The three credentials, deliberately distinct strings for the same
@@ -450,6 +450,20 @@ describe('deck launch routes (plan 032c)', () => {
       // path uses — not a special-cased second kind of thing.
       expect(getRoom(body.roomCode)).toBeDefined()
       expect(spawnedDeckCount()).toBe(1)
+    })
+
+    it('labels the created session with the presentation\'s discovered title, for the home view', async () => {
+      const response = await post('/api/launch', { presentationId: 'intro' })
+      const body = await response.json() as { roomCode: string }
+
+      // "intro"'s `slides.md` frontmatter (`createPresentationsDir` above)
+      // sets `title: Intro to Vue` — that's what a home-view operator sees on
+      // the Presentations table's "Present" row, and it should be the same
+      // string that comes back labeling the *live session* the click just
+      // created, not the bare id or an empty field.
+      expect(getRoom(body.roomCode)?.presentationTitle).toBe('Intro to Vue')
+      const summary = buildHomeUpdate().sessions.find(s => s.roomCode === body.roomCode)
+      expect(summary?.presentationTitle).toBe('Intro to Vue')
     })
 
     it('404s an unknown presentation id without attempting a spawn', async () => {

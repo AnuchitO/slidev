@@ -470,6 +470,16 @@ export interface HomeSessionSummary {
   /** Participants currently `connected` — the "how full is this room right now" number a home view actually wants. */
   connectedCount: number
   openHelpRequestCount: number
+  /**
+   * The `Presentation.title` this session was launched from (Flow A —
+   * `RoomState.presentationTitle`, set by `POST /api/launch`), so the home
+   * view's session table can show *which deck* is running instead of just
+   * its room code. `undefined` for the boot session and every Flow-B
+   * (`POST /api/register`) session — neither came from discovery, so there
+   * is no `Presentation` to name; the home view falls back to `deckUrl` for
+   * those, same as it already does for `presenterUrl`'s absence elsewhere.
+   */
+  presentationTitle?: string
 }
 
 /**
@@ -494,6 +504,7 @@ export function buildHomeUpdate(): { sessions: HomeSessionSummary[] } {
       participantCount: room.participants.size,
       connectedCount: [...room.participants.values()].filter(p => p.connected).length,
       openHelpRequestCount: room.errorReports.filter(r => r.status === 'open' || r.status === 'reopened').length,
+      presentationTitle: room.presentationTitle,
     })),
   }
 }

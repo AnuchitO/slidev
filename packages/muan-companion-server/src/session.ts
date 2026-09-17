@@ -163,6 +163,8 @@ export interface RoomState {
   presenterCode: string
   /** See `CreateMuanCompanionServerOptions.deckUrl` (`server.ts`). Per-room so 032b/032d can launch different decks side by side. */
   deckUrl: string
+  /** See `CreateSessionOptions.presentationTitle`'s own doc comment. */
+  presentationTitle?: string
   session: WorkshopSession
   participants: Map<string, Participant>
   stepStatus: Map<string, StepStatusValue>
@@ -307,6 +309,18 @@ export interface CreateSessionOptions {
    * module.
    */
   generate?: (length: number) => string
+  /**
+   * The discovered `Presentation.title` this session was launched from
+   * (plan 032c's `POST /api/launch`, via `resolvePresentation` —
+   * `presentations.ts`), carried through purely so the home view can label a
+   * live session with which deck is actually running (`HomeSessionSummary`
+   * in `server.ts`). `undefined` for every session that didn't come from
+   * Flow A's discovery — the boot session and any Flow-B (`POST
+   * /api/register`) session, neither of which has a `Presentation` behind
+   * it — and the home view falls back to the bare `deckUrl` for those rather
+   * than inventing a title.
+   */
+  presentationTitle?: string
 }
 
 export interface CreateSessionResult {
@@ -369,6 +383,7 @@ export function createSession(options: CreateSessionOptions = {}): CreateSession
     roomCode,
     presenterCode,
     deckUrl: options.deckUrl ?? '',
+    presentationTitle: options.presentationTitle,
     session: {
       id: roomCode,
       currentSlideIndex: 1,

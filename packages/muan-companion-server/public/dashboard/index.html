@@ -199,6 +199,16 @@
     font-size: 11px;
     padding: 1px 6px;
   }
+  /* The "open presenter view" link on the presenter-code row — same small
+     scale as `.code-copy` next to it, colored to read as a link rather than
+     a third button. */
+  .code-open-link {
+    color: var(--wt-primary);
+    font-size: 11px;
+    text-decoration: none;
+  }
+  .code-open-link:hover { text-decoration: underline; }
+
   /*
    * Bug found live: `.codes-panel`/`.share-panel` (below) both set `display`
    * unconditionally, and a class selector's `display` has the same
@@ -632,6 +642,16 @@
       <span class="code-label">Presenter code (yours only):</span>
       <code id="code-presenter"></code>
       <button type="button" class="code-copy" data-copy-target="code-presenter">copy</button>
+      <!--
+        `href` is set from `dashboard:join`'s ack (`result.presenterUrl` —
+        `buildPresenterUrl`, server.ts), the same URL `POST /api/launch`/`POST
+        /api/register` hand an operator elsewhere — this is just a second,
+        more convenient place to reach it once the dashboard is already open,
+        rather than a separately-derived link that could drift from it.
+        `target="_blank"` so clicking it doesn't navigate the operator away
+        from the dashboard they're looking at.
+      -->
+      <a class="code-open-link" id="presenter-link" target="_blank" rel="noopener">open presenter view</a>
     </div>
   </div>
 
@@ -721,6 +741,7 @@
     const codesPanelEl = document.getElementById('codes-panel')
     const codeRoomEl = document.getElementById('code-room')
     const codePresenterEl = document.getElementById('code-presenter')
+    const presenterLinkEl = document.getElementById('presenter-link')
     const sharePanelEl = document.getElementById('share-panel')
     const shareLinkEl = document.getElementById('share-link')
     const shareQrEl = document.getElementById('share-qr')
@@ -813,6 +834,7 @@
         if (result && result.roomCode) {
           codeRoomEl.textContent = result.roomCode
           codePresenterEl.textContent = result.presenterCode
+          presenterLinkEl.href = result.presenterUrl
           codesPanelEl.hidden = false
         }
         // The shareable join link + QR code (see `#share-panel`'s own HTML

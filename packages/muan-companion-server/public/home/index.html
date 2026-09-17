@@ -159,6 +159,45 @@
   }
   .panel h2 { margin-top: 0; }
   .row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  /*
+   * The "Join" cell: the participant link as text (so it can be read/copied
+   * without opening it) plus its QR code once fetched. Column, not row,
+   * because the link text and an 80px-square image side by side would make
+   * this already-wide table wider still; stacking keeps the cell's own width
+   * to whichever of the two is wider.
+   */
+  .join-cell { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+  .join-link {
+    color: var(--wt-primary);
+    font-size: 12px;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .join-qr {
+    width: 72px;
+    height: 72px;
+    border-radius: 4px;
+    /* A visible plate behind the QR while it loads/if it never does — a PNG
+     * with white modules on transparent would otherwise be unreadable
+     * against this page's dark background. */
+    background: #fff;
+    padding: 2px;
+  }
+  .join-qr-placeholder {
+    width: 72px;
+    height: 72px;
+    border-radius: 4px;
+    border: 1px dashed var(--border);
+    color: var(--muted);
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 4px;
+  }
 </style>
 </head>
 <body>
@@ -196,6 +235,7 @@
         <th>Connected</th>
         <th>Needs attention</th>
         <th>Slide</th>
+        <th>Join</th>
         <th>Actions</th>
       </tr>
     </thead>
@@ -257,6 +297,15 @@
     // Live session create/destroy, pushed by `broadcastHomeUpdate`.
     socket.on('home:update', payload => renderSessions(payload.sessions || []))
 
+    // roomCode -> data: URL, `null` for "asked and the server said no", or
+    // absent for "not asked yet". Keyed here (not re-derived from `session`)
+    // so a QR fetched for one `home:update` snapshot survives being rendered
+    // again by the next one, instead of re-fetching an unchanged room's QR
+    // (a real PNG encode, however cheap the server's own cache makes a
+    // *repeat* request) on every session create/destroy anywhere on the
+    // server.
+    const joinQrCache = new Map()
+
     function renderSessions(sessions) {
       sessionsEmptyEl.hidden = sessions.length > 0
       sessionRowsEl.innerHTML = sessions.map(session => `
@@ -268,12 +317,48 @@
           <td>${countPill(session.connectedCount)}</td>
           <td>${countPill(session.openHelpRequestCount, true)}</td>
           <td>${escapeHtml(String(session.currentSlideIndex))}</td>
+          <td class="join-cell">
+            ${session.joinUrl
+              ? `<a class="join-link" href="${escapeHtml(session.joinUrl)}" target="_blank" rel="noopener" title="${escapeHtml(session.joinUrl)}">${escapeHtml(session.joinUrl)}</a>`
+              : '<span class="join-link">—</span>'}
+            ${session.joinUrl ? renderJoinQr(session.roomCode) : ''}
+          </td>
           <td class="row-actions">
             <button type="button" class="action-button" data-action="open-dashboard" data-room-code="${escapeHtml(session.roomCode)}">Open dashboard</button>
             <button type="button" class="action-button danger" data-action="stop-session" data-room-code="${escapeHtml(session.roomCode)}">Stop</button>
           </td>
         </tr>
       `).join('')
+
+      // Fetch (once, cached) the QR for any room this page hasn't asked for
+      // yet — not on every `home:update`, and not for a session with no join
+      // link to encode in the first place.
+      for (const session of sessions) {
+        if (session.joinUrl && !joinQrCache.has(session.roomCode))
+          fetchJoinQr(session.roomCode)
+      }
+    }
+
+    // Renders either the cached QR image, or a placeholder while it's
+    // in flight / if the server ever said no — same id on both, so
+    // `fetchJoinQr` below can swap one for the other with `outerHTML`
+    // without touching the rest of the row (an in-flight Stop/Open-dashboard
+    // click on the same row must not be reset by a QR arriving late).
+    function renderJoinQr(roomCode) {
+      const cached = joinQrCache.get(roomCode)
+      const id = `join-qr-${escapeHtml(roomCode)}`
+      if (cached)
+        return `<img class="join-qr" id="${id}" src="${cached}" alt="QR code to join this session" />`
+      return `<span class="join-qr-placeholder" id="${id}">${cached === null ? 'QR unavailable' : 'loading QR…'}</span>`
+    }
+
+    function fetchJoinQr(roomCode) {
+      socket.emit('home:joinQrDataUrl', { adminCode, roomCode }, (result) => {
+        joinQrCache.set(roomCode, (result && result.ok && result.qrDataUrl) || null)
+        const el = document.getElementById(`join-qr-${roomCode}`)
+        if (el)
+          el.outerHTML = renderJoinQr(roomCode)
+      })
     }
 
     // A zero reads as "nothing here", not as a highlighted number — and
@@ -298,6 +383,23 @@
     // navigated to immediately. The code therefore never lands in this
     // page's DOM, in an `href` a bystander could read off the status bar,
     // or in anything the browser would keep for the life of the page.
+    //
+    // Bug found live: this used to be `location.href = result.url` — a
+    // same-tab navigation. With more than one live session, clicking "Open
+    // dashboard" on row A and then row B (before A's navigation actually
+    // finished — a `home:dashboardUrl` round trip is fast but not
+    // instant) meant the browser was already committed to A's document by
+    // the time B's ack arrived, so B's `location.href` assignment fired
+    // against a document already being torn down and did nothing. That reads
+    // as "every dashboard link goes to the same place" — it goes to whichever
+    // one was clicked *first*, no matter which row's button the operator
+    // actually pressed last. Opening in a **new tab** removes the whole race:
+    // each click gets its own tab regardless of ordering, matching what an
+    // operator managing several concurrent workshops actually wants anyway
+    // (compare dashboards side by side rather than losing `/home` each time).
+    // `noopener` for the same reason `<a target="_blank">` gets `rel="noopener"`
+    // elsewhere on this page — the opened dashboard should have no handle
+    // back to this admin-gated tab via `window.opener`.
     document.addEventListener('click', (event) => {
       const button = event.target.closest('button[data-action="open-dashboard"]')
       if (!button)
@@ -312,7 +414,7 @@
           button.textContent = 'unavailable'
           return
         }
-        location.href = result.url
+        window.open(result.url, '_blank', 'noopener')
       })
     })
 

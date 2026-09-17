@@ -373,6 +373,12 @@ describe('createMuanCompanionServer', () => {
       )
 
       expect(ack).toMatchObject({ ok: true, roomCode: TEST_ROOM_CODE, presenterCode: TEST_PRESENTER_CODE })
+      // The presenter's own "drive this deck" link (bug fix: this used to be
+      // absent from the ack entirely, so the dashboard's "Presenter code" row
+      // had no way to offer it as a link) — the exact shape `buildPresenterUrl`
+      // produces, `roomCode` included, so it's not the boot-session-fallback
+      // bug `buildPresenterUrl`'s own doc comment describes.
+      expect(ack.presenterUrl).toBe(buildPresenterUrl(DEFAULT_DECK_URL, TEST_ROOM_CODE, TEST_PRESENTER_CODE))
     })
 
     it('a rejected dashboard:join does not leak either code', async () => {
@@ -387,6 +393,7 @@ describe('createMuanCompanionServer', () => {
       expect(ack).toEqual({ ok: false })
       expect(ack.roomCode).toBeUndefined()
       expect(ack.presenterCode).toBeUndefined()
+      expect(ack.presenterUrl).toBeUndefined()
     })
 
     it('a participant with a valid room code but no presenter code cannot open the dashboard', async () => {
@@ -699,6 +706,41 @@ describe('createMuanCompanionServer', () => {
 
         expect(await emitWithAck(home, 'home:dashboardUrl', { adminCode: TEST_ADMIN_CODE, roomCode: 'no-such-room' })).toEqual({ ok: false })
         expect(await emitWithAck(home, 'home:dashboardUrl', { adminCode: TEST_ADMIN_CODE })).toEqual({ ok: false })
+      })
+    })
+
+    describe('home:joinQrDataUrl (per-session participant link + QR, on demand)', () => {
+      it('returns the join link and a data: URL QR code for a live room, given the admin code', async () => {
+        const home = await connectClient()
+        await emitWithAck(home, 'home:join', { adminCode: TEST_ADMIN_CODE })
+
+        const ack = await emitWithAck<{ ok: boolean, url?: string, qrDataUrl?: string }>(
+          home,
+          'home:joinQrDataUrl',
+          { adminCode: TEST_ADMIN_CODE, roomCode: TEST_ROOM_CODE },
+        )
+
+        expect(ack.ok).toBe(true)
+        expect(ack.url).toBe(`${DEFAULT_DECK_URL}?roomCode=${encodeURIComponent(TEST_ROOM_CODE)}`)
+        // Same encoding the per-room dashboard's own QR uses
+        // (`getJoinQrDataUrl`) — one PNG-encode implementation, not a second
+        // copy of it for this page.
+        expect(ack.qrDataUrl).toMatch(/^data:image\/png;base64,/)
+      })
+
+      it('re-checks the admin code per event rather than trusting an earlier home:join', async () => {
+        const home = await connectClient()
+        await emitWithAck(home, 'home:join', { adminCode: TEST_ADMIN_CODE })
+
+        expect(await emitWithAck(home, 'home:joinQrDataUrl', { roomCode: TEST_ROOM_CODE })).toEqual({ ok: false })
+        expect(await emitWithAck(home, 'home:joinQrDataUrl', { adminCode: 'wrong', roomCode: TEST_ROOM_CODE })).toEqual({ ok: false })
+      })
+
+      it('acks { ok: false } for an unknown room, indistinguishably from a bad credential', async () => {
+        const home = await connectClient()
+
+        expect(await emitWithAck(home, 'home:joinQrDataUrl', { adminCode: TEST_ADMIN_CODE, roomCode: 'no-such-room' })).toEqual({ ok: false })
+        expect(await emitWithAck(home, 'home:joinQrDataUrl', { adminCode: TEST_ADMIN_CODE })).toEqual({ ok: false })
       })
     })
 
@@ -2791,6 +2833,7 @@ describe('createMuanCompanionServer', () => {
           'currentSlideIndex',
           'currentStepId',
           'deckUrl',
+          'joinUrl',
           'openHelpRequestCount',
           'participantCount',
           'presentationTitle',

@@ -408,6 +408,18 @@ export interface DashboardJoinAck {
    * yet" case for it the way there is for the other two.
    */
   deckUrl?: string
+  /**
+   * The presenter's own "drive this deck" URL — `buildPresenterUrl`, the
+   * same one `POST /api/launch`/`POST /api/register` hand back. Lets the
+   * dashboard's "Presenter code" row offer an actual link (open the
+   * presenter view) instead of just the bare code to copy elsewhere. Safe to
+   * echo back for the identical reason `roomCode`/`presenterCode` already
+   * are here: reaching this line already proved the caller holds this exact
+   * presenter code. Always present alongside `ok: true`, matching
+   * `buildPresenterUrl`'s own "never undefined" contract — unlike `joinUrl`,
+   * there's no "nothing valid to show yet" case for it.
+   */
+  presenterUrl?: string
   /** See `buildJoinUrl`'s doc comment — `undefined` iff no room code is configured. */
   joinUrl?: string
   /**
@@ -496,6 +508,18 @@ export interface HomeSessionSummary {
    * those, same as it already does for `presenterUrl`'s absence elsewhere.
    */
   presentationTitle?: string
+  /**
+   * The participant-facing join link — `buildJoinUrl(room.deckUrl,
+   * room.roomCode)`. Both of its inputs (`deckUrl`, `roomCode`) are already
+   * plain fields on this same summary, so including the precomputed URL adds
+   * no new exposure — it just saves every subscriber re-deriving the same
+   * template string `server.ts` already owns the one definition of.
+   * `undefined` in lockstep with `buildJoinUrl`'s own "no room code, no
+   * link" case, which cannot actually happen for a session `createSession`
+   * produced (it always has a real room code) but is typed to match the
+   * function's real signature rather than asserted away.
+   */
+  joinUrl?: string
 }
 
 /**
@@ -521,6 +545,7 @@ export function buildHomeUpdate(): { sessions: HomeSessionSummary[] } {
       connectedCount: [...room.participants.values()].filter(p => p.connected).length,
       openHelpRequestCount: room.errorReports.filter(r => r.status === 'open' || r.status === 'reopened').length,
       presentationTitle: room.presentationTitle,
+      joinUrl: buildJoinUrl(room.deckUrl, room.roomCode),
     })),
   }
 }
@@ -550,6 +575,24 @@ export interface HomeJoinAck extends Partial<ReturnType<typeof buildHomeUpdate>>
 export interface HomeDashboardUrlAck {
   ok: boolean
   url?: string
+}
+
+/**
+ * The `home:joinQrDataUrl` ack — the participant-link twin of
+ * `home:dashboardUrl` above. `url` is the same `joinUrl` a `home:update` row
+ * already carries (returned again here so a caller that only wired up this
+ * one event doesn't also have to read the broadcast); `qrDataUrl` is a
+ * `data:image/png;base64,...` string encoding it, via the same
+ * `getJoinQrDataUrl` the per-room dashboard already uses — one QR-encoding
+ * implementation for the one join link, not a second copy for this page.
+ * Both are `undefined` together whenever `ok` is `false`, or when the room
+ * has no room code to build a link from (matches `HomeSessionSummary.joinUrl`
+ * and `buildJoinUrl`'s own "nothing to encode" case).
+ */
+export interface HomeJoinQrDataUrlAck {
+  ok: boolean
+  url?: string
+  qrDataUrl?: string
 }
 
 /**
@@ -1814,6 +1857,7 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         roomCode: room.roomCode,
         presenterCode: room.presenterCode,
         deckUrl: room.deckUrl,
+        presenterUrl: buildPresenterUrl(room.deckUrl, room.roomCode, room.presenterCode),
         joinUrl: joinUrlOf(room),
         joinQrDataUrl: await getJoinQrDataUrl(room),
       })
@@ -1906,6 +1950,35 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
         return
       }
       ack?.({ ok: true, url: dashboardUrlFor(room) })
+    })
+
+    // `home:dashboardUrl`'s participant-link twin: the QR code and plain
+    // join link for one room, fetched on demand rather than folded into
+    // `home:update`.
+    //
+    // The plain `joinUrl` *is* already in every `home:update` row (it carries
+    // no credential — see `HomeSessionSummary.joinUrl`'s own comment), so
+    // this event exists specifically for the QR **image**: `getJoinQrDataUrl`
+    // does a real PNG encode, and doing that unconditionally for every live
+    // session on every create/destroy broadcast would pay that cost for
+    // sessions no one is looking at. One encode per room, on first request,
+    // matches the dashboard's own lazy-and-cached posture for the identical
+    // value (`room.joinQrDataUrlPromise`) — a second dashboard, or this page,
+    // opening moments later reuses the same cached PNG rather than
+    // re-encoding it.
+    socket.on('home:joinQrDataUrl', async (payload: { adminCode?: string, roomCode?: string } | null | undefined, ack?: (result: HomeJoinQrDataUrlAck) => void) => {
+      if (!isValidAdminCode(adminCode, payload?.adminCode)) {
+        ack?.({ ok: false })
+        return
+      }
+      const room = getRoom(payload?.roomCode)
+      if (!room) {
+        ack?.({ ok: false })
+        return
+      }
+      const url = joinUrlOf(room)
+      const qrDataUrl = await getJoinQrDataUrl(room)
+      ack?.({ ok: true, url, qrDataUrl })
     })
   }
 

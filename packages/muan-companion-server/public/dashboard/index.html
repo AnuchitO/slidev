@@ -678,8 +678,23 @@
   <script src="/socket.io/socket.io.js"></script>
   <script>
     const presenterCode = new URLSearchParams(location.search).get('code') || undefined
+    // Bug found live: a dashboard opened for anything other than this
+    // server's *boot* session (i.e. every session `/home`'s Present button
+    // or a self-registering deck creates) connected with no room hint at
+    // all, so the server's own `io.on('connection')` resolved this socket to
+    // the *boot* session by default (`ROOM_CODE_QUERY_PARAM`'s own comment
+    // describes the fallback) — `presenterCode` above then got checked
+    // against the *wrong* room and `dashboard:join` rejected it every time,
+    // even with the exact code this page's own URL was opened with. Reading
+    // `roomCode` back out of the same URL `home:dashboardUrl`/`POST
+    // /api/register` build (`?code=…&roomCode=…`) and passing it as the
+    // Socket.io handshake's room hint is the fix — omitted (rather than sent
+    // empty) when absent, so an old `/dashboard?code=…` link with no
+    // `roomCode` at all still falls through to the server's own "no hint →
+    // boot session" default, unchanged.
+    const roomCodeHint = new URLSearchParams(location.search).get('roomCode') || undefined
 
-    const socket = io()
+    const socket = io(roomCodeHint ? { query: { roomCode: roomCodeHint } } : undefined)
     const connEl = document.getElementById('conn')
     const rowsEl = document.getElementById('rows')
     const emptyEl = document.getElementById('empty')

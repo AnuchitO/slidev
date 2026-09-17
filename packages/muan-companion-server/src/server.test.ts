@@ -3007,8 +3007,14 @@ describe('createMuanCompanionServer', () => {
         // Exactly the shapes `buildJoinUrl`/`buildPresenterUrl` produce — the
         // same helpers every other surface in this package uses.
         expect(body.participantUrl).toBe(buildJoinUrl(DECK, body.roomCode))
-        expect(body.presenterUrl).toBe(buildPresenterUrl(DECK, body.presenterCode))
-        expect(body.presenterUrl).toBe(`${DECK}/presenter/1?code=${encodeURIComponent(body.presenterCode)}`)
+        expect(body.presenterUrl).toBe(buildPresenterUrl(DECK, body.roomCode, body.presenterCode))
+        // `roomCode` rides along in the query string too (not just `code`) —
+        // the fix for a bug found live: with no room hint at all, the addon's
+        // `getWorkshopSocket()` (running in the presenter's own window) fell
+        // back to this *server's* boot session on every socket, silently
+        // moving the wrong room's slide. See `buildPresenterUrl`'s own doc
+        // comment for the full incident.
+        expect(body.presenterUrl).toBe(`${DECK}/presenter/1?code=${encodeURIComponent(body.presenterCode)}&roomCode=${encodeURIComponent(body.roomCode)}`)
       })
 
       it('registers the session in rooms with the supplied deck URL, isolated from the boot session', async () => {

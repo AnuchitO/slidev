@@ -254,9 +254,25 @@ export function buildJoinUrl(deckUrl: string, roomCode: string): string | undefi
  * URL with an empty code is still the correct URL to open; it simply won't
  * authorize anything, which is the intended fail-closed outcome for a session
  * with no presenter code rather than a link worth suppressing.
+ *
+ * **`roomCode` in the query string too, not just `code`.** Bug found live: for
+ * any session that isn't this process's *boot* session (every Flow A launch —
+ * `POST /api/launch` — and every Flow B registration — `POST /api/register`),
+ * a presenter URL with no room hint at all silently drove the *wrong* room.
+ * `client.ts`'s `getWorkshopSocket()` (the addon, running inside the deck this
+ * URL points at) reads `?roomCode=` off the page's own URL and passes it as
+ * the Socket.io handshake's room hint (`ROOM_CODE_QUERY_PARAM` — see that
+ * constant's own comment); with nothing to read, every socket from that deck —
+ * the presenter's own included — fell back to `defaultRoomCode` (the boot
+ * session). `presenter:setSlide` then moved the *boot* session's slide while
+ * the actual participants, correctly joined to the launched room, never saw
+ * it move; opening `/dashboard` with this URL's `code` similarly got checked
+ * against the boot session's presenter code and was silently rejected. Adding
+ * `roomCode` here is the fix for the presenter's own window; `buildJoinUrl`
+ * already carried it for participants, so this closes the one gap.
  */
-export function buildPresenterUrl(deckUrl: string, presenterCode: string): string {
-  return `${deckUrl}/presenter/1?code=${encodeURIComponent(presenterCode)}`
+export function buildPresenterUrl(deckUrl: string, roomCode: string, presenterCode: string): string {
+  return `${deckUrl}/presenter/1?code=${encodeURIComponent(presenterCode)}&roomCode=${encodeURIComponent(roomCode)}`
 }
 
 export interface MuanCompanionServer {

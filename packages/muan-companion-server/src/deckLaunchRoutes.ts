@@ -112,7 +112,7 @@ export interface CreateDeckLaunchRoutesOptions {
   /** Builds the participant-facing join URL — `server.ts`'s `buildJoinUrl`. */
   buildJoinUrl: (deckUrl: string, roomCode: string) => string | undefined
   /** Builds the presenter-facing URL — `server.ts`'s `buildPresenterUrl`. */
-  buildPresenterUrl: (deckUrl: string, presenterCode: string) => string
+  buildPresenterUrl: (deckUrl: string, roomCode: string, presenterCode: string) => string
   /** Pass `--remote=` to spawned decks — see `buildSlidevArgs`. */
   remote?: boolean
   /** Explicit Slidev CLI path — see `resolveSlidevBinary`. */
@@ -288,7 +288,7 @@ async function handleLaunch(
   respondJson(res, 201, {
     roomCode: session.roomCode,
     presenterCode: session.presenterCode,
-    presenterUrl: options.buildPresenterUrl(deckUrl, session.presenterCode),
+    presenterUrl: options.buildPresenterUrl(deckUrl, session.roomCode, session.presenterCode),
     participantUrl: options.buildJoinUrl(deckUrl, session.roomCode),
   })
 }

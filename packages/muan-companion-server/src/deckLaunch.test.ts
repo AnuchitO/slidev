@@ -443,7 +443,11 @@ describe('deck launch routes (plan 032c)', () => {
       // The deck URL is this server's public origin with the *child's* port —
       // the spawned deck runs on this same host, so only the port differs.
       const { port } = spawned.calls[0].args.join(' ').match(/--port=(?<port>\d+)/)!.groups as { port: string }
-      expect(body.presenterUrl).toBe(`http://companion.example:${port}/presenter/1?code=${encodeURIComponent(body.presenterCode)}`)
+      // `roomCode` in the query string alongside `code` — bug found live: a
+      // presenter URL with no room hint at all silently drove this server's
+      // *boot* session instead of the one just launched (see
+      // `buildPresenterUrl`'s own doc comment in server.ts).
+      expect(body.presenterUrl).toBe(`http://companion.example:${port}/presenter/1?code=${encodeURIComponent(body.presenterCode)}&roomCode=${encodeURIComponent(body.roomCode)}`)
       expect(body.participantUrl).toBe(`http://companion.example:${port}?roomCode=${encodeURIComponent(body.roomCode)}`)
 
       // A real session, created through the same `createSession` every other

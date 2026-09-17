@@ -53,7 +53,7 @@ export interface CreateRegistrationRoutesOptions {
   /** Builds the participant-facing join URL — `server.ts`'s `buildJoinUrl`. */
   buildJoinUrl: (deckUrl: string, roomCode: string) => string | undefined
   /** Builds the presenter-facing URL — `server.ts`'s `buildPresenterUrl`. */
-  buildPresenterUrl: (deckUrl: string, presenterCode: string) => string
+  buildPresenterUrl: (deckUrl: string, roomCode: string, presenterCode: string) => string
 }
 
 /**
@@ -303,7 +303,7 @@ async function handleRegister(
   respondJson(res, 201, {
     roomCode,
     presenterCode,
-    presenterUrl: options.buildPresenterUrl(deckUrl, presenterCode),
+    presenterUrl: options.buildPresenterUrl(deckUrl, roomCode, presenterCode),
     // Always defined in practice — `createSession` generates a room code when
     // none is supplied, and one is never supplied here — but `buildJoinUrl`'s
     // contract still returns `undefined` for an empty code, so this stays

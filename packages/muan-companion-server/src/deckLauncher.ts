@@ -469,10 +469,24 @@ function captureTail(stream: Readable | null, appendChunk: (chunk: string) => vo
  * changed shape across Vite majors. Tying launch success to a log line's
  * wording would make a routine Slidev upgrade break this server in a way whose
  * only symptom is "every launch times out".
+ *
+ * **Probed at `localhost`, not a hardcoded `127.0.0.1`.** Without `--remote`,
+ * `buildSlidevArgs` leaves the CLI's host at its own default, which is the
+ * literal string `'localhost'` (`packages/slidev/node/cli.ts`) — Vite/Node
+ * then resolve *that* at bind time via the host's own resolver, and on a
+ * machine where `localhost` resolves to `::1` first (common on modern
+ * macOS/Linux — Node 18+'s default DNS ordering), the child ends up bound to
+ * the IPv6 loopback only. A probe hardcoded to the IPv4 literal never
+ * connects to that socket at all — every launch times out after the full
+ * `READINESS_TIMEOUT_MS` even though the deck came up and is reachable at
+ * `http://localhost:<port>` the whole time. Probing the same `'localhost'`
+ * hostname (rather than an IP literal) resolves through the identical
+ * mechanism Vite used, on the same host, so the two agree regardless of
+ * which family that host prefers.
  */
 function probeReady(port: number, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const req = httpRequest({ host: '127.0.0.1', port, method: 'GET', path: '/', timeout: timeoutMs }, (res) => {
+    const req = httpRequest({ host: 'localhost', port, method: 'GET', path: '/', timeout: timeoutMs }, (res) => {
       // Drain rather than parse: this is a liveness check, and leaving the
       // response unconsumed would keep the socket open.
       res.resume()

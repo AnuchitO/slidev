@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { PassThrough } from 'node:stream'
 import { join } from 'pathe'
 import { io as ioClient } from 'socket.io-client'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   allocateEphemeralPort,
   buildSlidevArgs,
@@ -468,6 +468,38 @@ describe('deck launch routes (plan 032c)', () => {
       expect(getRoom(body.roomCode)?.presentationTitle).toBe('Intro to Vue')
       const summary = buildHomeUpdate().sessions.find(s => s.roomCode === body.roomCode)
       expect(summary?.presentationTitle).toBe('Intro to Vue')
+    })
+
+    it('falls back to a valid localhost URL — and warns loudly — when SLIDEV_MUAN_COMPANION_PUBLIC_URL is set but malformed', async () => {
+      // Found live: `SLIDEV_MUAN_COMPANION_PUBLIC_URL=true` (a copy-paste
+      // mix-up with the unrelated `SLIDEV_MUAN_COMPANION_SPAWN_REMOTE=true`)
+      // used to flow straight through into every launched deck's own
+      // `VITE_SLIDEV_MUAN_COMPANION_SERVER_URL` with no validation at all —
+      // the deck's own join link and QR code still looked completely normal
+      // (`deckUrlFor` already guarded those), so nothing about the launch or
+      // the home view hinted anything was wrong. Every participant's browser
+      // then failed to open a socket to the literal hostname `true`, with
+      // nothing in this server's own logs pointing at the cause.
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      await stopServer()
+      await startServer({ publicUrl: 'true' })
+
+      // Logged once, at construction — not deferred until the first launch
+      // that would actually suffer for it, and not silent.
+      expect(errorSpy.mock.calls.some(args => String(args[0]).includes('SLIDEV_MUAN_COMPANION_PUBLIC_URL'))).toBe(true)
+
+      const response = await post('/api/launch', { presentationId: 'intro' })
+      expect(response.status).toBe(201)
+
+      // The literal string `true` never reaches the child's environment —
+      // it gets the same `localhost` fallback an entirely-unset `publicUrl`
+      // produces, not a crash and not the invalid value passed through
+      // verbatim (which is what made this bug invisible until a
+      // participant's own browser console was inspected).
+      const { port } = new URL(url)
+      expect(spawned.calls[0].env[SERVER_URL_ENV]).toBe(`http://localhost:${port}`)
+
+      errorSpy.mockRestore()
     })
 
     it('404s an unknown presentation id without attempting a spawn', async () => {

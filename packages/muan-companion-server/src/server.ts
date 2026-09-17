@@ -19,7 +19,7 @@ import { generateCode } from './codeGeneration'
 import { createDeckLaunchRoutes } from './deckLaunchRoutes'
 import { HEARTBEAT_INTERVAL_MS, sweepStaleParticipants } from './presence'
 import { listPresentations } from './presentations'
-import { createRegistrationRoutes } from './registrationRoutes'
+import { createRegistrationRoutes, normalizeDeckUrl } from './registrationRoutes'
 import { createScreenshotUploadHandler } from './screenshotUpload'
 import {
   addErrorReport,
@@ -151,6 +151,18 @@ export interface CreateMuanCompanionServerOptions {
    * `DEFAULT_DECK_URL` above: a zero-config server produces a well-formed link
    * that works locally rather than refusing to start or emitting something
    * obviously broken, and a real deployment sets the env var.
+   *
+   * **Set-but-invalid gets the same `localhost` fallback as unset, not a
+   * crash** — found live: a value that isn't a well-formed absolute
+   * `http:`/`https:` URL (e.g. the literal string `"true"`, from a
+   * copy-paste mix-up with `SLIDEV_MUAN_COMPANION_SPAWN_REMOTE=true`) used to
+   * flow straight through into every launched deck's bundle, and the only
+   * symptom was every participant's browser failing to open a socket with an
+   * opaque `ERR_NAME_NOT_RESOLVED` — nothing in this server's own logs
+   * pointed at the cause. `createMuanCompanionServer` now validates this
+   * once at construction (`normalizeDeckUrl`, the same check
+   * `registrationRoutes.ts` already trusts for the identical class of
+   * value) and logs a loud `console.error` if it's rejected.
    */
   publicUrl?: string
   /**
@@ -810,6 +822,40 @@ function requireAdminCode(adminCode: string) {
 export function createMuanCompanionServer(options: CreateMuanCompanionServerOptions = {}): MuanCompanionServer {
   const deckUrl = options.deckUrl ?? DEFAULT_DECK_URL
 
+  // Plan 032c: `SLIDEV_MUAN_COMPANION_PUBLIC_URL` gets baked, unmodified, into
+  // every launched deck's own environment (`resolvePublicUrl` below, read by
+  // `deckLauncher.ts`'s `childEnv` as `VITE_SLIDEV_MUAN_COMPANION_SERVER_URL`)
+  // with no validation anywhere on that path — unlike `deckLaunchRoutes.ts`'s
+  // `deckUrlFor`, which already guards the *participant-facing link* built
+  // from this same value. Found live: an env var accidentally set to the
+  // literal string `"true"` (a copy-paste mix-up with the unrelated
+  // `SLIDEV_MUAN_COMPANION_SPAWN_REMOTE=true`) produced a deck whose join
+  // link and QR code looked completely normal — `deckUrlFor`'s `try`/`catch`
+  // fell back to `localhost` for those — while every participant's browser
+  // tried to open a socket to the literal hostname `true` (`io("true", ...)`
+  // reads a schemeless string as a bare host) and failed with an opaque
+  // `ERR_NAME_NOT_RESOLVED` in *their* console, with nothing at all in this
+  // server's own logs pointing at the cause. Validated once, here, with the
+  // same `normalizeDeckUrl` this package already trusts for the identical
+  // class of value (`registrationRoutes.ts`'s caller-supplied `deckUrl`)
+  // rather than a second hand-rolled check — an invalid value is dropped
+  // back to `undefined`, the same "unconfigured" state `resolvePublicUrl`
+  // already has a well-formed `localhost` fallback for, and logged loudly
+  // exactly once, at construction, rather than resurfacing on every launch
+  // or (worse) silently on none.
+  if (options.publicUrl !== undefined && normalizeDeckUrl(options.publicUrl) === undefined) {
+    console.error(
+      `[muan-companion-server] SLIDEV_MUAN_COMPANION_PUBLIC_URL is set to `
+      + `${JSON.stringify(options.publicUrl)}, which is not a valid absolute `
+      + `http(s) URL — ignoring it and falling back to `
+      + `http://localhost:<port>. Every deck launched via /api/launch bakes `
+      + `this value into its own bundle as the sync server's address; a bad `
+      + `value here means every participant's browser fails to connect with `
+      + `no visible error beyond a raw network failure in their own console.`,
+    )
+  }
+  const validatedPublicUrl = options.publicUrl !== undefined ? normalizeDeckUrl(options.publicUrl) : undefined
+
   // Plan 032b: the cross-room admin credential, resolved once for the life
   // of the process. `undefined` means "generate one", the same posture
   // `createSession` applies to a session's own two codes — see
@@ -1187,10 +1233,14 @@ export function createMuanCompanionServer(options: CreateMuanCompanionServerOpti
    * participant's browser connects would be a genuine attack, not a
    * convenience. Same reasoning `dashboardUrlFor` gives for staying
    * root-relative.
+   *
+   * Reads `validatedPublicUrl`, not `options.publicUrl` directly — see that
+   * constant's own doc comment for why an invalid env var must not reach
+   * this point at all.
    */
   function resolvePublicUrl(): string {
-    if (options.publicUrl)
-      return options.publicUrl
+    if (validatedPublicUrl)
+      return validatedPublicUrl
     const address = httpServer.address()
     const port = address !== null && typeof address !== 'string' ? (address as AddressInfo).port : DEFAULT_SERVER_PORT
     return `http://localhost:${port}`
